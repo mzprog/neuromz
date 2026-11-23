@@ -265,15 +265,20 @@ void print_seq_trace(const nmz_trace_recorder *rec, const nmz_vocab *v, const pr
     printf("  (|v| = L2 norm; at t = 0 the gradient to h_{-1} is dropped: that is where truncation cuts)\n");
 
     if (last_norms && n_last > 1) {
-        double prod = 1.0, mx = 0;
+        double prod = 1.0, mx = 0, mn = HUGE_VAL, lo, decades;
         int steps = 0;
         section("VANISHING / EXPLODING GRADIENTS   the loss of the LAST character only, followed back in time");
         printf("  |dL_last/dh_t|: how strongly the last prediction can still teach step t\n\n");
-        for (t = n_last - 1; t >= 0; t--)
+        for (t = n_last - 1; t >= 0; t--) {
             if (last_norms[t] > mx) mx = last_norms[t];
+            if (last_norms[t] > 0 && last_norms[t] < mn) mn = last_norms[t];
+        }
+        /* log axis from the smallest value (at least one decade below the largest) */
+        lo = mn < mx / 10 ? mn : mx / 10;
+        decades = mx > 0 && lo > 0 ? log10(mx) - log10(lo) : 1;
         for (t = n_last - 1; t >= 0; t--) {
             double r = t < n_last - 1 && last_norms[t + 1] > 0 ? last_norms[t] / last_norms[t + 1] : NAN;
-            double lg = mx > 0 && last_norms[t] > 0 ? (log10(last_norms[t]) - log10(mx) + 6) / 6 : 0; /* 6 decades */
+            double lg = mx > 0 && last_norms[t] > 0 ? (log10(last_norms[t]) - log10(lo)) / decades : 0;
             if (o->max_rows > 0 && n_last - 1 - t >= 2 * o->max_rows) {
                 printf("  %s\n", sym("…", "..."));
                 break;
@@ -293,8 +298,8 @@ void print_seq_trace(const nmz_trace_recorder *rec, const nmz_vocab *v, const pr
         }
         if (steps > 0) {
             double per = pow(prod, 1.0 / steps);
-            printf("\n  bars are on a log scale (6 decades). On average each step back multiplies the gradient by %.3f;\n",
-                   per);
+            printf("\n  bars: log scale over %.1f decade(s). On average each step back multiplies the gradient by %.3f;\n",
+                   decades, per);
             if (per < 0.95)
                 printf("  after %d steps only %.2g of it is left: a VANISHING gradient. A vanilla RNN therefore learns\n"
                        "  short-range patterns easily and long-range ones hardly at all - the problem LSTMs fix\n"
