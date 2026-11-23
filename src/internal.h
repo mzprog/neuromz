@@ -44,6 +44,7 @@ extern const nmz_layer_ops nmz__maxpool2d_ops;
 extern const nmz_layer_ops nmz__flatten_ops;
 extern const nmz_layer_ops nmz__dropout_ops;
 int nmz__conv2d_init_used(const nmz_layer *l);
+const nmz_tensor *nmz__maxpool_argmax(const nmz_layer *l);
 
 /* Activation layer accessors */
 nmz_act nmz__activation_layer_act(const nmz_layer *l);

@@ -400,18 +400,18 @@ nmz_status nmz_dataset_load_idx(nmz_dataset **out, const char *images_path, cons
     n = di[0];
     if (limit > 0 && (size_t)limit < n) n = (size_t)limit;
     pix = (size_t)di[1] * di[2];
-    labels = malloc(n);
+    labels = malloc(dl[0]); /* all labels: the class count must not depend on the limit */
     pixels = malloc(pix);
     ds = calloc(1, sizeof *ds);
     if (!labels || !pixels || !ds) {
         s = nmz__fail(NMZ_ERR_NOMEM, "out of memory");
         goto done;
     }
-    if (fread(labels, 1, n, fl) != n) {
-        s = nmz__fail(NMZ_ERR_FORMAT, "%s: truncated (expected %zu labels)", labels_path, n);
+    if (fread(labels, 1, dl[0], fl) != dl[0]) {
+        s = nmz__fail(NMZ_ERR_FORMAT, "%s: truncated (expected %u labels)", labels_path, dl[0]);
         goto done;
     }
-    for (i = 0; i < n; i++)
+    for (i = 0; i < dl[0]; i++)
         if (labels[i] > max_label) max_label = labels[i];
     ds->n_samples = (int)n;
     ds->n_inputs = (int)pix;

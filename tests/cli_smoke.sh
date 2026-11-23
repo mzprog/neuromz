@@ -34,13 +34,15 @@ stdin_check() { # stdin_check WANT_RC PATTERN INPUT-FILE
 # --- basics
 check 0 "Commands" "$B" --help
 check 0 "neuromz 2" "$B" --version
-check 0 "trace X1" "$B" help trace
+check 0 "trace (X1" "$B" help trace
 check 1 "unknown command" "$B" frobnicate
 
 # --- nothing loaded: every command fails cleanly
-for c in show predict test train trace step save gradcheck set reinit; do
+for c in predict test train trace step save gradcheck set reinit; do
     check 1 "no network loaded" "$B" $c 1 2
 done
+check 1 "no network loaded" "$B" show
+check 1 "no network loaded" "$B" show filters
 check 0 "no network" "$B" clear
 
 # --- quick mode, training, prediction, persistence
@@ -69,13 +71,60 @@ check 0 "2 hidden" sh -c "\"$B\" new 2 3 3 1 && echo 2 hidden"
 check 0 "\[yours\]" "$B" new 2 6 2:sigmoid --loss mse -o "$T/xa.nmz"
 check 0 "Converged" "$B" -m "$T/xa.nmz" train examples/xor_and.csv
 
+# --- image layers on a tiny generated dataset (1x4x4 images, 2 classes)
+awk 'BEGIN { srand(7); for (i = 0; i < 40; i++) { c = i % 2; s = "";
+    for (p = 0; p < 16; p++) { x = int(rand() * 60); if ((c == 0 && p % 4 == 1) || (c == 1 && int(p / 4) == 2)) x += 180;
+        s = s x ","; } print s (c ? "bar" : "stripe"); } }' >"$T/img.csv"
+check 0 "conv 1x4x4->2x4x4" "$B" new 1x4x4 conv:2:3:relu:pad=same pool:2 dropout:0.2 2:softmax --normalize minmax \
+    --optimizer adam --schedule cosine --seed 5 -o "$T/img.nmz"
+check 0 "flatten 2x2x2->8" "$B" -m "$T/img.nmz" show
+check 0 "accuracy" "$B" -m "$T/img.nmz" train "$T/img.csv" --limit 30 --epochs 20 -o "$T/img.nmz"
+check 0 "Adam state stored" "$B" -m "$T/img.nmz" show
+check 0 "input patch x" "$B" -m "$T/img.nmz" trace --sample 2 --data "$T/img.csv" --at 1,2,3
+check 0 "Adam step" "$B" -m "$T/img.nmz" trace --sample 2 --data "$T/img.csv"
+check 0 "winner" "$B" -m "$T/img.nmz" step --sample 1 --data "$T/img.csv" --full
+check 0 "PASS" "$B" -m "$T/img.nmz" gradcheck --sample 3 --data "$T/img.csv"
+check 0 "conv2d: 2 filters" "$B" -m "$T/img.nmz" show filters
+check 0 "prediction" "$B" -m "$T/img.nmz" show sample 4 --data "$T/img.csv"
+check 0 "predicted class" "$B" -m "$T/img.nmz" predict --sample 4 --data "$T/img.csv"
+check 0 "step schedule" "$B" -m "$T/img.nmz" set --optimizer sgd --schedule step --step-size 2 --gamma 0.5
+check 0 "Saved" "$B" -m "$T/img.nmz" save "$T/img2.nmz" --no-optimizer
+check 0 "accuracy" "$B" -m "$T/img.nmz" test "$T/img.csv" --limit 10
+check 0 "\[preset\]" "$B" new --preset mnist-cnn
+check 0 "\[preset\]" "$B" new --preset mnist-mlp
+check 1 "unknown preset" "$B" new --preset imagenet
+check 1 "do not also give sizes" "$B" new --preset mnist-cnn 2 3
+check 1 "image input shape" "$B" new 16 conv:2:3 2
+check 1 "must be a dense layer" "$B" new 1x4x4 conv:2:3
+check 1 "conv needs filters" "$B" new 1x4x4 conv:2 2
+check 1 "pool needs a window" "$B" new 1x4x4 pool 2
+check 1 "dropout needs a rate" "$B" new 4 dropout:1.0 2
+check 1 "larger than" "$B" new 1x4x4 conv:2:7 2
+check 1 "pad=same needs" "$B" new 1x4x4 conv:2:2:pad=same 2
+check 1 "--at needs" "$B" -m "$T/img.nmz" trace --sample 1 --data "$T/img.csv" --at 0,1
+check 1 "out of range" "$B" -m "$T/img.nmz" trace --sample 99 --data "$T/img.csv"
+check 1 "make data" env NEUROMZ_DATA="$T/none" "$B" -m "$T/img.nmz" test mnist
+check 1 "unknown optimizer" "$B" new 2 4 1 --optimizer rmsprop
+check 1 "unknown normalization" "$B" new 2 4 1 --normalize max
+
+# --- MNIST (only when `make data` has been run)
+if [ -f data/train-images-idx3-ubyte ] && [ -f data/t10k-labels-idx1-ubyte ]; then
+    check 0 "\[preset\]" "$B" new --preset mnist-cnn --epochs 1 -o "$T/m.nmz"
+    check 0 "200 samples" "$B" -m "$T/m.nmz" train mnist --limit 200 -o "$T/m.nmz"
+    check 0 "accuracy" "$B" -m "$T/m.nmz" test mnist --limit 100
+    check 0 "prediction" "$B" -m "$T/m.nmz" show sample 3
+    check 0 "where this filter responds most" "$B" -m "$T/m.nmz" trace --sample 1
+else
+    echo "skip MNIST checks (run make data)"
+fi
+
 # --- bad input never crashes
 check 1 "usage" "$B" new
 check 1 "usage" "$B" new 2
 check 1 "positive integer" "$B" new 2 0 1
 check 1 "positive integer" "$B" new 2 x 1
-check 1 "unknown activation" "$B" new 2 4:swish 1
-check 1 "unknown init" "$B" new 2 4:relu:magic 1
+check 1 "is not an activation" "$B" new 2 4:swish 1
+check 1 "is not an activation" "$B" new 2 4:relu:magic 1
 check 1 "only leaky_relu" "$B" new 2 4:tanh=3 1
 check 1 "softmax" "$B" new 2 4 1 --loss ce
 check 1 "needs a value" "$B" new 2 4 1 --lr

@@ -368,10 +368,10 @@ static void dense_backward(const nmz_trace_event *ev, const print_opts *o) {
 static void update_event(const nmz_trace_event *ev, const print_opts *o) {
     const nmz_tensor *w = nmz_trace_find(ev, "value"), *g = nmz_trace_find(ev, "grad"),
                      *v0 = nmz_trace_find(ev, "velocity_prev"), *dl = nmz_trace_find(ev, "delta");
-    int cols = width(w), rows = (int)nmz_tensor_rows(w), n = (int)w->size, e;
+    int n = (int)w->size, e;
     printf("\n[layer %d] %s %s  (%d value%s)\n", ev->layer, ev->layer_type, ev->detail, n, n == 1 ? "" : "s");
     printf("  ");
-    rpad(w->rank == 2 ? "i,j" : "j", 8);
+    rpad(w->rank == 2 ? "i,j" : w->rank == 4 ? "f,c,ky,kx" : "j", 10);
     rpad("w old", 13);
     rpad(g_ascii ? "dL/dw" : "∂L/∂w", 13);
     rpad("v old", 13);
@@ -379,13 +379,10 @@ static void update_event(const nmz_trace_event *ev, const print_opts *o) {
     rpad("w new", 13);
     printf("\n");
     for (e = 0; e < n; e++) {
-        char idx[32];
+        char idx[48];
         if (over_limit(e, n, o)) break;
-        if (w->rank == 2 && rows > 0)
-            snprintf(idx, sizeof idx, "%d,%d", e / cols + 1, e % cols + 1);
-        else
-            snprintf(idx, sizeof idx, "%d", e + 1);
-        printf("  %8s %12s %12s %12s %12s %12s\n", idx, num(w->data[e]), num(g->data[e]), num(v0->data[e]),
+        fmt_index(idx, sizeof idx, w, (size_t)e);
+        printf("  %10s %12s %12s %12s %12s %12s\n", idx, num(w->data[e]), num(g->data[e]), num(v0->data[e]),
                num(dl->data[e]), num((double)w->data[e] + dl->data[e]));
     }
 }
@@ -397,6 +394,7 @@ static void update_event(const nmz_trace_event *ev, const print_opts *o) {
 void print_trace_all(const nmz_trace_recorder *rec, const print_opts *o, int applied) {
     size_t i, n = nmz_trace_recorder_count(rec);
     nmz_trace_phase last = (nmz_trace_phase)-1;
+    pr_focus_reset();
     for (i = 0; i < n; i++) {
         const nmz_trace_event *ev = nmz_trace_recorder_get(rec, i);
         if (ev->phase != last && ev->phase != NMZ_TRACE_LOSS) {
@@ -407,11 +405,16 @@ void print_trace_all(const nmz_trace_recorder *rec, const print_opts *o, int app
             if (ev->phase == NMZ_TRACE_UPDATE) {
                 double lr = 0, mu = 0;
                 nmz_trace_scalar_get(ev, "lr", &lr);
-                nmz_trace_scalar_get(ev, "momentum", &mu);
-                printf("WEIGHT UPDATE%s   %s = %g, %s = %g\n", applied ? "" : " (preview only: not applied; use `step`)",
-                       S_ETA, lr, S_MU, mu);
-                printf("  v %s %s%sv %s %s%s%sL/%sw        w %s w + v\n", S_LARROW, S_MU, S_DOT, S_MINUS, S_ETA, S_DOT,
-                       S_D, S_D, S_LARROW);
+                if (nmz_trace_find(ev, "m")) {
+                    printf("WEIGHT UPDATE%s\n", applied ? "" : " (preview only: not applied; use `step`)");
+                    pr_adam_header(ev);
+                } else {
+                    nmz_trace_scalar_get(ev, "momentum", &mu);
+                    printf("WEIGHT UPDATE%s   %s = %g, %s = %g\n",
+                           applied ? "" : " (preview only: not applied; use `step`)", S_ETA, lr, S_MU, mu);
+                    printf("  v %s %s%sv %s %s%s%sL/%sw        w %s w + v\n", S_LARROW, S_MU, S_DOT, S_MINUS, S_ETA,
+                           S_DOT, S_D, S_D, S_LARROW);
+                }
             }
             print_rule();
         }
@@ -419,12 +422,25 @@ void print_trace_all(const nmz_trace_recorder *rec, const print_opts *o, int app
         switch (ev->phase) {
         case NMZ_TRACE_FORWARD:
             if (!strcmp(ev->layer_type, "dense")) dense_forward(ev, o);
-            else if (!strcmp(ev->layer_type, "activation")) act_forward(ev, o);
+            else if (!strcmp(ev->layer_type, "activation")) {
+                if (is_map(nmz_trace_find(ev, "z"))) pr_act_map_forward(ev, o);
+                else act_forward(ev, o);
+            } else if (!strcmp(ev->layer_type, "normalize")) pr_normalize(ev, o);
+            else if (!strcmp(ev->layer_type, "conv2d")) pr_conv_forward(ev, o);
+            else if (!strcmp(ev->layer_type, "maxpool2d")) pr_pool_forward(ev, o);
+            else if (!strcmp(ev->layer_type, "flatten")) pr_flatten(ev, 0);
+            else if (!strcmp(ev->layer_type, "dropout")) pr_dropout(ev, 0);
+            else printf("\n[layer %d] %s (forward)\n", ev->layer, ev->layer_type);
             break;
         case NMZ_TRACE_LOSS: loss_event(ev, o); break;
         case NMZ_TRACE_BACKWARD:
             if (ev->layer < 0) loss_backward(ev, o);
             else if (!strcmp(ev->layer_type, "dense")) dense_backward(ev, o);
+            else if (!strcmp(ev->layer_type, "conv2d")) pr_conv_backward(ev, o);
+            else if (!strcmp(ev->layer_type, "maxpool2d")) pr_pool_backward(ev, o);
+            else if (!strcmp(ev->layer_type, "flatten")) pr_flatten(ev, 1);
+            else if (!strcmp(ev->layer_type, "dropout")) pr_dropout(ev, 1);
+            else if (!strcmp(ev->layer_type, "activation") && is_map(nmz_trace_find(ev, "dL/da"))) pr_act_map_backward(ev, o);
             else if (!strcmp(ev->layer_type, "activation")) {
                 const nmz_trace_event *fwd = NULL;
                 size_t k;
@@ -435,7 +451,10 @@ void print_trace_all(const nmz_trace_recorder *rec, const print_opts *o, int app
                 act_backward(ev, fwd, o);
             }
             break;
-        case NMZ_TRACE_UPDATE: update_event(ev, o); break;
+        case NMZ_TRACE_UPDATE:
+            if (nmz_trace_find(ev, "m")) pr_adam_update(ev, o);
+            else update_event(ev, o);
+            break;
         }
     }
 }

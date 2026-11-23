@@ -450,6 +450,14 @@ nmz_status nmz_net_forward(nmz_net *net, const nmz_tensor *x, const nmz_tensor *
     return nmz__net_forward(net, x, 0, y);
 }
 
+nmz_status nmz_net_forward_mode(nmz_net *net, const nmz_tensor *x, int training, const nmz_tensor **y) {
+    nmz_status s;
+    if (!net) return nmz__fail(NMZ_ERR_ARG, "net is NULL");
+    s = nmz__net_forward(net, x, training != 0, y);
+    net->training = training != 0; /* the backward pass that follows is traced with the same mode */
+    return s;
+}
+
 nmz_status nmz_net_predict(nmz_net *net, const float *x, float *y) {
     const nmz_tensor *out;
     int shape[NMZ_MAX_RANK];

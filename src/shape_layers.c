@@ -154,6 +154,8 @@ static void pool_destroy(nmz_layer *l) {
 const nmz_layer_ops nmz__maxpool2d_ops = {"maxpool2d", pool_setup, no_init,   pool_forward,  pool_backward, no_params,
                                           no_param,    pool_save,  pool_load, pool_describe, pool_destroy};
 
+const nmz_tensor *nmz__maxpool_argmax(const nmz_layer *l) { return &((const pool_layer *)l->self)->argmax; }
+
 nmz_layer *nmz_layer_maxpool2d(int size, int stride) {
     pool_layer *p;
     nmz_layer *l;

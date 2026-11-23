@@ -232,7 +232,7 @@ static void test_idx(void) {
         ds = NULL;
     }
     CHECK_OK(nmz_dataset_load_idx(&ds, pi, pl, 2));
-    CHECK(ds && ds->n_samples == 2);
+    CHECK(ds && ds->n_samples == 2 && ds->n_classes == 5); /* classes counted over all labels */
     nmz_dataset_free(ds);
     ds = NULL;
     /* wrong kinds, truncation, count mismatch */

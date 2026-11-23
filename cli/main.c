@@ -6,6 +6,7 @@
  * Only this program may use POSIX/terminal APIs; the library stays portable. */
 #if defined(__unix__) || defined(__APPLE__)
 #define _POSIX_C_SOURCE 200809L
+#include <time.h>
 #include <unistd.h>
 #define NMZ_HAVE_ISATTY 1
 #endif
@@ -14,6 +15,23 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+double cli_now(void) {
+#ifdef NMZ_HAVE_ISATTY
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) == 0) return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+#endif
+    return (double)clock() / CLOCKS_PER_SEC;
+}
+
+int cli_stdout_is_tty(void) {
+#ifdef NMZ_HAVE_ISATTY
+    return isatty(STDOUT_FILENO);
+#else
+    return 0;
+#endif
+}
 
 static int stdin_is_terminal(void) {
 #ifdef NMZ_HAVE_ISATTY

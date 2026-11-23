@@ -14,14 +14,48 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The "switch pattern" of a forward pass: which side of 0 every relu /
+ * leaky-relu input is on, and every max-pool winner. If a perturbation
+ * changes it, the loss is not differentiable between the two points. */
+static size_t signature(const nmz_net *net, float *out) {
+    size_t n = 0, e;
+    int i;
+    for (i = 0; i < net->n_layers; i++) {
+        const nmz_layer *l = net->layers[i];
+        int k = nmz_layer_activation_kind(l);
+        if (k == NMZ_ACT_RELU || k == NMZ_ACT_LEAKY_RELU) {
+            for (e = 0; e < net->acts[i].size; e++, n++)
+                if (out) out[n] = net->acts[i].data[e] > 0.0f ? 1.0f : 0.0f;
+        } else if (l->ops == &nmz__maxpool2d_ops) {
+            const nmz_tensor *am = nmz__maxpool_argmax(l);
+            for (e = 0; e < am->size; e++, n++)
+                if (out) out[n] = am->data[e];
+        }
+    }
+    return n;
+}
+
+static int same_signature(const nmz_net *net, const float *base, float *tmp, size_t n) {
+    if (n == 0) return 1;
+    signature(net, tmp);
+    return memcmp(base, tmp, n * sizeof(float)) == 0;
+}
+
 /* Every forward pass starts from the same PRNG state, so stochastic layers
  * (dropout) make identical choices and L is a deterministic function of w. */
+typedef struct sigbuf {
+    float *base, *tmp;
+    size_t n;
+    int crossed; /* set when a forward's switch pattern differs from base */
+} sigbuf;
+
 static nmz_status loss_at(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t, int training,
-                          const nmz_rng *rng0, double *L) {
+                          const nmz_rng *rng0, sigbuf *sb, double *L) {
     nmz_status s;
     net->rng = *rng0;
     s = nmz__net_forward(net, x, training, NULL);
     if (s != NMZ_OK) return s;
+    if (!same_signature(net, sb->base, sb->tmp, sb->n)) sb->crossed = 1;
     return nmz_net_compute_loss(net, t, L);
 }
 
@@ -61,6 +95,7 @@ nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_t
     long saved_step;
     double worst = 0.0;
     nmz_rng rng0;
+    sigbuf sb = {NULL, NULL, 0, 0};
     int k;
     if (!net || !x || !t || !result) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
     if (eps <= 0) eps = 1e-3;
@@ -76,6 +111,16 @@ nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_t
     /* analytic gradients, copied out (they are overwritten by later passes) */
     net->rng = rng0;
     if ((s = nmz__net_forward(net, x, training, NULL)) != NMZ_OK) goto out;
+    sb.n = signature(net, NULL); /* switch pattern at the unperturbed point */
+    if (sb.n) {
+        sb.base = malloc(sb.n * sizeof(float));
+        sb.tmp = malloc(sb.n * sizeof(float));
+        if (!sb.base || !sb.tmp) {
+            s = nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+            goto out;
+        }
+        signature(net, sb.base);
+    }
     net->training = training;
     s = nmz_net_backward(net, t, NULL);
     net->training = 0;
@@ -103,11 +148,16 @@ nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_t
             float orig = w->data[e];
             double lp, lm;
             w->data[e] = (float)(orig + eps);
-            s = loss_at(net, x, t, training, &rng0, &lp);
+            sb.crossed = 0;
+            s = loss_at(net, x, t, training, &rng0, &sb, &lp);
             w->data[e] = (float)(orig - eps);
-            if (s == NMZ_OK) s = loss_at(net, x, t, training, &rng0, &lm);
+            if (s == NMZ_OK) s = loss_at(net, x, t, training, &rng0, &sb, &lm);
             w->data[e] = orig;
             if (s != NMZ_OK) goto out;
+            if (sb.crossed) {
+                r.kinks++;
+                continue;
+            }
             compare(&r, &worst, grads.data[off + e], (lp - lm) / (2.0 * eps), net->param_refs[k].layer,
                     nmz_layer_param_name(l, pi), e, atol, rtol);
         }
@@ -119,11 +169,16 @@ nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_t
         float orig = xp.data[e];
         double lp, lm;
         xp.data[e] = (float)(orig + eps);
-        s = loss_at(net, &xp, t, training, &rng0, &lp);
+        sb.crossed = 0;
+        s = loss_at(net, &xp, t, training, &rng0, &sb, &lp);
         xp.data[e] = (float)(orig - eps);
-        if (s == NMZ_OK) s = loss_at(net, &xp, t, training, &rng0, &lm);
+        if (s == NMZ_OK) s = loss_at(net, &xp, t, training, &rng0, &sb, &lm);
         xp.data[e] = orig;
         if (s != NMZ_OK) goto out;
+        if (sb.crossed) {
+            r.kinks++;
+            continue;
+        }
         compare(&r, &worst, grads.data[off + e], (lp - lm) / (2.0 * eps), -1, "x", e, atol, rtol);
     }
     s = NMZ_OK;
@@ -134,6 +189,8 @@ out:
     net->have_forward = net->have_grads = 0;
     nmz_tensor_free(&xp);
     nmz_tensor_free(&grads);
+    free(sb.base);
+    free(sb.tmp);
     *result = r;
     return s;
 }

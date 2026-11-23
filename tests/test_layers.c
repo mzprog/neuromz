@@ -321,7 +321,36 @@ static void test_shape_errors(void) {
     nmz_net_free(net);
 }
 
+/* a relu input placed right at the kink: the check must skip, not fail */
+static void test_gradcheck_kink(void) {
+    nmz_net *net = NULL;
+    nmz_tensor x = NMZ_TENSOR_EMPTY, t = NMZ_TENSOR_EMPTY;
+    nmz_gradcheck_result r;
+    int in = 2, xs[2] = {1, 2}, ts[2] = {1, 1};
+    nmz_layer *d;
+    CHECK_OK(nmz_net_create(&net, 1, &in, 1));
+    CHECK_OK(nmz_net_add_dense(net, 2, NMZ_ACT_RELU, NMZ_INIT_HE));
+    CHECK_OK(nmz_net_add_dense(net, 1, NMZ_ACT_LINEAR, NMZ_INIT_XAVIER));
+    CHECK_OK(nmz_net_build(net));
+    d = nmz_net_layer(net, 0);
+    nmz_layer_param_value(d, 0)->data[0] = 1.0f; /* z_1 = 5·1 + 0·w + b */
+    nmz_layer_param_value(d, 0)->data[2] = 0.3f;
+    nmz_layer_param_value(d, 1)->data[0] = -4.9999f; /* → z_1 = 0.0001, inside ±eps·x */
+    nmz_layer_param_value(nmz_net_layer(net, 2), 0)->data[0] = 1.0f;
+    CHECK_OK(nmz_tensor_init(&x, 2, xs));
+    CHECK_OK(nmz_tensor_init(&t, 2, ts));
+    x.data[0] = 5.0f;
+    x.data[1] = 0.0f;
+    t.data[0] = 3.0f;
+    CHECK_OK(nmz_net_gradcheck(net, &x, &t, 1e-3, 0, 0, &r));
+    CHECK_MSG(r.kinks > 0 && r.failures == 0, "kinks %zu failures %zu", r.kinks, r.failures);
+    nmz_tensor_free(&x);
+    nmz_tensor_free(&t);
+    nmz_net_free(net);
+}
+
 const test_case layer_tests[] = {
+    {"layers/gradcheck_skips_kinks", test_gradcheck_kink},
     {"layers/gradcheck_conv2d", test_gradcheck_conv},
     {"layers/gradcheck_pool_flatten_cnn", test_gradcheck_pool_flatten},
     {"layers/gradcheck_dropout", test_gradcheck_dropout},

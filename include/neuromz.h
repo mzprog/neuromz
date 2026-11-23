@@ -299,6 +299,9 @@ const char *nmz_net_class_name(const nmz_net *net, int i);
 /* Forward a batch x of shape [B, input_shape...]. *y points to the net's
  * output buffer (valid until the next forward). */
 nmz_status nmz_net_forward(nmz_net *net, const nmz_tensor *x, const nmz_tensor **y);
+/* Same with an explicit mode: training = 1 activates dropout (and consumes
+ * the net's PRNG); nmz_net_forward uses evaluation mode (training = 0). */
+nmz_status nmz_net_forward_mode(nmz_net *net, const nmz_tensor *x, int training, const nmz_tensor **y);
 /* Single sample convenience: x has input_size floats, y receives output_size. */
 nmz_status nmz_net_predict(nmz_net *net, const float *x, float *y);
 /* Loss of the last forward pass against target t (same shape as output). */
@@ -490,6 +493,10 @@ typedef struct nmz_gradcheck_result {
     double worst_analytic;
     double worst_numeric;
     size_t failures;     /* scalars with |a−n| > atol + rtol·max(|a|,|n|) */
+    size_t kinks;        /* checks skipped: a relu changed side or a max-pool
+                            winner changed within ±eps, so the loss has no
+                            derivative there and the difference quotient is
+                            meaningless (not counted in `checked`)        */
 } nmz_gradcheck_result;
 
 /* Compare backprop gradients (all params and the input) with central
