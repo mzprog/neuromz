@@ -7,12 +7,16 @@
  *   pool:    pool:K[:stride=S]          (also maxpool:K)
  *   other:   flatten | dropout:RATE
  *   text:    input `text` (+ --data FILE for the vocabulary), embed:D[:INIT],
- *            rnn:H[:INIT], and `vocab[:ACT]` = a dense output with one unit
- *            per character (applied at every time step)
+ *            rnn:H[:INIT], lstm:H[:INIT][:forget_bias=F], gru:H[:INIT]
+ *            (INIT: auto = orthogonal, orthogonal, xavier, he), and
+ *            `vocab[:ACT]` = a dense output with one unit per character
+ *            (applied at every time step); recurrent layers can be stacked,
+ *            with dropout:RATE between them
  * A flatten is inserted automatically before a dense layer that follows
  * conv/pool layers. The last layer must be dense (the output). */
 #include "cli.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,14 +24,16 @@
 
 #define DEFAULT_SEED 42u
 
-typedef enum { LS_DENSE, LS_CONV, LS_POOL, LS_FLATTEN, LS_DROPOUT, LS_EMBED, LS_RNN } ls_kind;
+typedef enum { LS_DENSE, LS_CONV, LS_POOL, LS_FLATTEN, LS_DROPOUT, LS_EMBED, LS_RNN, LS_LSTM, LS_GRU } ls_kind;
+#define IS_RECURRENT(k) ((k) == LS_RNN || (k) == LS_LSTM || (k) == LS_GRU)
 #define VOCAB_UNITS (-1) /* dense size = vocabulary size */
 
 typedef struct lspec {
     ls_kind kind;
     int n; /* units, filters or pool size */
     int kh, kw, stride, pad;
-    float rate, alpha;
+    float rate, alpha, forget_bias;
+    int fb_set;
     nmz_act act;
     int act_set;
     nmz_init init;
@@ -111,6 +117,46 @@ static const preset k_presets[] = {
      "constant: early stopping decides when to stop", 0.0, "0 = no loss target; the validation loss decides",
      "data/alice.txt", 0, 64, 1, 3, 0.1f, 5.0f,
      "64 steps of backpropagation through time per update; the hidden state is carried across batches"},
+    {"names-lstm", "LSTM that invents names: the `names` preset with gates instead of a plain tanh RNN", "text",
+     "characters (Unicode code points) of a list of names; one per line, newline = end of a name",
+     {{"embed:16", "each of the V characters gets a learned 16-number vector"},
+      {"lstm:64", "64 LSTM cells = about the same number of weights as rnn:128 (4 gates per cell): a fair comparison"},
+      {"vocab:softmax", "at every step: probabilities for the next character (incl. end of name)"},
+      {NULL, NULL}},
+     NMZ_NORM_NONE, "token ids are not scaled", NMZ_OPT_ADAM, 0.005f,
+     "Adam copes well with the very different gradient sizes of embedding, gate and output weights",
+     "0.005: gated cells tolerate a larger step than the plain RNN (measured on the names lists)", 32,
+     "32 sequences of 16 characters per update", 40, "at most 40 passes; early stopping usually ends sooner",
+     NMZ_SCHED_CONSTANT, "constant: early stopping decides when to stop", 0.0,
+     "0 = no loss target; the validation loss decides (patience)", "examples/names_en.txt", 1, 16, 0, 3, 0.1f, 5.0f,
+     "16 steps cover two or three names: enough context for one name, cheap to train"},
+    {"char-lstm", "LSTM for running text: the `char-rnn` preset with gates (same number of weights)", "text",
+     "characters (Unicode code points) of a long text",
+     {{"embed:32", "each character gets a learned 32-number vector"},
+      {"lstm:64", "64 LSTM cells ~ the weights of rnn:128; the cell state c can carry information far back"},
+      {"vocab:softmax", "at every step: probabilities for the next character"},
+      {NULL, NULL}},
+     NMZ_NORM_NONE, "token ids are not scaled", NMZ_OPT_ADAM, 0.006f,
+     "Adam: per-weight step sizes; robust for recurrent nets", "0.006 with clipping (measured on Alice)", 16,
+     "16 streams of 64 characters per update", 20, "at most 20 passes; early stopping may end sooner",
+     NMZ_SCHED_CONSTANT, "constant: early stopping decides when to stop", 0.0,
+     "0 = no loss target; the validation loss decides", "data/alice.txt", 0, 64, 1, 3, 0.1f, 5.0f,
+     "64 steps of backpropagation through time per update; h and c are carried across batches"},
+    {"arabic-text", "two stacked LSTMs for Arabic prose (Kalila wa-Dimna, `make data-text`)", "text",
+     "characters (Unicode code points) of an Arabic text: letters, hamza forms, the few vowel marks, punctuation",
+     {{"embed:32", "each character (letter, mark, punctuation) gets a learned 32-number vector"},
+      {"lstm:96", "first LSTM: 96 cells read the characters (spelling, word pieces)"},
+      {"dropout:0.1", "between the LSTMs, 10% of the values are zeroed in training: less overfitting"},
+      {"lstm:96", "second LSTM on top of the first: more abstract, slower-changing features (words, phrases)"},
+      {"vocab:softmax", "at every step: probabilities for the next character"},
+      {NULL, NULL}},
+     NMZ_NORM_NONE, "token ids are not scaled", NMZ_OPT_ADAM, 0.004f,
+     "Adam: per-weight step sizes; robust for stacked recurrent nets", "0.004 with clipping (measured on Kalila wa-Dimna)",
+     16, "16 streams of 64 characters per update", 15,
+     "at most 15 passes over the book (~1 min each); early stopping may end sooner", NMZ_SCHED_CONSTANT,
+     "constant: early stopping decides when to stop", 0.0, "0 = no loss target; the validation loss decides",
+     "data/kalila.txt", 0, 64, 1, 3, 0.1f, 5.0f,
+     "64 characters (~12 words) of backpropagation through time; h and c are carried across batches"},
 };
 
 static const preset *find_preset(const char *name) {
@@ -178,15 +224,28 @@ static int parse_modifier(const char *tok, lspec *sp, const char *whole) {
         else return cli_fail("pad must be a number >= 0 or 'same' in '%s'", whole), 0;
         return 1;
     }
-    if (sp->kind == LS_EMBED || sp->kind == LS_RNN) {
+    if (sp->kind == LS_EMBED || IS_RECURRENT(sp->kind)) {
         nmz_init in;
         if (sp->kind == LS_RNN && !strcmp(buf, "tanh") && !eq) return 1; /* the only RNN activation */
+        if (sp->kind == LS_LSTM && eq && (!strcmp(buf, "forget_bias") || !strcmp(buf, "forget-bias"))) {
+            if (!cli_parse_double(eq, &d) || d < -100 || d > 100)
+                return cli_fail("forget_bias needs a number (e.g. lstm:64:forget_bias=1), got '%s'", whole), 0;
+            sp->forget_bias = (float)d;
+            sp->fb_set = 1;
+            return 1;
+        }
         if (!eq && nmz_init_parse(buf, &in) == NMZ_OK) {
+            if (sp->kind == LS_EMBED && in == NMZ_INIT_ORTHOGONAL)
+                return cli_fail("'%s': orthogonal init is for recurrent layers (embed: auto xavier he)", whole), 0;
             sp->init = in;
             sp->init_set = in != NMZ_INIT_AUTO;
             return 1;
         }
-        return cli_fail("'%s': embed/rnn take only an init (auto xavier he); rnn always uses tanh", whole), 0;
+        if (sp->kind == LS_EMBED) return cli_fail("'%s': embed takes only an init (auto xavier he)", whole), 0;
+        fprintf(stderr, "error: '%s': %s takes an init (auto orthogonal xavier he)%s\n", whole,
+                sp->kind == LS_LSTM ? "lstm" : sp->kind == LS_GRU ? "gru" : "rnn",
+                sp->kind == LS_LSTM ? " and forget_bias=F" : sp->kind == LS_RNN ? "; rnn always uses tanh" : "");
+        return 0;
     }
     if (sp->kind == LS_DENSE || sp->kind == LS_CONV) {
         nmz_act a;
@@ -231,7 +290,7 @@ static int parse_kernel(const char *s, int *kh, int *kw) {
     return 1;
 }
 
-/* embed:D[:init], rnn:H[:init], vocab[:act][:init] */
+/* embed:D[:init], rnn|lstm|gru:H[:init][:forget_bias=F], vocab[:act][:init] */
 static int parse_text_layer(char **tok, int nt, const char *s, lspec *sp, int *first) {
     long n;
     if (!strcmp(tok[0], "embed") || !strcmp(tok[0], "embedding")) {
@@ -242,10 +301,10 @@ static int parse_text_layer(char **tok, int nt, const char *s, lspec *sp, int *f
         *first = 2;
         return 1;
     }
-    if (!strcmp(tok[0], "rnn")) {
+    if (!strcmp(tok[0], "rnn") || !strcmp(tok[0], "lstm") || !strcmp(tok[0], "gru")) {
         if (nt < 2 || !cli_parse_int(tok[1], 1, 100000, &n))
-            return cli_fail("rnn needs a number of hidden units: rnn:128, got '%s'", s), 0;
-        sp->kind = LS_RNN;
+            return fprintf(stderr, "error: %s needs a number of hidden units: %s:64, got '%s'\n", tok[0], tok[0], s), 0;
+        sp->kind = !strcmp(tok[0], "rnn") ? LS_RNN : !strcmp(tok[0], "lstm") ? LS_LSTM : LS_GRU;
         sp->n = (int)n;
         *first = 2;
         return 1;
@@ -318,7 +377,7 @@ static int parse_layer(const char *s, lspec *sp) {
         first = 2;
     } else {
         fprintf(stderr, "error: layer spec must be a positive integer size (e.g. 64:relu) or start with dense:, conv:, pool:, "
-                        "flatten, dropout:, embed:, rnn: or vocab — got '%s'\n", s);
+                        "flatten, dropout:, embed:, rnn:, lstm:, gru: or vocab — got '%s'\n", s);
         goto out;
     }
 modifiers:
@@ -355,11 +414,13 @@ static void shape_str(char *b, size_t n, const nmz_layer *l, int out) {
 
 /* Build the vocabulary from a text file. items < 0: auto-detect "one item
  * per line" (>= 20 lines, 90% of them <= 40 characters, none > 80). */
-static int text_vocab(const char *path, int items, nmz_vocab **out, int *items_used, size_t *n_chars, size_t *bad) {
+static int text_vocab(const char *path, int items, unsigned tnorm, nmz_vocab **out, int *items_used, size_t *n_chars,
+                      size_t *bad, size_t *removed) {
     nmz_text_opts to = nmz_text_defaults();
     nmz_dataset *ds = NULL;
     to.seq_len = 1;
     to.items = items > 0;
+    to.normalize = tnorm;
     if (nmz_dataset_load_text(&ds, path, &to) != NMZ_OK) return cli_lib_fail("cannot read the text for the vocabulary");
     if (items < 0) {
         int nl = nmz_vocab_index(ds->vocab, '\n'), lines = 0, short_lines = 0, longest = 0, len = 0, i;
@@ -392,6 +453,7 @@ static int text_vocab(const char *path, int items, nmz_vocab **out, int *items_u
     *items_used = items > 0;
     *n_chars = ds->n_tokens;
     *bad = ds->invalid_utf8;
+    *removed = ds->n_removed;
     if (nmz_vocab_copy(out, ds->vocab) != NMZ_OK) {
         nmz_dataset_free(ds);
         return cli_lib_fail("vocabulary");
@@ -421,7 +483,8 @@ int cmd_new(cli_state *st, int argc, char **argv) {
     int is_text = 0, items = -1, items_set = 0, has_rnn = 0, V = 0, items_used = 0;
     const char *data = NULL;
     nmz_vocab *vocab = NULL;
-    size_t n_chars = 0, n_bad = 0;
+    size_t n_chars = 0, n_bad = 0, n_removed = 0;
+    unsigned tnorm = 0;
 
     specs = calloc((size_t)argc + 16, sizeof *specs);
     dense_sizes = calloc((size_t)argc + 16, sizeof *dense_sizes);
@@ -441,11 +504,16 @@ int cmd_new(cli_state *st, int argc, char **argv) {
             if (!strcmp(a, "--preset")) {
                 if (!(v = cli_opt_value(argc, argv, &i))) goto out;
                 if (!(pre = find_preset(v))) {
-                    cli_fail("unknown preset '%s' (available: mnist-cnn, mnist-mlp, names, char-rnn)", v);
+                    cli_fail("unknown preset '%s' (available: mnist-cnn, mnist-mlp, names, char-rnn, names-lstm, char-lstm, "
+                             "arabic-text)", v);
                     goto out;
                 }
             } else if (!strcmp(a, "--data")) {
                 if (!(data = cli_opt_value(argc, argv, &i))) goto out;
+            } else if (!strcmp(a, "--strip-diacritics")) {
+                tnorm |= NMZ_TEXT_STRIP_DIACRITICS;
+            } else if (!strcmp(a, "--unify-alef")) {
+                tnorm |= NMZ_TEXT_UNIFY_ALEF;
             } else if (!strcmp(a, "--items") || !strcmp(a, "--no-items")) {
                 items = !strcmp(a, "--items");
                 items_set = 1;
@@ -509,9 +577,10 @@ int cmd_new(cli_state *st, int argc, char **argv) {
             cli_fail("a text model needs --data FILE to build its character vocabulary%s", NULL);
             goto out;
         }
-        if (text_vocab(data, items, &vocab, &items_used, &n_chars, &n_bad)) {
-            if (pre && data == pre->data && !strcmp(pre->name, "char-rnn"))
-                fprintf(stderr, "       (the char-rnn preset uses %s: run `make data-text`, or pass --data FILE)\n", data);
+        if (text_vocab(data, items, tnorm, &vocab, &items_used, &n_chars, &n_bad, &n_removed)) {
+            if (pre && data == pre->data && !strncmp(data, "data/", 5))
+                fprintf(stderr, "       (the %s preset uses %s: run `make data-text`, or pass --data FILE)\n", pre->name,
+                        data);
             goto out;
         }
         V = vocab->size;
@@ -519,14 +588,19 @@ int cmd_new(cli_state *st, int argc, char **argv) {
         cli_fail("the input must be a size like 784, a shape like 1x28x28, or `text`, got '%s'", input_text);
         goto out;
     }
+    if (tnorm && !is_text) {
+        cli_fail("--strip-diacritics/--unify-alef apply to text models only%s", NULL);
+        goto out;
+    }
     for (i = 0; i < n_specs; i++) {
-        if (specs[i].kind == LS_EMBED || specs[i].kind == LS_RNN) {
+        if (specs[i].kind == LS_EMBED || IS_RECURRENT(specs[i].kind)) {
             if (!is_text) {
-                cli_fail("embed/rnn layers need the `text` input (e.g. new text embed:32 rnn:128 vocab --data FILE)%s",
+                cli_fail("embed/rnn/lstm/gru layers need the `text` input (e.g. new text embed:32 lstm:64 vocab --data "
+                         "FILE)%s",
                          NULL);
                 goto out;
             }
-            has_rnn |= specs[i].kind == LS_RNN;
+            has_rnn |= IS_RECURRENT(specs[i].kind);
         }
         if (specs[i].kind == LS_DENSE && specs[i].n == VOCAB_UNITS) {
             if (!is_text) {
@@ -665,11 +739,13 @@ int cmd_new(cli_state *st, int argc, char **argv) {
         case LS_DROPOUT: l = nmz_layer_dropout(sp->rate); break;
         case LS_EMBED: l = nmz_layer_embedding(V, sp->n, sp->init); break;
         case LS_RNN: l = nmz_layer_rnn(sp->n, sp->init); break;
+        case LS_LSTM: l = nmz_layer_lstm(sp->n, sp->init, sp->fb_set ? sp->forget_bias : NMZ_LSTM_FORGET_BIAS); break;
+        case LS_GRU: l = nmz_layer_gru(sp->n, sp->init); break;
         }
         if (nmz_net_add(net, l) != NMZ_OK) goto libfail;
         l = nmz_net_layer(net, nmz_net_layer_count(net) - 1);
         if (sp->kind != LS_FLATTEN && sp->kind != LS_DROPOUT && sp->kind != LS_POOL && sp->kind != LS_EMBED &&
-            sp->kind != LS_RNN && sp->act != NMZ_ACT_LINEAR && nmz_net_add(net, nmz_layer_activation(sp->act, sp->alpha)) != NMZ_OK)
+            !IS_RECURRENT(sp->kind) && sp->act != NMZ_ACT_LINEAR && nmz_net_add(net, nmz_layer_activation(sp->act, sp->alpha)) != NMZ_OK)
             goto libfail;
         {
             char in[48], outs[48], val[64];
@@ -717,8 +793,29 @@ int cmd_new(cli_state *st, int argc, char **argv) {
                 snprintf(val, sizeof val, "tanh");
                 if (!why) why = "h_t = tanh(x_t W_xh + h_{t-1} W_hh + b): the time loop and BPTT run inside the layer";
                 break;
+            case LS_LSTM:
+                snprintf(what, sizeof what, "lstm %s->%s", in, outs);
+                snprintf(val, sizeof val, "i f g o");
+                if (!why)
+                    why = "c_t = f*c_{t-1} + i*g, h_t = o*tanh(c_t): gates decide what to forget, write and show";
+                break;
+            case LS_GRU:
+                snprintf(what, sizeof what, "gru %s->%s", in, outs);
+                snprintf(val, sizeof val, "z r h~");
+                if (!why) why = "h_t = z*h_{t-1} + (1-z)*h~: an update gate mixes the old state and a candidate";
+                break;
             }
             explain(what, val, tag_of(sp->act_set, sp->why != NULL), why);
+            if (sp->kind == LS_LSTM) {
+                double fb = sp->fb_set ? sp->forget_bias : NMZ_LSTM_FORGET_BIAS;
+                char fwhy[160];
+                snprintf(val, sizeof val, "%g", fb);
+                snprintf(fwhy, sizeof fwhy, "f = sigmoid(... + bias) starts near sigmoid(%g) = %.2f: %s", fb,
+                         1.0 / (1.0 + exp(-fb)),
+                         fb > 0 ? "the cell keeps most of c at first (it can learn to forget)"
+                                : "the cell forgets half or more of c at every step at first");
+                explain("  forget-gate bias", val, sp->fb_set ? "[yours]" : "[default]", fwhy);
+            }
         }
     }
     if (nmz_net_set_loss(net, loss) != NMZ_OK || nmz_net_set_normalization(net, norm) != NMZ_OK ||
@@ -797,6 +894,17 @@ int cmd_new(cli_state *st, int argc, char **argv) {
         snprintf(what, sizeof what, "from %s: %zu characters%s; stored in the model, so `generate` needs only the model",
                  data, n_chars, n_bad ? " (some invalid UTF-8 read as U+FFFD)" : "");
         explain("vocabulary", buf, "[data]", what);
+        if (tnorm || n_removed) {
+            snprintf(buf, sizeof buf, "%s%s", tnorm & NMZ_TEXT_STRIP_DIACRITICS ? "strip-marks" : "",
+                     tnorm == NMZ_TEXT_NORMALIZE_ALL ? "+alef" : tnorm == NMZ_TEXT_UNIFY_ALEF ? "unify-alef" : "");
+            snprintf(what, sizeof what, "%s%s: %zu characters removed; applied to every text the model reads",
+                     tnorm & NMZ_TEXT_STRIP_DIACRITICS ? "tashkeel and tatweel removed" : "",
+                     tnorm == NMZ_TEXT_NORMALIZE_ALL ? ", alef forms -> bare alef"
+                     : tnorm == NMZ_TEXT_UNIFY_ALEF  ? "alef forms -> bare alef"
+                                                     : "",
+                     n_removed);
+            explain("text normalization", buf, "[yours]", what);
+        }
         explain("items", items_used ? "one per line" : "running text", items_set ? "[yours]" : pre && pre->data ? "[preset]" : "[auto]",
                 items_used ? "newline = end of an item: `generate --count N` makes N separate items"
                            : "the text is one long stream");
@@ -805,8 +913,9 @@ int cmd_new(cli_state *st, int argc, char **argv) {
                 pre && !(mask & CLI_SET_SEQLEN) && pre->why_seq ? pre->why_seq
                                                                  : "characters per training sequence = steps of backpropagation through time");
         explain("carry state", o.carry_state ? "on" : "off", tag_of(mask & CLI_SET_CARRY, pre != NULL),
-                o.carry_state ? "batch k+1 continues batch k: h is carried over (truncated BPTT), no shuffling"
-                              : "every sequence starts from h = 0; sequences are shuffled");
+                o.carry_state ? "batch k+1 continues batch k: the state (h; and c in an LSTM) is carried over "
+                                "(truncated BPTT), no shuffling"
+                              : "every sequence starts from a zero state; sequences are shuffled");
         snprintf(buf, sizeof buf, "%g%%", 100.0 * o.val_fraction);
         explain("validation", buf, tag_of(mask & CLI_SET_VAL, pre != NULL),
                 "the last part of the text is held out: train and validation loss are reported every epoch");

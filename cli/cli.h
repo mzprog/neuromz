@@ -113,11 +113,32 @@ void pr_adam_header(const nmz_trace_event *ev);
 void pr_adam_update(const nmz_trace_event *ev, const print_opts *o);
 void print_sgd_update(const nmz_trace_event *ev, const print_opts *o);
 
-/* print_seq.c: the unrolled view of a character RNN. unit < 0 = automatic;
- * last_norms[t] = |dL_last/dh_t| from a backward pass with only the last
- * step's loss (may be NULL). */
+/* print_seq.c: the unrolled view of a character model (rnn, lstm, gru). */
+/* How much of the LAST step's loss gradient reaches every step t, for one
+ * recurrent layer (from a backward pass with only the last step's loss). */
+typedef struct seq_survival {
+    int T, layer;    /* steps; net layer index of the recurrent layer   */
+    char kind[8];    /* "rnn", "lstm", "gru"                            */
+    double *h;       /* |dL/dh_t|                                        */
+    double *c;       /* lstm: |dL/dc_t|, else NULL                       */
+    double *gate_prod; /* lstm: mean over cells of Π_{s>t} f_s; gru: of z */
+    double *x;       /* |dL/de_t| at the embedding output (the input)    */
+} seq_survival;
+int seq_is_recurrent_type(const char *type);
+/* layer: net layer index, < 0 = the first recurrent layer. 0 = ok. */
+int seq_survival_collect(const nmz_trace_recorder *rec, int layer, int T, seq_survival *sv);
+void seq_survival_free(seq_survival *sv);
+/* geometric-mean factor per step of v[T-1] -> v[0]; *left = v[0]/v[T-1] */
+double seq_survival_rate(const double *v, int T, double *left);
+/* unit < 0 = automatic; layer = net layer index (< 0: the first recurrent
+ * layer); sv (may be NULL) = the vanishing-gradient view */
 void print_seq_trace(const nmz_trace_recorder *rec, const nmz_vocab *v, const print_opts *o, int applied, int unit,
-                     const double *last_norms, int n_last);
+                     int layer, const seq_survival *sv);
+/* cmd_seq.c: commands for sequence models */
+int cmd_compare(cli_state *st, int argc, char **argv);
+int show_gates(cli_state *st, int argc, char **argv);
+/* net layer index of the n-th (1-based) recurrent layer, or -1 */
+int seq_recurrent_layer(const nmz_net *net, int n);
 void print_rule(void);
 
 #endif

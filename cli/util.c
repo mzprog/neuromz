@@ -329,5 +329,8 @@ const char *cli_char_label(uint32_t cp, char *buf, size_t n) {
 
 const char *cli_init_reason(int init) {
     if (init == NMZ_INIT_HE) return "He: Var(W) = 2/fan_in, makes up for relu zeroing half of the signal";
+    if (init == NMZ_INIT_ORTHOGONAL)
+        return "recurrent W_h orthogonal (all singular values 1: repeated steps neither shrink nor blow up h), "
+               "input W_x Glorot";
     return "Glorot/Xavier: Var(W) = 2/(fan_in+fan_out), keeps tanh/sigmoid layers in their useful range";
 }

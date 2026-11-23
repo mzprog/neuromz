@@ -177,6 +177,7 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
     const char *data = "mnist:test";
     char desc[160];
     nmz_norm norm;
+    if (argc > 1 && !strcmp(argv[1], "gates")) return show_gates(st, argc, argv);
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "weights") || !strcmp(argv[i], "--weights"))
             weights = 1;
@@ -192,7 +193,8 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
             if (!(data = cli_opt_value(argc, argv, &i))) return 1;
         } else if (parse_header_opt(argv[i], &header)) {
         } else
-            return fail("show takes `weights`, `filters`, `vocab` or `sample N [--data SPEC]`, got '%s'", argv[i]);
+            return fail("show takes `weights`, `filters`, `vocab`, `gates [--text T | --data FILE]` or `sample N "
+                        "[--data SPEC]`, got '%s'", argv[i]);
     }
     if (sample) return show_sample(st, sample, data, header);
     if (!need_net(st)) return 1;
@@ -207,6 +209,11 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
         }
         printf("Vocabulary: %d characters (Unicode code points), %llu occurrences in the training text%s\n", v->size,
                (unsigned long long)total, v->items ? "; ⏎ = end of an item" : "");
+        if (v->normalize)
+            printf("Text normalization: %s%s%s (applied to every text the model reads)\n",
+                   v->normalize & NMZ_TEXT_STRIP_DIACRITICS ? "tashkeel and tatweel removed" : "",
+                   v->normalize == NMZ_TEXT_NORMALIZE_ALL ? ", " : "",
+                   v->normalize & NMZ_TEXT_UNIFY_ALEF ? "alef forms written as bare alef" : "");
         printf("  %4s  %-6s  %-8s %10s  %6s\n", "id", "char", "code", "count", "share");
         for (k = 0; k < v->size; k++) {
             char lbl[32];
@@ -236,7 +243,8 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
             const nmz_vocab *v = nmz_net_vocab(st->net);
             printf("text: T character ids per sequence (any T)%s\n",
                    v && v->items ? ", one item per line" : "");
-            if (v) printf("  vocabulary   %d characters (`show vocab` lists them)\n", v->size);
+            if (v) printf("  vocabulary   %d characters (`show vocab` lists them)%s\n", v->size,
+                          v->normalize ? ", Arabic text normalization on" : "");
         } else {
             print_shape(nmz_net_layer(st->net, 0));
             printf(" (%d value(s) per sample)\n", nmz_net_input_size(st->net));
@@ -359,45 +367,69 @@ static int cmd_generate(cli_state *st, int argc, char **argv) {
         }
     }
     if (new_only && !data) return fail("--new-only needs --data FILE (the training items to avoid)%s", NULL);
-    if (!v->items) { /* running text: one passage per seed */
+    if (!v->items) { /* running text: one passage per seed, all generated at once */
+        char **outs;
         if (!count) count = 1;
         if (!length_set) g.length = 300;
-        for (i = 0; i < count; i++) {
-            char *out = NULL;
-            g.seed = seed + (uint64_t)i;
-            if (nmz_net_generate(st->net, &g, &out, NULL) != NMZ_OK) return lib_fail("generate");
-            if (count > 1) printf("--- seed %llu\n", (unsigned long long)g.seed);
-            printf("%s%s\n", g.prime ? g.prime : "", out);
-            free(out);
+        g.seed = seed;
+        outs = calloc((size_t)count, sizeof *outs);
+        if (!outs) return fail("out of memory%s", NULL);
+        if (nmz_net_generate_batch(st->net, &g, (int)count, outs, NULL) != NMZ_OK) {
+            free(outs);
+            return lib_fail("generate");
         }
+        for (i = 0; i < count; i++) {
+            if (count > 1) printf("--- seed %llu\n", (unsigned long long)(seed + (uint64_t)i));
+            printf("%s%s\n", g.prime ? g.prime : "", outs[i]);
+            free(outs[i]);
+        }
+        free(outs);
         return 0;
     }
-    /* items (names): stop at the end-of-item token, keep distinct ones */
+    /* items (names): stop at the end-of-item token, keep distinct ones. Rows
+     * are generated in batches (one forward pass per step for the batch) and
+     * judged in seed order, so the result is the same as one item at a time
+     * with seeds seed, seed+1, ... */
     if (!count) count = 10;
     if (!length_set) g.length = 64;
     g.stop_at_end = 1;
     seen = calloc((size_t)count, sizeof *seen);
     if (!seen) return fail("out of memory%s", NULL);
     while (made < count && attempts < count * 50) {
-        char *out = NULL;
-        size_t len;
-        int dup = 0, k, known;
-        g.seed = seed + (uint64_t)attempts++;
-        if (nmz_net_generate(st->net, &g, &out, NULL) != NMZ_OK) {
+        int need = (int)count - made, rows = need + need / 2 + 1, k, r;
+        char **outs;
+        if (rows > 1024) rows = 1024;
+        if (rows > count * 50 - attempts) rows = (int)count * 50 - attempts;
+        outs = calloc((size_t)rows, sizeof *outs);
+        g.seed = seed + (uint64_t)attempts;
+        if (!outs || nmz_net_generate_batch(st->net, &g, rows, outs, NULL) != NMZ_OK) {
             for (k = 0; k < made; k++) free(seen[k]);
             free(seen);
-            return lib_fail("generate");
+            free(outs);
+            return outs ? lib_fail("generate") : fail("out of memory%s", NULL);
         }
-        len = strlen(out);
-        if (len && out[len - 1] == '\n') out[--len] = '\0';
-        for (k = 0; k < made && !dup; k++) dup = !strcmp(seen[k], out);
-        known = data && len ? line_in_file(data, out) : 0;
-        if (!len || dup || (new_only && known)) {
-            free(out);
-            continue;
+        for (r = 0; r < rows; r++) {
+            char *out = outs[r];
+            size_t len;
+            int dup = 0, known;
+            outs[r] = NULL;
+            if (made >= count) { /* enough: the rest of the batch is not used */
+                free(out);
+                continue;
+            }
+            attempts++;
+            len = strlen(out);
+            if (len && out[len - 1] == '\n') out[--len] = '\0';
+            for (k = 0; k < made && !dup; k++) dup = !strcmp(seen[k], out);
+            known = data && len ? line_in_file(data, out) : 0;
+            if (!len || dup || (new_only && known)) {
+                free(out);
+                continue;
+            }
+            seen[made++] = out;
+            printf("  %2d. %s%s%s\n", made, g.prime ? g.prime : "", out, known ? "   (in the training data)" : "");
         }
-        seen[made++] = out;
-        printf("  %2d. %s%s%s\n", made, g.prime ? g.prime : "", out, known ? "   (in the training data)" : "");
+        free(outs);
     }
     if (made < count) printf("(only %d distinct item(s) after %d attempts)\n", made, attempts);
     for (i = 0; i < made; i++) free(seen[i]);
@@ -464,9 +496,9 @@ static int on_epoch(const nmz_epoch_info *info, void *user) {
 static int cmd_train(cli_state *st, int argc, char **argv) {
     nmz_train_opts o;
     nmz_train_result res;
-    nmz_dataset *ds = NULL;
+    nmz_dataset *ds = NULL, *vds = NULL;
     progress pr;
-    const char *spec = NULL;
+    const char *spec = NULL, *val_file = NULL;
     unsigned mask = 0;
     int i, header = -1, limit = 0, fitted_before = 0, fitted_after = 0;
     long every = 0;
@@ -485,6 +517,8 @@ static int cmd_train(cli_state *st, int argc, char **argv) {
                 pr.quiet = 1;
             } else if (!strcmp(argv[i], "--limit")) {
                 if (!parse_limit(argc, argv, &i, &limit)) return 1;
+            } else if (!strcmp(argv[i], "--val-file")) {
+                if (!(val_file = cli_opt_value(argc, argv, &i))) return 1;
             } else if (!strcmp(argv[i], "--every")) {
                 const char *v = cli_opt_value(argc, argv, &i);
                 if (!v || !cli_parse_int(v, 1, 1000000000L, &every))
@@ -500,23 +534,29 @@ static int cmd_train(cli_state *st, int argc, char **argv) {
     }
     if (!spec) return fail("usage: train DATA [options]   DATA = FILE.csv, mnist, or an IDX images file%s", NULL);
     if (cli_load_data(st, spec, 0, limit, header, o.seq_len, &ds)) return 1;
+    if (val_file && cli_load_data(st, val_file, 1, 0, header, o.seq_len, &vds)) {
+        nmz_dataset_free(ds);
+        return 1;
+    }
     pr.max_epochs = o.max_epochs;
     pr.every = every ? (int)every : (o.max_epochs >= 20 ? o.max_epochs / 20 : 1);
     pr.tty = cli_stdout_is_tty();
     pr.t0 = cli_now();
     pr.ce = nmz_net_loss_kind(st->net) == NMZ_LOSS_CROSS_ENTROPY;
-    pr.has_val = o.val_fraction > 0;
+    pr.has_val = o.val_fraction > 0 || vds;
     o.on_epoch = on_epoch;
     o.on_batch = on_batch;
     o.user = &pr;
     nmz_net_normalization(st->net, &fitted_before, NULL, NULL, NULL);
     printf("Training on %s: %d samples%s, %d input(s), %d output(s)\n", spec, ds->n_samples,
            limit ? " (--limit)" : "", ds->n_inputs, ds->n_outputs);
+    if (vds)
+        printf("Validating on %s: %d samples (all of %s is used for training)\n", val_file, vds->n_samples, spec);
     printf("  ");
     cli_print_train_config(&o);
     if (o.batch_size > ds->n_samples)
         printf("  (batch %d > %d samples: using the full dataset as one batch)\n", o.batch_size, ds->n_samples);
-    s = nmz_net_train(st->net, ds, &o, &res);
+    s = nmz_net_train_val(st->net, ds, vds, &o, &res);
     clear_line(&pr);
     st->dirty = 1;
     nmz_net_normalization(st->net, &fitted_after, NULL, NULL, NULL);
@@ -524,6 +564,7 @@ static int cmd_train(cli_state *st, int argc, char **argv) {
         printf("  (input normalization was fitted on this data and is now part of the model)\n");
     if (s != NMZ_OK) {
         nmz_dataset_free(ds);
+        nmz_dataset_free(vds);
         return lib_fail("training stopped");
     }
     if (res.converged)
@@ -537,8 +578,11 @@ static int cmd_train(cli_state *st, int argc, char **argv) {
         printf("Stopped at the epoch limit (%d): loss %.6g > target %g, ", res.epochs, res.loss, o.target_loss);
     print_acc(res.accuracy);
     printf(" (on the training data), %.1fs\n", cli_now() - pr.t0);
-    if (o.val_fraction > 0) {
-        printf("  validation (last %g%% of the data): loss %.6g", 100.0 * o.val_fraction, res.val_loss);
+    if (vds || o.val_fraction > 0) {
+        if (vds)
+            printf("  validation (%s): loss %.6g", val_file, res.val_loss);
+        else
+            printf("  validation (last %g%% of the data): loss %.6g", 100.0 * o.val_fraction, res.val_loss);
         if (pr.ce) printf(", perplexity %.3f", exp(res.val_loss));
         if (!isnan(res.val_accuracy)) printf(", accuracy %.1f%%", 100.0 * res.val_accuracy);
         printf("\n");
@@ -547,6 +591,7 @@ static int cmd_train(cli_state *st, int argc, char **argv) {
         printf("  hint: try more epochs (--epochs), another learning rate (--lr), more hidden units, or a looser "
                "--target-loss\n");
     nmz_dataset_free(ds);
+    nmz_dataset_free(vds);
     return 0;
 }
 
@@ -802,7 +847,7 @@ static int sample_tensors(cli_state *st, const sample_args *a, nmz_tensor *x, nm
 /* ------------------------------------------------------ trace on a sequence */
 
 typedef struct seq_args {
-    int *ids, *tgt, T, unit, full;
+    int *ids, *tgt, T, unit, full, layer;
     long sample;
     const char *data, *json, *text;
     print_opts po;
@@ -817,6 +862,7 @@ static int parse_seq_args(cli_state *st, int argc, char **argv, seq_args *a) {
     memset(a, 0, sizeof *a);
     a->o = *nmz_net_train_config(st->net);
     a->unit = -1;
+    a->layer = -1;
     for (i = 1; i < argc; i++) {
         const char *s = argv[i], *val;
         if (!strcmp(s, "--full")) {
@@ -824,13 +870,17 @@ static int parse_seq_args(cli_state *st, int argc, char **argv, seq_args *a) {
             continue;
         }
         if (!strcmp(s, "--text") || !strcmp(s, "--sample") || !strcmp(s, "--data") || !strcmp(s, "--json") ||
-            !strcmp(s, "--unit")) {
+            !strcmp(s, "--unit") || !strcmp(s, "--layer")) {
             if (!(val = cli_opt_value(argc, argv, &i))) return 1;
             if (!strcmp(s, "--text")) a->text = val;
             else if (!strcmp(s, "--data")) a->data = val;
             else if (!strcmp(s, "--json")) a->json = val;
             else if (!strcmp(s, "--sample")) {
                 if (!cli_parse_int(val, 1, 1000000000L, &a->sample)) return fail("--sample needs a positive integer, got '%s'", val);
+            } else if (!strcmp(s, "--layer")) {
+                if (!cli_parse_int(val, 1, 1000, &n)) return fail("--layer needs a positive integer (1-based), got '%s'", val);
+                if ((a->layer = seq_recurrent_layer(st->net, (int)n)) < 0)
+                    return fail("--layer %s: the model has fewer recurrent layers (rnn/lstm/gru)", val);
             } else {
                 if (!cli_parse_int(val, 1, 100000, &n)) return fail("--unit needs a positive integer (1-based), got '%s'", val);
                 a->unit = (int)n - 1;
@@ -848,6 +898,7 @@ static int parse_seq_args(cli_state *st, int argc, char **argv, seq_args *a) {
         uint32_t *cp = NULL;
         size_t m = 0, bad = 0, k;
         if (nmz_utf8_decode(a->text, strlen(a->text), &cp, &m, &bad) != NMZ_OK) return lib_fail("--text");
+        m = nmz_text_normalize(cp, m, v->normalize); /* the model's normalisation (e.g. no tashkeel) */
         if (m < 2 || m > 10000) {
             free(cp);
             return fail("--text needs at least 2 characters (the net predicts each next one)%s", NULL);
@@ -923,8 +974,10 @@ static int run_trace_seq(cli_state *st, int argc, char **argv, int apply) {
     nmz_trace_recorder *rec = NULL;
     nmz_tensor x = NMZ_TENSOR_EMPTY, t = NMZ_TENSOR_EMPTY;
     const nmz_vocab *v = nmz_net_vocab(st->net);
-    double *last = NULL, L = 0;
-    int rc = 1, V = nmz_net_output_size(st->net), k;
+    seq_survival sv;
+    double L = 0;
+    int rc = 1, V = nmz_net_output_size(st->net);
+    memset(&sv, 0, sizeof sv);
     if (parse_seq_args(st, argc, argv, &a)) goto out;
     if (!v || v->size != V) {
         fail("this sequence model has no matching vocabulary%s", NULL);
@@ -932,21 +985,10 @@ static int run_trace_seq(cli_state *st, int argc, char **argv, int apply) {
     }
     if (nmz_trace_recorder_create(&rec) != NMZ_OK) goto lib;
     /* 1. the loss of the last step alone, followed back through time */
-    last = calloc((size_t)a.T, sizeof *last);
-    if (!last || seq_tensors(&a, V, 1, &x, &t)) goto lib;
+    if (seq_tensors(&a, V, 1, &x, &t)) goto lib;
     nmz_net_set_trace(st->net, nmz_trace_recorder_fn, rec);
     if (nmz_net_forward_mode(st->net, &x, 0, NULL) != NMZ_OK || nmz_net_backward(st->net, &t, NULL) != NMZ_OK) goto lib;
-    for (k = 0; k < (int)nmz_trace_recorder_count(rec); k++) {
-        const nmz_trace_event *ev = nmz_trace_recorder_get(rec, (size_t)k);
-        if (ev->phase == NMZ_TRACE_BACKWARD && !strcmp(ev->layer_type, "rnn") && ev->time_step >= 0 &&
-            ev->time_step < a.T) {
-            const nmz_tensor *g = nmz_trace_find(ev, "dL/dh");
-            double s2 = 0;
-            size_t e;
-            for (e = 0; g && e < g->size; e++) s2 += (double)g->data[e] * g->data[e];
-            last[ev->time_step] = sqrt(s2);
-        }
-    }
+    if (seq_survival_collect(rec, a.layer, a.T, &sv)) seq_survival_free(&sv); /* (no recurrent layer: no view) */
     nmz_trace_recorder_clear(rec);
     /* 2. the real pass: every step's loss */
     if (seq_tensors(&a, V, 0, &x, &t)) goto lib;
@@ -962,7 +1004,7 @@ static int run_trace_seq(cli_state *st, int argc, char **argv, int apply) {
     }
     printf("%s of one sequence (%d steps): every value of the forward and backward pass, unrolled through time\n",
            apply ? "STEP" : "TRACE", a.T);
-    print_seq_trace(rec, v, &a.po, apply, a.unit, last, a.T);
+    print_seq_trace(rec, v, &a.po, apply, a.unit, a.layer, &sv);
     printf("\n");
     print_rule();
     if (apply) {
@@ -982,7 +1024,7 @@ out:
     nmz_trace_recorder_free(rec);
     nmz_tensor_free(&x);
     nmz_tensor_free(&t);
-    free(last);
+    seq_survival_free(&sv);
     free(a.ids);
     free(a.tgt);
     return rc;
@@ -1187,7 +1229,7 @@ static int cmd_quit(cli_state *st, int argc, char **argv) {
 }
 
 static const cmd k_cmds[] = {
-    {"new", cmd_new, "new INPUT LAYER... [options]  |  new --preset mnist-cnn|mnist-mlp",
+    {"new", cmd_new, "new INPUT LAYER... [options]  |  new --preset NAME",
      "Create a network. INPUT is a size (784) or an image shape (1x28x28, or 28x28).\n"
      "  Layers (each one argument):\n"
      "    N[:ACT][:INIT]                     dense layer, e.g. 64:relu, 10:softmax, 4:tanh:xavier\n"
@@ -1195,20 +1237,30 @@ static const cmd k_cmds[] = {
      "    pool:K[:stride=S]                  max pooling, e.g. pool:2\n"
      "    flatten | dropout:RATE             (a flatten is inserted automatically before dense layers)\n"
      "  activations: linear sigmoid tanh relu leaky_relu[=ALPHA] softmax    inits: auto xavier he\n"
-     "  Quick mode: new 2 4 1   (defaults chosen and explained).  Presets: --preset mnist-cnn, mnist-mlp\n"
+     "  Text models: INPUT `text` with --data FILE (builds the character vocabulary), then\n"
+     "    embed:D  rnn:H  lstm:H[:forget_bias=F]  gru:H  (inits: auto = orthogonal, xavier, he)  vocab\n"
+     "    e.g. new text embed:32 lstm:64 dropout:0.2 lstm:64 vocab --data FILE   (stacked)\n"
+     "    --items/--no-items, --strip-diacritics (Arabic tashkeel + tatweel), --unify-alef (أ إ آ -> ا)\n"
+     "  Quick mode: new 2 4 1   (defaults chosen and explained).\n"
+     "  Presets: mnist-cnn mnist-mlp names char-rnn names-lstm char-lstm arabic-text\n"
      "  options: --loss mse|ce --normalize none|minmax|zscore --seed N\n"
      "           --optimizer sgd|adam --lr X --momentum X --beta1 X --beta2 X --eps X\n"
      "           --schedule constant|step|cosine --step-size N --gamma X --min-lr X\n"
      "           --batch N --epochs N --target-loss X --no-shuffle"},
-    {"show", cmd_show, "show [weights | filters | vocab | sample N [--data SPEC]]",
+    {"show", cmd_show, "show [weights | filters | vocab | gates (--text T | --data FILE) | sample N [--data SPEC]]",
      "Describe the network; `weights` prints every parameter, `filters` draws the conv kernels as\n"
-     "  ASCII heatmaps, `sample N` draws sample N (default from mnist:test) with the prediction."},
+     "  ASCII heatmaps, `sample N` draws sample N (default from mnist:test) with the prediction,\n"
+     "  `vocab` lists a text model's characters. `gates` runs a text (--text, or --data FILE with\n"
+     "  --from K --chars N, default 20000 characters) through an LSTM/GRU model and summarises its\n"
+     "  gates: means, how often they are near 0 or 1, the forget/update gate per unit, memory half-lives."},
     {"train", cmd_train, "train DATA [options]",
      "Train. DATA is a CSV file (first INPUTS columns are inputs, the rest targets; a text label column\n"
      "  is one-hot encoded), `mnist` (the training set, after `make data`) or an IDX images file.\n"
      "  Options override the stored config for this run only (use `set` to change it):\n"
      "  --limit N (first N samples) --epochs N --batch N --lr X --optimizer sgd|adam --schedule ...\n"
-     "  --every N --quiet --header/--no-header. A live progress line is shown on terminals."},
+     "  --every N --quiet --header/--no-header. A live progress line is shown on terminals.\n"
+     "  Validation: --val F (the last fraction F of DATA) or --val-file FILE (a separate set; then all\n"
+     "  of DATA trains). Text models: --seq-len N --carry/--no-carry --clip X --patience N."},
     {"test", cmd_test, "test DATA [--limit N]",
      "Loss and accuracy on a dataset (`mnist` = the 10 000 test images), with a confusion matrix."},
     {"predict", cmd_predict, "predict X1 ... Xn  |  predict --sample N [--data SPEC]",
@@ -1219,9 +1271,12 @@ static const cmd k_cmds[] = {
      "  (--at FILTER,ROW,COL, 1-based; default: filter 1 at the centre), max-pool shows the window and\n"
      "  its winner. Nothing is changed (evaluation mode; the update is only previewed).\n"
      "  --target may be a class name; with --sample the dataset label is the target.\n"
-     "  Text models: trace --text \"Alice was\" (or --sample N --data FILE) shows the RNN unrolled through\n"
-     "  time (h_t = tanh(...) for hidden unit --unit J, top-5 next characters), a heatmap of the hidden\n"
-     "  state, backpropagation through time and how the gradient vanishes or explodes."},
+     "  Text models: trace --text \"Alice was\" (or --sample N --data FILE) shows the recurrent layer\n"
+     "  unrolled through time for unit --unit J: rnn h_t = tanh(...); lstm every gate i f g o, c_t and\n"
+     "  h_t with bars; gru z, r, h~ and h_t. Then heatmaps over time (all hidden units, or the gates of\n"
+     "  one cell and the forget/update gate of every cell), backpropagation through time and how the\n"
+     "  gradient of the last character vanishes (along h, and along the LSTM cell state c).\n"
+     "  Stacked models: --layer N shows the N-th recurrent layer."},
     {"step", cmd_step_fwd, "step (same arguments as trace) [--lr X] [--optimizer ...]",
      "Like trace, but in training mode and the weight update is applied: one step you can follow."},
     {"generate", cmd_generate,
@@ -1231,6 +1286,11 @@ static const cmd k_cmds[] = {
      "  file are marked, --new-only skips them. Running-text models print --length characters (300).\n"
      "  --temperature < 1 is safer/more repetitive, > 1 wilder; --top-k K samples among the K most\n"
      "  likely characters only; the same --seed gives the same text."},
+    {"compare", cmd_compare, "compare MODEL.nmz [MODEL.nmz ...] (--text TEXT | --data FILE [--from K] [--chars N]) [--layer N] [--full]",
+     "Gradient survival side by side: for each trained text model (e.g. an rnn, an lstm and a gru\n"
+     "  trained on the same data), how much of the LAST character's loss gradient reaches the step k\n"
+     "  characters back - along h, along an LSTM's cell state c, and the product of the forget (LSTM)\n"
+     "  or update (GRU) gates. With --data the text is --chars characters (default 65) from offset --from."},
     {"gradcheck", cmd_gradcheck, "gradcheck (X1 ... Xn --target T... | --sample N [--data SPEC] | --text TEXT)",
      "Compare every backprop gradient with a numerical derivative (L(w+e)-L(w-e))/2e."},
     {"save", cmd_save, "save [FILE] [--no-optimizer]",

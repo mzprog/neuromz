@@ -24,7 +24,7 @@ LIB_SRC := src/error.c src/tensor.c src/rng.c src/activation.c src/dense.c src/l
            src/net.c src/train.c src/trace.c src/gradcheck.c src/io.c src/dataset.c \
            src/defaults.c src/conv2d.c src/shape_layers.c src/normalize.c \
            src/text.c src/recurrent.c src/lstm.c src/gru.c src/generate.c
-CLI_SRC := cli/main.c cli/commands.c cli/cmd_new.c cli/util.c cli/print.c cli/print_conv.c cli/print_seq.c cli/line.c
+CLI_SRC := cli/main.c cli/commands.c cli/cmd_new.c cli/util.c cli/print.c cli/print_conv.c cli/print_seq.c cli/cmd_seq.c cli/line.c
 TEST_SRC := tests/test_main.c tests/test_core.c tests/test_math.c tests/test_train.c \
             tests/test_io.c tests/test_layers.c tests/test_optim.c \
             tests/test_text.c tests/test_seq.c tests/test_gated.c

@@ -136,12 +136,57 @@ check 1 "need the .text. input" "$B" new 4 rnn:8 3
 check 1 "text model" "$B" -m "$T/xor.nmz" generate
 printf 'ab\377cd\nabce\nabcf\n' >"$T/bad.txt"
 check 0 "U+FFFD" sh -c "\"$B\" new text embed:2 rnn:3 vocab --data \"$T/bad.txt\" --seq-len 2 -o \"$T/b.nmz\" && \"$B\" -m \"$T/b.nmz\" show vocab"
+
+# --- gated layers (phase 4): LSTM, GRU, stacks, gate views, compare
+check 0 "\[preset\]" "$B" new --preset names-lstm --epochs 2 -o "$T/nl.nmz"
+check 0 "validation" "$B" -m "$T/nl.nmz" train examples/names_en.txt --limit 200 -o "$T/nl.nmz"
+check 0 "forget gate" "$B" -m "$T/nl.nmz" trace --text "Anna"
+check 0 "FORGET GATE f of every cell" "$B" -m "$T/nl.nmz" trace --text "Christopher" --unit 2
+check 0 "along the cell state" "$B" -m "$T/nl.nmz" trace --text "Christopher"
+check 0 "PASS" "$B" -m "$T/nl.nmz" gradcheck --text "Eve"
+check 0 "Weights updated" "$B" -m "$T/nl.nmz" step --text "Bob"
+check 0 "mean forget gate f per cell" "$B" -m "$T/nl.nmz" show gates --data examples/names_en.txt --chars 500
+check 0 "longest memory" "$B" -m "$T/nl.nmz" show gates --text "AnnaMaria"
+check 0 " 4\. " "$B" -m "$T/nl.nmz" generate --count 4 --seed 3
+check 0 "gru Tx8->Tx6" "$B" new text embed:8 gru:6 vocab --data examples/names_en.txt --epochs 2 -o "$T/ng.nmz"
+check 0 "validation" "$B" -m "$T/ng.nmz" train examples/names_en.txt --limit 100 -o "$T/ng.nmz"
+check 0 "UPDATE GATE z" "$B" -m "$T/ng.nmz" trace --text "Anna"
+check 0 "GRADIENT SURVIVAL" "$B" compare "$T/n.nmz" "$T/nl.nmz" "$T/ng.nmz" --text "Maximilian"
+check 0 "lstm c" "$B" compare "$T/nl.nmz" --data examples/names_en.txt --from 100 --chars 30 --full
+check 0 "sigmoid(2.5) = 0.92" "$B" new text embed:4 lstm:6:forget_bias=2.5:xavier dropout:0.2 lstm:5 vocab --data examples/names_ar.txt -o "$T/st.nmz"
+check 0 "layer 3 (lstm)" "$B" -m "$T/st.nmz" trace --text "سارة" --layer 2
+check 0 "Validating on" "$B" -m "$T/st.nmz" train examples/names_ar.txt --epochs 1 --val-file examples/names_ar.txt
+check 0 "orthogonal" "$B" new text embed:4 rnn:6:orthogonal vocab --data examples/names_en.txt
+check 0 "strip-marks" "$B" new text embed:4 lstm:4 vocab --data examples/names_ar.txt --strip-diacritics -o "$T/sd.nmz"
+check 0 "tashkeel" "$B" -m "$T/sd.nmz" show vocab
+check 0 " 2\. " "$B" -m "$T/sd.nmz" generate --count 2 --prime "مُ"
+check 1 "fewer recurrent layers" "$B" -m "$T/st.nmz" trace --text "سارة" --layer 3
+check 1 "no gated layer" "$B" -m "$T/n.nmz" show gates --text "Anna"
+check 1 "not in the vocabulary" "$B" compare "$T/nl.nmz" "$T/st.nmz" --text "Anna"
+check 1 "usage: compare" "$B" compare
+check 1 "orthogonal init is for recurrent" "$B" new text embed:4:orthogonal vocab --data examples/names_en.txt
+check 1 "forget_bias" "$B" new text embed:4 lstm:4:forget_bias=x vocab --data examples/names_en.txt
+check 1 "gru needs a number" "$B" new text embed:4 gru vocab --data examples/names_en.txt
+check 1 "text models only" "$B" new 2 4 1 --strip-diacritics
+check 1 "cannot open\|cannot read" "$B" -m "$T/nl.nmz" train examples/names_en.txt --val-file "$T/missing.txt"
+
 if [ -f data/alice.txt ]; then
     check 0 "\[preset\]" "$B" new --preset char-rnn --epochs 1 -o "$T/c.nmz"
     check 0 "validation" "$B" -m "$T/c.nmz" train data/alice.txt --limit 60 -o "$T/c.nmz"
     check 0 "" "$B" -m "$T/c.nmz" generate --length 40 --prime "Alice"
+    check 0 "seed 2" "$B" -m "$T/c.nmz" generate --length 20 --count 2 --seed 1
+    check 0 "\[preset\]" "$B" new --preset char-lstm --epochs 1 -o "$T/cl.nmz"
+    check 0 "validation" "$B" -m "$T/cl.nmz" train data/alice.txt --limit 40 -o "$T/cl.nmz"
+    check 0 "GRADIENT SURVIVAL" "$B" compare "$T/c.nmz" "$T/cl.nmz" --data data/alice.txt --from 1000
 else
     echo "skip char-rnn checks (run make data-text)"
+fi
+if [ -f data/kalila.txt ]; then
+    check 0 "\[preset\]" "$B" new --preset arabic-text --epochs 1 --strip-diacritics -o "$T/k.nmz"
+    check 0 "validation" "$B" -m "$T/k.nmz" train data/kalila.txt --limit 20 -o "$T/k.nmz"
+    check 0 "" "$B" -m "$T/k.nmz" generate --length 30 --prime "قال"
+else
+    echo "skip Arabic text checks (run make data-text)"
 fi
 
 # --- MNIST (only when `make data` has been run)
