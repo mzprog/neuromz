@@ -39,6 +39,11 @@ uint32_t nmz__crc32(uint32_t crc, const void *data, size_t n);
 /* ----- built-in layer ops */
 extern const nmz_layer_ops nmz__dense_ops;
 extern const nmz_layer_ops nmz__activation_ops;
+extern const nmz_layer_ops nmz__conv2d_ops;
+extern const nmz_layer_ops nmz__maxpool2d_ops;
+extern const nmz_layer_ops nmz__flatten_ops;
+extern const nmz_layer_ops nmz__dropout_ops;
+int nmz__conv2d_init_used(const nmz_layer *l);
 
 /* Activation layer accessors */
 nmz_act nmz__activation_layer_act(const nmz_layer *l);

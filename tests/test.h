@@ -67,6 +67,7 @@ extern const test_case core_tests[];
 extern const test_case math_tests[];
 extern const test_case train_tests[];
 extern const test_case io_tests[];
+extern const test_case layer_tests[];
 
 /* Scratch file path inside the build directory. */
 const char *test_path(const char *name);

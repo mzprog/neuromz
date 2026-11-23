@@ -163,7 +163,8 @@ static nmz_status read_str(nmz_reader *r, char **out) {
 
 /* --------------------------------------------------------------- registry */
 
-static const nmz_layer_ops *const k_registry[] = {&nmz__dense_ops, &nmz__activation_ops};
+static const nmz_layer_ops *const k_registry[] = {&nmz__dense_ops,     &nmz__activation_ops, &nmz__conv2d_ops,
+                                                  &nmz__maxpool2d_ops, &nmz__flatten_ops,    &nmz__dropout_ops};
 
 const nmz_layer_ops *nmz_layer_ops_find(const char *type) {
     size_t i;

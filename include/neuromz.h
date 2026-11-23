@@ -134,6 +134,19 @@ nmz_layer *nmz_layer_dense(int units, nmz_init init);
 /* alpha is the negative slope for NMZ_ACT_LEAKY_RELU (ignored otherwise;
  * pass 0 to use the default 0.01). */
 nmz_layer *nmz_layer_activation(nmz_act act, float alpha);
+/* Convolution over per-sample [C, H, W] input: `filters` kernels of
+ * kh × kw, zero padding `pad` (or NMZ_PAD_SAME: output keeps H×W; needs
+ * stride 1 and an odd kernel). NMZ_INIT_AUTO = He unless a tanh/sigmoid
+ * activation follows. Output [filters, OH, OW], OH = (H + 2·pad − kh)/stride + 1. */
+#define NMZ_PAD_SAME (-1)
+nmz_layer *nmz_layer_conv2d(int filters, int kh, int kw, int stride, int pad, nmz_init init);
+/* Max pooling over size × size windows (stride 0 = size), no padding. */
+nmz_layer *nmz_layer_maxpool2d(int size, int stride);
+/* [d1, d2, ...] → [d1·d2·...] (needed between conv/pool and dense layers). */
+nmz_layer *nmz_layer_flatten(void);
+/* Inverted dropout: in training each value is zeroed with probability `rate`
+ * and the rest scaled by 1/(1−rate); identity in evaluation. */
+nmz_layer *nmz_layer_dropout(float rate);
 /* Free a layer that was NOT added to a net. */
 void nmz_layer_free(nmz_layer *l);
 
@@ -149,6 +162,8 @@ nmz_tensor *nmz_layer_param_grad(nmz_layer *l, int i);
 int nmz_layer_activation_kind(const nmz_layer *l);
 /* For dense layers: the init actually used (AUTO resolved after build), else -1. */
 int nmz_layer_dense_init(const nmz_layer *l);
+/* Same for any layer with initialised weights (dense, conv2d), else -1. */
+int nmz_layer_init_used(const nmz_layer *l);
 /* Output size per sample (product of the per-sample output shape). */
 int nmz_layer_output_size(const nmz_layer *l);
 int nmz_layer_input_size(const nmz_layer *l);

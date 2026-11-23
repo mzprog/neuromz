@@ -195,6 +195,11 @@ int nmz_layer_dense_init(const nmz_layer *l) {
     return (int)((const dense_layer *)l->self)->resolved;
 }
 
+int nmz_layer_init_used(const nmz_layer *l) {
+    if (l && l->ops == &nmz__conv2d_ops) return nmz__conv2d_init_used(l);
+    return nmz_layer_dense_init(l);
+}
+
 nmz_layer *nmz_layer_dense(int units, nmz_init init) {
     dense_layer *d;
     nmz_layer *l;
