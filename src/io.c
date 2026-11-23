@@ -223,6 +223,7 @@ static void sec_train_ext(nmz_net *net, nmz_writer *w) {
     nmz_write_f32(w, net->train.clip_norm);
     nmz_write_u32(w, (uint32_t)(net->train.carry_state != 0));
     nmz_write_u32(w, (uint32_t)net->train.seq_len);
+    nmz_write_u32(w, (uint32_t)net->train.patience);
 }
 
 static void write_section(nmz_net *net, nmz_writer *w, const char *tag, void (*fn)(nmz_net *, nmz_writer *)) {
@@ -405,17 +406,19 @@ static nmz_status read_vocab(nmz_reader *r, nmz_net *net) {
 
 static nmz_status read_train_ext(nmz_reader *r, nmz_net *net) {
     float vf = 0, clip = 0;
-    uint32_t carry = 0, seq = 0;
+    uint32_t carry = 0, seq = 0, pat = 0;
     nmz_read_f32(r, &vf);
     nmz_read_f32(r, &clip);
     nmz_read_u32(r, &carry);
-    if (nmz_read_u32(r, &seq) != NMZ_OK) return r->err;
-    if (!(vf >= 0.0f && vf < 1.0f) || !(clip >= 0.0f) || carry > 1 || seq > 100000)
+    nmz_read_u32(r, &seq);
+    if (nmz_read_u32(r, &pat) != NMZ_OK) return r->err;
+    if (!(vf >= 0.0f && vf < 1.0f) || !(clip >= 0.0f) || carry > 1 || seq > 100000 || pat > 100000)
         return r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt train_ext section");
     net->train.val_fraction = vf;
     net->train.clip_norm = clip;
     net->train.carry_state = (int)carry;
     net->train.seq_len = (int)seq;
+    net->train.patience = (int)pat;
     return NMZ_OK;
 }
 

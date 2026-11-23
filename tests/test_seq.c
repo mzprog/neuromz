@@ -544,6 +544,43 @@ static void test_generate_arabic(void) {
     nmz_dataset_free(ds);
 }
 
+static int track_min(const nmz_epoch_info *info, void *user) {
+    double *best = user;
+    if (info->val_loss < *best) *best = info->val_loss;
+    return 0;
+}
+
+/* early stopping: the small Arabic list overfits after ~10 epochs */
+static void test_patience(void) {
+    nmz_text_opts to = nmz_text_defaults();
+    nmz_dataset *ds = NULL;
+    nmz_net *net;
+    nmz_train_opts o = nmz_train_defaults();
+    nmz_train_result r;
+    double best = HUGE_VAL;
+    to.items = 1;
+    to.seq_len = 12;
+    CHECK_OK(nmz_dataset_load_text(&ds, "examples/names_ar.txt", &to));
+    if (!ds) return;
+    net = char_net(ds->vocab->size, 16, 64, 42);
+    o.optimizer = NMZ_OPT_ADAM;
+    o.learning_rate = 0.005f;
+    o.batch_size = 16;
+    o.max_epochs = 80;
+    o.target_loss = 0;
+    o.val_fraction = 0.1f;
+    o.patience = 4;
+    o.on_epoch = track_min;
+    o.user = &best;
+    CHECK_OK(nmz_net_train(net, ds, &o, &r));
+    test_note("Arabic names, patience 4: stopped after %d epochs, best epoch %d, val loss %.3f", r.epochs, r.best_epoch,
+              r.val_loss);
+    CHECK(r.epochs < 80 && r.best_epoch > 0 && r.epochs == r.best_epoch + 4);
+    CHECK_NEAR(r.val_loss, best, 1e-9); /* the best weights were restored */
+    nmz_net_free(net);
+    nmz_dataset_free(ds);
+}
+
 static void test_phase2_file_loads(void) {
     /* format 3 written by the phase-2 code: no vocab / train_ext sections */
     static const float want[3][3] = {{0x1.f78916p-1f, 0x1.dab4dp-7f, 0x1.0c16f6p-9f},
@@ -573,6 +610,7 @@ const test_case seq_tests[] = {
     {"gen/deterministic_topk_items_saveload", test_generate},
     {"gen/arabic_model_valid_utf8", test_generate_arabic},
     {"io/phase2_format3_file_loads", test_phase2_file_loads},
+    {"train/early_stopping_restores_best", test_patience},
     {"seq/gradcheck_rnn_multistep", test_gradcheck_rnn},
     {"seq/gradcheck_char_rnn_head", test_gradcheck_char_rnn},
     {"seq/gradcheck_carried_state", test_gradcheck_carry},

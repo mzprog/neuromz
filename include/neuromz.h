@@ -202,6 +202,7 @@ typedef struct nmz_epoch_info {
     double val_loss;     /* loss on the validation split (NaN without one) */
     double val_accuracy;
     int clipped_batches; /* batches whose gradients were clipped this epoch */
+    int improved;        /* 1 if this is the best validation loss so far */
 } nmz_epoch_info;
 
 typedef struct nmz_batch_info {
@@ -253,6 +254,10 @@ typedef struct nmz_train_opts {
                             carried over (truncated BPTT); no shuffling   */
     int seq_len;         /* text: time steps per training sequence (used
                             by the loaders/CLI, stored with the model)   */
+    int patience;        /* > 0 with a validation split: stop after this
+                            many epochs without a new best validation
+                            loss and restore the best weights (early
+                            stopping); 0 = off                            */
     nmz_epoch_fn on_epoch;
     nmz_batch_fn on_batch;
     void *user;          /* passed to both callbacks                    */
@@ -266,6 +271,7 @@ typedef struct nmz_train_result {
     int stopped;     /* 1 if the on_epoch callback asked to stop      */
     double val_loss; /* final validation loss (NaN without a split)   */
     double val_accuracy;
+    int best_epoch;  /* epoch whose weights were kept (patience), else 0 */
 } nmz_train_result;
 
 /* Library defaults (not tuned for any dataset). */

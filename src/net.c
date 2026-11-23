@@ -96,6 +96,7 @@ nmz_train_opts nmz_train_defaults(void) {
     o.clip_norm = 0.0f;
     o.carry_state = 0;
     o.seq_len = 0;
+    o.patience = 0;
     return o;
 }
 

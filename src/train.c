@@ -38,6 +38,7 @@ nmz_status nmz__train_opts_validate(const nmz_train_opts *o) {
         return nmz__fail(NMZ_ERR_ARG, "validation fraction must be in [0, 1)");
     if (!(o->clip_norm >= 0.0f) || !isfinite(o->clip_norm)) return nmz__fail(NMZ_ERR_ARG, "clip norm must be >= 0");
     if (o->seq_len < 0 || o->seq_len > 100000) return nmz__fail(NMZ_ERR_ARG, "sequence length must be 0..100000");
+    if (o->patience < 0) return nmz__fail(NMZ_ERR_ARG, "patience must be >= 0");
     return NMZ_OK;
 }
 
@@ -162,13 +163,28 @@ nmz_status nmz_net_evaluate(nmz_net *net, const nmz_dataset *ds, double *loss, d
     return evaluate_range(net, ds, 0, ds->n_samples, loss, accuracy);
 }
 
+/* copy all parameters to/from one flat buffer (early stopping) */
+static void params_copy(nmz_net *net, float *buf, int to_buf) {
+    int k;
+    size_t off = 0;
+    for (k = 0; k < net->n_params; k++) {
+        nmz_tensor *w = nmz_layer_param_value(net->layers[net->param_refs[k].layer], net->param_refs[k].index);
+        if (to_buf)
+            memcpy(buf + off, w->data, w->size * sizeof(float));
+        else
+            memcpy(w->data, buf + off, w->size * sizeof(float));
+        off += w->size;
+    }
+}
+
 nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_opts *opts,
                          nmz_train_result *result) {
     nmz_train_opts o;
     nmz_train_result res;
     nmz_tensor xb = NMZ_TENSOR_EMPTY, tb = NMZ_TENSOR_EMPTY;
-    int *perm = NULL, epoch, i, bs, n, n_val = 0, used;
-    double bl = 0.0;
+    int *perm = NULL, epoch, i, bs, n, n_val = 0, used, best_epoch = 0;
+    double bl = 0.0, best_val = HUGE_VAL;
+    float *best = NULL;
     nmz_status s;
     if (!net) return nmz__fail(NMZ_ERR_ARG, "net is NULL");
     o = opts ? *opts : net->train;
@@ -200,6 +216,13 @@ nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_op
     used = o.carry_state ? (n / bs) * bs : n;
     perm = malloc((size_t)n * sizeof *perm);
     if (!perm) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+    if (o.patience > 0 && n_val > 0) {
+        best = malloc(nmz_net_param_count(net) * sizeof *best + 1);
+        if (!best) {
+            free(perm);
+            return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+        }
+    }
 
     for (epoch = 1; epoch <= o.max_epochs; epoch++) {
         int start, batch = 0, n_batches = (used + bs - 1) / bs, clipped = 0;
@@ -273,9 +296,24 @@ nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_op
         info.val_loss = res.val_loss;
         info.val_accuracy = res.val_accuracy;
         info.clipped_batches = clipped;
+        info.improved = n_val > 0 && res.val_loss < best_val;
+        if (info.improved) {
+            best_val = res.val_loss;
+            best_epoch = epoch;
+            if (best) params_copy(net, best, 1);
+        }
         if (res.loss <= o.target_loss) res.converged = 1;
         if (o.on_epoch && o.on_epoch(&info, o.user)) res.stopped = 1;
         if (res.converged || res.stopped) break;
+        if (best && epoch - best_epoch >= o.patience) break; /* early stopping */
+    }
+    if (best && best_epoch > 0 && best_epoch != res.epochs) { /* go back to the best weights */
+        params_copy(net, best, 0);
+        res.best_epoch = best_epoch;
+        if ((s = evaluate_range(net, ds, 0, n, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
+        if ((s = evaluate_range(net, ds, n, n_val, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
+    } else if (best) {
+        res.best_epoch = best_epoch;
     }
     s = NMZ_OK;
 done:
@@ -283,6 +321,7 @@ done:
     net->carry = 0;
     nmz_net_reset_state(net);
     free(perm);
+    free(best);
     nmz_tensor_free(&xb);
     nmz_tensor_free(&tb);
     if (result) *result = res;

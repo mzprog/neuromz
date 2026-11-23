@@ -136,11 +136,11 @@ static void test_corruption(void) {
         return;
     }
     /* flip one bit somewhere in the weights → checksum mismatch */
-    buf[n - 120] ^= 0x10; /* inside the last dense W (tail: b, the softmax layer, sections, CRC) */
+    buf[n - 124] ^= 0x10; /* inside the last dense W (tail: b, the softmax layer, sections, CRC) */
     spit(q, buf, n);
     CHECK_STATUS(nmz_net_load(&b, q), NMZ_ERR_FORMAT);
     CHECK_MSG(strstr(nmz_last_error(), "checksum") != NULL, "%s", nmz_last_error());
-    buf[n - 120] ^= 0x10;
+    buf[n - 124] ^= 0x10;
     /* every truncation is rejected cleanly (no crash, no leak) */
     for (i = 0; i < n; i += (i < 64 ? 1 : 7)) {
         spit(q, buf, i);

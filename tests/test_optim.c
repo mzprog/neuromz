@@ -341,9 +341,9 @@ static void test_unknown_section_skipped(void) {
     buf = malloc((size_t)n + sizeof extra);
     if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n) {
         fclose(f);
-        /* layout of the tail: u32 count = 1, "train_ext" section (4+9 + 4 + 16 bytes), CRC */
+        /* layout of the tail: u32 count = 1, "train_ext" section (4+9 + 4 + 20 bytes), CRC */
         {
-            long cnt = n - 4 - 33 - 4;
+            long cnt = n - 4 - 37 - 4;
             CHECK(buf[cnt] == 1 && buf[cnt + 1] == 0 && buf[cnt + 4] == 9 && !memcmp(buf + cnt + 8, "train_ext", 9));
             buf[cnt] = 2; /* append one more section after train_ext */
         }
