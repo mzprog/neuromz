@@ -61,7 +61,11 @@ sanitize:
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 ./build/san/test_neuromz
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 sh tests/cli_smoke.sh ./build/san/neuromz
 
-examples: $(CLI)
+$(BUILD)/api_xor: examples/api_xor.c $(LIB)
+	$(CC) $(ALL_CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+examples: $(CLI) $(BUILD)/api_xor
+	./$(BUILD)/api_xor
 	sh examples/run_examples.sh ./$(CLI)
 
 clean:
