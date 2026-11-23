@@ -123,6 +123,8 @@ typedef struct seq_survival {
     double *c;       /* lstm: |dL/dc_t|, else NULL                       */
     double *gate_prod; /* lstm: mean over cells of Π_{s>t} f_s; gru: of z */
     double *x;       /* |dL/de_t| at the embedding output (the input)    */
+    int *n_keep;     /* lstm/gru: units whose Π f (Π z) from t on is >= 0.5 */
+    int units;       /* H */
 } seq_survival;
 int seq_is_recurrent_type(const char *type);
 /* layer: net layer index, < 0 = the first recurrent layer. 0 = ok. */

@@ -396,7 +396,7 @@ static int cmd_generate(cli_state *st, int argc, char **argv) {
     seen = calloc((size_t)count, sizeof *seen);
     if (!seen) return fail("out of memory%s", NULL);
     while (made < count && attempts < count * 50) {
-        int need = (int)count - made, rows = need + need / 2 + 1, k, r;
+        int need = (int)count - made, rows = need, k, r; /* repeated rounds replace duplicates */
         char **outs;
         if (rows > 1024) rows = 1024;
         if (rows > count * 50 - attempts) rows = (int)count * 50 - attempts;

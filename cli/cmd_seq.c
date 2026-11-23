@@ -138,12 +138,11 @@ static int text_src_load(text_src *ts, long default_chars) {
 
 /* ---------------------------------------------------------- show gates */
 
-#define GATE_BINS 5
 typedef struct gate_acc {
     int layer, lstm, H;
     long steps;
-    double *unit_sum; /* [n_gates × H] */
-    long hist[4][GATE_BINS]; /* per gate: <0.1, 0.1-0.5, 0.5-0.9, >0.9 ... */
+    double *unit_sum; /* [4 × H]: per gate block of `gates`, per unit */
+    long hist[4][4];  /* per gate block: values < 0.1, 0.1-0.5, 0.5-0.9, > 0.9 */
 } gate_acc;
 
 typedef struct gate_stats {
@@ -167,7 +166,7 @@ static void gate_trace(const nmz_trace_event *ev, void *user) {
     G = g->shape[2];
     for (t = 0; t < T; t++)
         for (k = 0; k < (gs->acc[a].lstm ? 4 : 3); k++) {
-            if ((gs->acc[a].lstm && k == 2) || (!gs->acc[a].lstm && k == 2)) continue; /* candidates: not gates */
+            if (k == 2) continue; /* g (lstm) and h~ (gru) are candidates, not gates */
             for (j = 0; j < gs->acc[a].H; j++) {
                 double v = g->data[(size_t)t * G + (size_t)k * gs->acc[a].H + j];
                 int bin = v < 0.1 ? 0 : v < 0.5 ? 1 : v < 0.9 ? 2 : 3;
@@ -579,30 +578,44 @@ int cmd_compare(cli_state *st, int argc, char **argv) {
         spark(&se[k], T, lo);
         printf("\n");
     }
-    printf("\nsummary\n");
-    printf("  %-10s %14s %14s %14s %14s\n", "", "x per step", "left at k=10", "left at k=end", "< 1% after");
-    for (k = 0; k < ns; k++) {
-        double left, per = seq_survival_rate(se[k].v, T, &left);
-        int u = steps_until(&se[k], T, 0.01);
-        char b1[24], b2[24], b3[24], b4[24];
-        if (se[k].is_prod) {
-            per = T > 1 && se[k].v[0] > 0 ? pow(se[k].v[0], 1.0 / (T - 1)) : NAN;
-            left = se[k].v[0];
+    {
+        int k0 = T - 1 > 32 ? 16 : (T - 1) / 2;
+        printf("\nsummary\n");
+        printf("  %-10s %12s %13s %13s %13s %13s\n", "", "x per step", "x/step k>=", "left at", "left at",
+               "< 1% after");
+        printf("  %-10s %12s %13d %13s %13s %13s\n", "", "(all)", k0, "k=10", "k=end", "");
+        for (k = 0; k < ns; k++) {
+            double left, per = seq_survival_rate(se[k].v, T, &left), far, a = rel(&se[k], T - 1 - k0, T);
+            int u = steps_until(&se[k], T, 0.01);
+            char b1[24], b2[24], b3[24], b4[24], b5[24];
+            if (se[k].is_prod) {
+                per = T > 1 && se[k].v[0] > 0 ? pow(se[k].v[0], 1.0 / (T - 1)) : NAN;
+                left = se[k].v[0];
+            }
+            far = a > 0 && rel(&se[k], 0, T) > 0 && T - 1 > k0 ? pow(rel(&se[k], 0, T) / a, 1.0 / (T - 1 - k0)) : NAN;
+            snprintf(b1, sizeof b1, "x%.3f", per);
+            snprintf(b5, sizeof b5, "x%.3f", far);
+            snprintf(b2, sizeof b2, "%.2g", T > 10 ? rel(&se[k], T - 1 - 10, T) : NAN);
+            snprintf(b3, sizeof b3, "%.2g", left);
+            if (u < 0)
+                snprintf(b4, sizeof b4, "never (>%d)", T - 1);
+            else
+                snprintf(b4, sizeof b4, "%d steps", u);
+            printf("  ");
+            put_pad(se[k].label, 10, 0);
+            printf(" %12s %13s %13s %13s %13s\n", b1, b5, b2, b3, b4);
         }
-        snprintf(b1, sizeof b1, "x%.3f", per);
-        snprintf(b2, sizeof b2, "%.2g", T > 10 ? rel(&se[k], T - 1 - 10, T) : NAN);
-        snprintf(b3, sizeof b3, "%.2g", left);
-        if (u < 0)
-            snprintf(b4, sizeof b4, "never (> %d)", T - 1);
-        else
-            snprintf(b4, sizeof b4, "%d steps", u);
-        printf("  ");
-        put_pad(se[k].label, 10, 0);
-        printf(" %14s %14s %14s %14s\n", b1, b2, b3, b4);
+        for (i = 0; i < nm; i++)
+            if (ms[i].sv.n_keep)
+                printf("  %c: %d of %d %ss keep at least half along the %s path over all %d steps (%s >= 0.5)\n",
+                       ms[i].letter, ms[i].sv.n_keep[0], ms[i].sv.units, ms[i].sv.c ? "cell" : "unit",
+                       ms[i].sv.c ? "cell-state" : "direct", T - 1,
+                       ms[i].sv.c ? sym("Π f", "prod f") : sym("Π z", "prod z"));
     }
-    printf("\n  (\"x per step\": the geometric mean of the per-step factor; \"left at k\": the relative size k steps\n"
-           "  back. A vanilla RNN multiplies the gradient by W_hh%s and tanh' at every step, so it usually shrinks\n"
-           "  geometrically; an LSTM's cell state only multiplies it by f, and a GRU's direct path by z.)\n",
+    printf("\n  (\"x per step\": the geometric mean of the per-step factor, over all steps and from the\n"
+           "  k in the header on; \"left at k\": the relative size k steps back. A vanilla RNN multiplies the\n"
+           "  gradient by W_hh%s and tanh' at every step, so it shrinks geometrically; an LSTM's cell state only\n"
+           "  multiplies it by f, and a GRU's direct path by z: units whose gate stays near 1 carry it far back.)\n",
            sym("ᵀ", "^T"));
     rc = 0;
 out:

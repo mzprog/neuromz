@@ -494,6 +494,7 @@ void seq_survival_free(seq_survival *sv) {
     free(sv->c);
     free(sv->gate_prod);
     free(sv->x);
+    free(sv->n_keep);
     memset(sv, 0, sizeof *sv);
 }
 
@@ -513,15 +514,18 @@ int seq_survival_collect(const nmz_trace_recorder *rec, int layer, int T, seq_su
         const nmz_tensor *g = nmz_trace_find(fw, "gates");
         int lstm = !strcmp(sv->kind, "lstm"), H, G, j;
         sv->gate_prod = calloc((size_t)T, sizeof *sv->gate_prod);
+        sv->n_keep = calloc((size_t)T, sizeof *sv->n_keep);
         if (lstm) sv->c = calloc((size_t)T, sizeof *sv->c);
-        if (!sv->gate_prod || (lstm && !sv->c) || !g) return 1;
+        if (!sv->gate_prod || !sv->n_keep || (lstm && !sv->c) || !g) return 1;
         G = g->shape[2];
         H = lstm ? G / 4 : G / 3;
+        sv->units = H;
         /* mean over units of the product of f (lstm) or z (gru) of the later steps */
         for (j = 0; j < H; j++) {
             double prod = 1.0;
             for (t = T - 1; t >= 0; t--) {
                 sv->gate_prod[t] += prod / H;
+                sv->n_keep[t] += prod >= 0.5;
                 prod *= g->data[(size_t)t * G + (lstm ? H : 0) + j];
             }
         }

@@ -803,6 +803,9 @@ Added in phase 4 (LSTM, GRU, gate traces, gradient survival, Arabic prose):
     but singular values spread from ≈ 0 to ≈ 2. `xavier` keeps the phase-3
     initialisation; dense, conv and embedding layers reject `orthogonal`
     (their matrices are not applied repeatedly). Tested: WᵀW = I within 1e-7.
+    Compatibility is one-way: every phase-3 file loads, but a phase-3 build
+    rejects a new RNN whose init field says `orthogonal` ("corrupt rnn
+    config") — as it rejects any layer type it does not know.
 75. **The engine did not change** (DESIGN §3.1). The only edits outside
     the new layer files: `NMZ_TRACE_MAX_ITEMS` 8 → 12, the layer registry
     lines, helpers moved into recurrent.c for sharing, and batch generation
@@ -839,7 +842,14 @@ Added in phase 4 (LSTM, GRU, gate traces, gradient survival, Arabic prose):
     `generate --count N` gives exactly the phase-3 output. Rows that finish
     leave the batch: their row of every layer's carried state is removed.
     Found by measuring: without that, a batch keeps stepping until its
-    longest item ends, and 500 names took 4× longer than one at a time.
+    longest item ends, and 500 names took 4× longer than one at a time (and
+    the CLI asked for 1.5× the rows it needed, to allow for duplicates;
+    now it asks for exactly the missing number, round after round).
+    Measured now: 500 names 37–42 ms vs 38–43 ms one at a time, 50 × 300
+    characters of Alice 218–235 ms vs 226–228 ms — the same. Batching turns
+    15 000 forward calls into 300, but on one thread the arithmetic per row
+    is unchanged; reusing each weight row for all rows of the batch (loop
+    order) is what would make it faster, and is deferred.
 81. **Arabic normalisation is a vocabulary option**, off by default:
     `NMZ_TEXT_STRIP_DIACRITICS` (harakat U+064B–U+0652, superscript alef
     U+0670, tatweel U+0640) and `NMZ_TEXT_UNIFY_ALEF` (أ إ آ ٱ → ا). The
@@ -871,3 +881,38 @@ Added in phase 4 (LSTM, GRU, gate traces, gradient survival, Arabic prose):
     generate the same names. Found when the new orthogonal default changed
     one test's generated item: it came from a context (zero state + '\n')
     that never occurs in that test's training text — the old pass was luck.
+86. **Learning rates were swept per architecture, not shared.** Gated
+    layers take a larger step: on English names LSTM 0.005 → 2.038 and
+    0.01 → 2.028, GRU 2.061 → 2.056; on Alice LSTM 0.004/0.006/0.01 →
+    1.648/1.639/1.621 after 20 epochs. The RNN is best at its phase-3
+    values (names 0.003 → 2.118 vs 0.006 → 2.108, within noise; Alice
+    0.004 → 1.638 vs 0.008 → 1.667). Hence `names-lstm`/`char-lstm` use
+    0.01, and `char-lstm` allows 30 epochs (the LSTM was still improving
+    at 20). `arabic-text` (two stacked LSTMs of 96) uses 0.005, chosen
+    from these results rather than measured on its own.
+87. **Dropout between stacked recurrent layers is the ordinary Dropout
+    layer**: an independent mask for every value of [B, T, H], applied to
+    the outputs that go up the stack, never to the recurrent connection.
+    "Variational" dropout (one mask per sequence, also on h_{t−1}) needs a
+    hook inside the recurrent layer; deferred.
+88. **`compare` reports the per-step factor over all steps *and* from k ≥ 16
+    on.** Found by looking at the first trained models: one average hid the
+    lesson. On Alice the LSTM's cell-state gradient shrinks ×0.859 per step
+    on average — barely better than the RNN's ×0.803 — because the trained
+    LSTM concentrates on the last few characters; from 16 steps back on it
+    is ×0.942 against ×0.820, and the count of cells with Π f ≥ 0.5 over
+    the whole window (12 of 64) shows where that comes from.
+89. **Four partial sums in the recurrent backward dot products**
+    (`nmz__dot`). The input and h_{t−1} gradients are row dot products
+    accumulated in double; with one accumulator every addition waits for
+    the previous one. Four independent sums (still double, so decision 1
+    holds) cut the LSTM backward by about a third (gprof, Alice).
+90. **The results are reported as measured, including the unflattering
+    ones**: the gated layers win on all four texts at equal size, by
+    0.2 nats on the 2.7 k-character Arabic names but only 0.01–0.06 on the
+    books; orthogonal initialisation made no measurable difference for the
+    RNN (names 2.118 vs 2.112 with Glorot, Alice 1.638 vs 1.634); the GRU
+    hardly uses its direct path on Alice yet is the best model there.
+    Next-character prediction depends mostly on the last few characters;
+    the long-range gradient the cell state preserves is visible in
+    `compare` but worth little loss at this scale.

@@ -11,8 +11,13 @@ sum, and which max-pool input "won".
 * `neuromz`: a command-line program with a beginner path and an advanced path
 * Dense, Conv2D, MaxPool2D, Flatten, Dropout layers; SGD+momentum and Adam;
   learning-rate schedules; input normalization stored with the model
-* Embedding and RNN layers (backpropagation through time inside the layer,
-  truncated BPTT with a carried hidden state, gradient clipping)
+* Embedding, RNN, **LSTM** and **GRU** layers (backpropagation through time
+  inside the layer, truncated BPTT with a carried state, stacking, gradient
+  clipping, orthogonal initialisation)
+* `trace` shows every gate of an LSTM/GRU at every time step with real
+  numbers, and `compare` puts side by side how much of a gradient survives
+  N steps back in an RNN, an LSTM (along h and along the cell state) and a
+  GRU — *why gates fix vanishing gradients*, measured
 * Trains a small CNN on MNIST to 98.8% test accuracy in about 2 minutes on a 2017
   laptop CPU (single thread), and character RNNs that invent English and
   Arabic names or write Alice-in-Wonderland-flavoured text
@@ -243,7 +248,8 @@ $ ./build/neuromz -m names.nmz generate --count 10 --data examples/names_en.txt
 it has not improved for that many epochs and keeps the best weights.
 `generate` options: `--prime TEXT`, `--length N`, `--temperature X` (below 1
 safer, above 1 wilder), `--top-k K`, `--seed N` (same seed, same text),
-`--count N` (distinct items), `--data FILE --new-only` (skip names that are
+`--count N` (distinct items, generated as one batch: item k is exactly
+what `--seed` + k gives alone), `--data FILE --new-only` (skip names that are
 already in the training data). `show vocab` lists the characters with their
 counts. The perplexity e^loss reads as "as unsure as a uniform choice among
 that many characters".
@@ -275,7 +281,9 @@ $ ./build/neuromz -m alice.nmz generate --prime "Alice " --length 300 --temperat
 ```
 
 Advanced text models use the same spec style: `new text embed:32 rnn:256
-vocab --data FILE --seq-len 100 --carry --clip 1 --patience 5 --val 0.05`.
+vocab --data FILE --seq-len 100 --carry --clip 1 --patience 5 --val 0.05`;
+`train FILE --val-file OTHER` validates on a separate file instead of the
+last part of FILE.
 
 ### Trace a sequence: recurrence and BPTT, step by step
 
@@ -288,26 +296,26 @@ probabilities:
 ```
 $ ./build/neuromz -m names.nmz trace --text "Christopher"
 RNN UNROLLED THROUGH TIME   the same weights at every step; h carries the past forward
-  h_t = tanh(x_t·W_xh + h_{t-1}·W_hh + b)      shown for hidden unit j = 72 of 128 (the unit that changes most here; ...)
-  x_t = e_t (from the embedding), h_{-1} = 0
+  h_t = tanh(x_t·W_xh + h_{t-1}·W_hh + b)      shown for hidden unit j = 6 of 128 (the unit that changes most here; ...)
+  x_t = the layer's input at step t, h_{-1} = 0 (or the carried state)
 
-  t=0   input C    h_t[72] = tanh(1.3162 + 0.0000 + 0.1901) = tanh(1.5063) = 0.9063
-         x_t·W_xh[:,j]   h_{t-1}·W_hh[:,j]   b[j]
-        next: a     32.6% ██████████
-              h     18.9% ██████   <- target
-              l     17.1% █████
-              o     13.5% ████
-              e      4.4% █
-        target h: p = 0.1892, loss -log p = 1.6649
+  t=0   input C    h_t[6] = tanh(-1.4276 + 0.0000 + -0.1032) = tanh(-1.5307) = -0.9105
+        x_t·W_xh[:,j]   h_{t-1}·W_hh[:,j]   b[j]
+        next: h     33.4% ██████████   <- target
+              a     22.9% ███████
+              o     10.5% ███
+              l     10.3% ███
+              i      3.3% █
+        target h: p = 0.3338, loss -log p = 1.0971
 
-  t=1   input h    h_t[72] = tanh(0.9507 + 0.4411 + 0.1901) = tanh(1.5819) = 0.9189
+  t=1   input h    h_t[6] = tanh(-1.0076 + -0.1262 + -0.1032) = tanh(-1.2370) = -0.8446
   ...
 HIDDEN STATE OVER TIME   rows = hidden units, columns = time steps
   ' ' = -1 ... '+' = 0 ... '@' = +1   (tanh range)
-         Christophe
-      1 %@@@@@@@@@
-      2 -@@@%%+:#*
-      3 %@@@@@@%%@
+        Christophe
+      1 *%@: .+##+
+      2 #-   :% +:
+      3 #   =:=@#:
   ...
 ```
 
@@ -318,24 +326,254 @@ character's loss alone, followed back through time:
 
 ```
 VANISHING / EXPLODING GRADIENTS   the loss of the LAST character only, followed back in time
-  t=9    e         0.1557           ████████████████████████████████████
-  t=8    h         0.1597   x1.026  ████████████████████████████████████
-  t=7    p         0.1374   x0.860  ██████████████████████████████████
-  t=6    o         0.1107   x0.806  ██████████████████████████████
+  step   char  |dL/dh_t|   x/step  (log scale)
+  t=9    e        0.1494           ██████████████████████████████
+  t=8    h        0.1246  x0.834   ████████████████████████████
+  t=7    p        0.0975  x0.782   █████████████████████████
+  t=6    o        0.0655  x0.672   ████████████████████
   ...
-  t=1    h         0.0368   x0.874  █████████████
-  t=0    C         0.0264   x0.718  ████████
+  t=1    h        0.0155  x0.661   ██
+  t=0    C        0.0127  x0.822
 
-  bars: log scale over 1.0 decade(s). On average each step back multiplies the gradient by 0.821;
-  after 9 steps only 0.17 of it is left: a VANISHING gradient. A vanilla RNN therefore learns
-  short-range patterns easily and long-range ones hardly at all - the problem LSTMs fix
-  with an additive cell state.
+  bars: log scale over 1.1 decade(s). Each step back multiplies |dL/dh| by 0.761 on average;
+  after 9 steps 0.085 of the h-gradient is left.
+  That is a VANISHING gradient: a vanilla RNN learns short-range patterns easily and long-range
+  ones hardly at all - the problem the LSTM's additive cell state fixes (try `compare`).
 ```
 
-On a 64-character window of Alice the same view ends with "after 47 steps
-only 0.00018 of it is left". The trace then shows the gradient clipping
+On a 64-character window of Alice only about 1e-6 of it is left after 63
+steps (see `compare` below). The trace then shows the gradient clipping
 decision (`global gradient norm 4.53 <= clip 5 -> unchanged`) and the Adam
 update for every weight. `step` applies it.
+
+## RNN vs LSTM: why gates matter
+
+A vanilla RNN squeezes the whole past into h_t = tanh(x_t·W_xh + h_{t−1}·W_hh
++ b). Learning "what happened 40 characters ago" needs a gradient to travel
+40 steps back, and every step multiplies it by W_hhᵀ and by tanh′ ≤ 1: it
+shrinks geometrically (the trace above: ×0.76 per step). An **LSTM** adds a
+second state, the *cell* c, that is updated by addition and controlled by
+gates — numbers between 0 and 1 computed from x_t and h_{t−1}:
+
+```
+i, f, o = σ(x_t·W_x + h_{t−1}·W_h + b)   input, forget, output gates
+g       = tanh(x_t·W_x + h_{t−1}·W_h + b) candidate
+c_t     = f ⊙ c_{t−1} + i ⊙ g             keep part of the old memory, write some new
+h_t     = o ⊙ tanh(c_t)                   show part of it
+```
+
+Backwards, ∂L/∂c_{t−1} = ∂L/∂c_t ⊙ f: along the cell the gradient is only
+multiplied by the forget gate — no weight matrix, no tanh′. A cell whose
+forget gate stays near 1 passes the gradient back almost untouched: the
+"gradient highway". A **GRU** gets a similar path with two gates:
+h_t = z ⊙ h_{t−1} + (1 − z) ⊙ h~, where the update gate z decides how much
+of the old state to keep (NeuroMZ uses the original formulation of Cho et
+al. 2014, DESIGN decision 73).
+
+```bash
+./build/neuromz new --preset char-lstm -o lstm.nmz      # embed:32 lstm:64 vocab: the weights of char-rnn's rnn:128
+./build/neuromz -m lstm.nmz train data/alice.txt -o lstm.nmz
+./build/neuromz new text embed:32 gru:75 vocab --data data/alice.txt --lr 0.01 --batch 16 -o gru.nmz
+./build/neuromz new text embed:32 lstm:64 dropout:0.2 lstm:64 vocab --data data/alice.txt   # stacked
+```
+
+`lstm:64` has about as many weights as `rnn:128` (four gates per cell), so
+the comparisons below are fair: every model has 29–33 k parameters.
+Recurrent matrices start orthogonal (all singular values 1), and the forget
+gate's bias starts at 1, so a new cell keeps ~73 % of its memory per step
+(`lstm:64:forget_bias=2` to change it; `new` prints what each choice means).
+
+### Every gate, with real numbers
+
+`trace` on an LSTM shows, for one cell (`--unit J`; by default the one whose
+output changes most), every gate at every step: the three terms of its
+input, the sigmoid, and a bar for how open it is; then the cell update and
+the output:
+
+```
+$ ./build/neuromz -m lstm.nmz trace --text "the Queen said"
+LSTM UNROLLED THROUGH TIME   gates decide what the cell forgets (f), writes (i, g) and shows (o)
+  for cell j = 5 of 64 (the cell whose output changes most here; choose with --unit J)
+  ...
+  t=1   input h
+     i  input gate  =    σ(   2.970 +    4.565 +   0.586) =    σ(  8.121) =  1.000 ████████████████████
+     f  forget gate =    σ(   8.458 +  -10.514 +   1.174) =    σ( -0.882) =  0.293 ██████··············
+     g  candidate   = tanh(   3.988 +   -1.007 +  -0.075) = tanh(  2.906) =  0.994           |██████████
+     o  output gate =    σ(  -2.410 +    5.328 +   0.113) =    σ(  3.032) =  0.954 ███████████████████·
+     c_t = f·c_{t-1} + i·g = 0.293·1.65e-04 + 1.000·0.994 = 4.82e-05 + 0.994 = 0.994             |███
+     h_t = o·tanh(c_t) = 0.954·0.759 = 0.724
+        next: e     76.9% ███████████████████████   <- target
+              o      8.2% ██
+  ...
+GATE ACTIVITY OVER TIME   cell 3: one row per gate, columns = time steps
+                 “Off␣with␣her␣head!”␣the␣Queen␣shouted␣at␣the␣top␣of␣her␣voic
+  i input gate   @@@@: @@@@:@@@.@@@@@@@@@@@@@@@@ @@@@@@@@@@%@@@@@@@@@@ @@@ @@@
+  f forget gate    @@ @ @@ @@# @@ @ + %@@ @@@%= @@%*@.-  @ @@% @-@ .@ @@@ @@-.
+  o output gate  %+@@: @#@@-@@@.@@@@@@#@@@:@@@@@ =@@=@@@@ @..@@ @@@@@@=@@@ @@
+  c cell         -*%@===----+*--+*%-+-: :-: :=*--=*#+*#-*=-: :-:++-*#--+*--++*
+```
+
+(The three numbers in each gate are x_t·W_x, h_{t−1}·W_h and the bias. In
+the heatmap ' ' is 0 and '@' is 1; cell 3's forget gate closes at most
+spaces, so it keeps something about the current word and drops it at the
+next word boundary.)
+
+followed by a heatmap of that cell's gates over time (and of every cell's
+forget gate), the backward pass with ∂L/∂h *and* ∂L/∂c per step, and the
+vanishing-gradient view along both paths. GRU models show z, r, h~ and h_t
+the same way. `--layer N` picks a layer of a stacked model.
+
+### Gradient survival, side by side
+
+`compare` takes trained models and one text and shows how much of the **last
+character's** loss gradient reaches each earlier step — for the RNN along h,
+for the LSTM along h and along c, plus the product of the forget gates (what
+the cell path alone would keep), and for the GRU along h and through its
+update gates. Three models trained on Alice with the same number of weights,
+on 65 characters of the validation part:
+
+```
+$ ./build/neuromz compare alice-rnn.nmz alice-lstm.nmz alice-gru.nmz --data data/alice.txt --from 140000 --chars 65
+text (64 steps; the models predict the last character from all before it):
+  re!” said the King triumphantly, pointing to the
+tarts on the tab
+
+models (recurrent layer 1 of each):
+  A  alice-rnn.nmz        rnn 128, 32683 parameters            loss of the last prediction 1.943
+  B  alice-lstm.nmz       lstm 64, 32107 parameters            loss of the last prediction 2.327
+  C  alice-gru.nmz        gru 75, 32400 parameters             loss of the last prediction 1.161
+
+  back  char     A rnn h   B lstm h   B lstm c      B Π f    C gru h      C Π z
+     0  a          1.000      1.000      1.000      1.000      1.000      1.000
+     1  t          0.841      0.460      1.015      0.777      0.835      0.159
+     2  ␣          0.680      0.315      0.929      0.591      0.444      0.013
+     4  h          0.311      0.072      0.411      0.578      0.198    4.4e-03
+     8  o          0.091    8.1e-03      0.020      0.515      0.030    9.8e-05
+    16  e          0.011    5.0e-04    1.2e-03      0.428    6.7e-03    9.6e-06
+    24  n        1.1e-03    4.7e-05    1.5e-04      0.397    4.7e-04    2.3e-07
+    32  ,        1.4e-04    2.0e-05    1.1e-04      0.352    7.4e-05    3.2e-10
+    40  m        6.3e-05    6.7e-05    1.4e-04      0.322    1.6e-05    3.2e-10
+    48  i        1.5e-05    6.8e-06    8.8e-05      0.300    9.2e-06    1.6e-11
+    56  i        3.2e-06    7.9e-06    9.1e-05      0.271    9.5e-07    2.8e-15
+    63  r        9.6e-07    2.0e-05    7.1e-05      0.183    4.6e-07    9.4e-21
+
+the same on a log scale, one column per step back (0 at the left; '█' = 1, empty = below 1e-06):
+  A rnn h    ███████▇▇▇▇▇▇▇▆▆▆▆▆▅▅▅▅▅▅▄▄▄▄▄▄▄▃▃▃▃▃▃▃▃▃▃▃▃▃▂▂▂▂▂▂▂▁▁▁▁▁▁▁▁▁▁▁
+  B lstm h   ███▇▇▇▆▆▆▆▅▅▅▅▄▅▄▄▄▄▃▃▃▃▃▃▃▂▂▂▂▃▂▄▃▃▃▃▃▃▃▃▂▂▂▂▂▂▂▂▃▂▂▂▂▂▂▁▂▂▂▂▁▂
+  B lstm c   █████▇▇▆▆▆▆▅▆▅▅▅▅▄▅▄▄▄▄▃▃▃▃▃▃▃▃▃▃▄▄▄▄▄▃▄▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃
+  B Π f      ████████████████████████████████████████████████████████████████
+  C gru h    █████▇▇▇▆▆▆▆▆▆▆▆▆▅▅▅▅▄▄▄▄▄▄▄▄▄▄▃▃▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▁▁▁▁▁
+  C Π z      █▇▆▆▅▅▃▃▃▃▃▃▃▃▃▂▂▂▂
+
+summary
+               x per step    x/step k>=       left at       left at    < 1% after
+                    (all)            16          k=10         k=end
+  A rnn h          x0.803        x0.820         0.062       9.6e-07      17 steps
+  B lstm h         x0.842        x0.934        0.0036         2e-05       8 steps
+  B lstm c         x0.859        x0.942          0.01       7.1e-05      11 steps
+  B Π f            x0.973        x0.982          0.47          0.18   never (>63)
+  C gru h          x0.793        x0.815         0.019       4.6e-07      15 steps
+  C Π z            x0.481        x0.479       5.9e-05       9.4e-21       3 steps
+  B: 12 of 64 cells keep at least half along the cell-state path over all 63 steps (Π f >= 0.5)
+  C: 0 of 75 units keep at least half along the direct path over all 63 steps (Π z >= 0.5)
+```
+
+How to read it — and it is not quite the textbook picture:
+
+* **Far back, the RNN's gradient vanishes geometrically; the LSTM's does
+  not.** From 16 steps back on, every step costs the RNN ×0.82 and the
+  LSTM's cell state only ×0.94; after 63 steps the RNN keeps 1e-6 of the
+  gradient, the cell state 7e-5 (70× more), and its sparkline goes flat
+  from about 30 steps back while the RNN's keeps falling. That flat tail is
+  the gradient highway: 12 of the 64 cells keep at least half of their
+  state (Π f ≥ 0.5) over all 63 steps — no RNN unit can do that, because
+  its only path back goes through W_hhᵀ and tanh′ at every step.
+* **Close to the last character the LSTM's gradient falls *faster*** (0.4 %
+  left after 10 steps, against 6 % for the RNN). The trained LSTM has
+  learned to make its prediction mostly from the last few characters and
+  to keep only a few long-term cells; a gate can close as well as open.
+* **The highway is open, but little enters it.** Π f stays at 0.18 after 63
+  steps, yet |∂L/∂c| falls to 7e-5: the cells with f ≈ 1 are often
+  saturated (|c| large, so tanh′(c) ≈ 0) and receive almost no gradient at
+  the last step in the first place.
+* **The GRU barely uses its direct path here** (Π z collapses within a few
+  steps: its update gates mostly replace the state), and its gradient
+  vanishes about as fast as the RNN's — yet it has the best validation loss
+  of the three (table below). For predicting the next character of Alice,
+  most of the information is in the last few characters; what the gates
+  buy is mainly a better use of them.
+
+On Kalila wa-Dimna (`benchmark_gated.sh` prints the same table) the order
+changes: after 63 steps the RNN keeps 9e-10 of the gradient, the LSTM's cell
+5e-7 (500× more, 11 cells with Π f ≥ 0.5) and the GRU 2e-5 — there the GRU's
+gradient survives best, through its candidate path rather than z. Which path
+a trained model uses is something it learns from the data, which is why
+`compare` measures it rather than assuming it.
+
+The same three models on English names (22 steps) show no highway at all:
+names are short and the LSTM learns to forget (only 9 of 64 cells have a
+mean forget gate above 0.9 there, against 36 of 64 on Alice — see below).
+
+### What the gates do: `show gates`
+
+```
+$ ./build/neuromz -m alice-lstm.nmz show gates --data data/alice.txt --from 130000 --chars 14000
+layer 1: lstm 32->64 (gates i f g o, forget bias 1, orthogonal init)
+  gate                mean      < 0.1  0.1-0.5  0.5-0.9    > 0.9    (share of all 896000 values)
+  i  input gate      0.755      16.4%     7.4%     9.4%    66.8%
+  f  forget gate     0.789      16.4%     4.3%     5.5%    73.8%
+  o  output gate     0.530      39.3%     7.7%     7.7%    45.3%
+
+  mean forget gate f per cell (64 cells): how much of its state each one keeps per step
+    0.0-0.1    0
+    0.1-0.2    3 ███
+    ...
+    0.8-0.9    8 █████████
+    0.9-1.0   36 ████████████████████████████████████████  <- long memory
+  mostly open (mean > 0.9): 36 of 64; mostly closed (mean < 0.1): 0 of 64
+  longest memory (a state that is only multiplied by f halves after ln 0.5 / ln f steps):
+    cell   55   mean f = 0.999   half-life ~ 574.4 steps
+    cell   62   mean f = 0.998   half-life ~ 360.4 steps
+```
+
+On running text more than half of the cells keep their memory (f > 0.9 on
+average); the same architecture trained on the names list has only 9 such
+cells — the model's gates adapt to how far back the data is worth
+remembering. The longest-memory cell, 55, has both gates wide open and adds
+about −1 to c at every character: its c saturates within a few characters
+of a reset, so it signals "near the start of a stream" rather than storing
+anything specific — `trace --unit 55` shows it. Not every long memory is
+an interesting one.
+
+### Arabic prose, and normalisation
+
+`make data-text` also fetches *Kalila wa-Dimna* (كليلة ودمنة), Ibn
+al-Muqaffaʿ's 8th-century book of fables and a classic of Arabic prose, from
+Arabic Wikisource (240 k characters; source and licence in
+[`examples/DATASETS.md`](examples/DATASETS.md)). `--preset arabic-text` is
+two stacked LSTMs (96 cells each, dropout between them) for it.
+
+The text is *partly* vocalised: about 1 % of its characters are tashkeel
+(mostly tanwin ً ٌ ٍ and some shadda ّ), placed wherever an editor happened
+to add them. `new ... --strip-diacritics` removes the harakat and the
+tatweel ـ; `--unify-alef` also writes أ إ آ ٱ as ا. The choice is stored in
+the model and applied to everything it reads — training text, `--prime`,
+`trace --text` — so `generate --prime "قالَ"` works on a stripped model.
+
+The trade-off:
+
+* **Stripping** gives the model a smaller alphabet (53 → 45 characters for Kalila wa-Dimna) and a
+  more predictable stream — it no longer has to guess where an editor put a
+  tanwin — but it can no longer *write* the marks, and words that differ
+  only in their vowels become the same string. The loss is not comparable
+  one-to-one either: the stripped model predicts fewer, easier characters
+  per word.
+* **Unifying alef** goes further: همزة spelling (أ/إ/آ) is information in
+  Arabic (أن vs إن), so a unified model cannot learn it. It helps only
+  when the source is inconsistent about hamza, which matters more for
+  informal text than for an edited classic.
+
+Off is the default: the model learns the text as it is written.
 
 ## The advanced path
 
@@ -356,21 +594,23 @@ is marked `[yours]`; the rest is still explained.
 | conv | `conv:FILTERS:K[:ACT][:INIT][:stride=S][:pad=P\|same]`, `K` = `3` or `3x5` |
 | pooling, other | `pool:K[:stride=S]`, `flatten` (automatic before dense), `dropout:RATE` |
 | activations | `linear`, `sigmoid`, `tanh`, `relu`, `leaky_relu[=ALPHA]`, `softmax` |
-| init | `auto` (He before relu and for conv, Xavier otherwise), `xavier`, `he` |
+| init | `auto` (He before relu and for conv, Xavier otherwise; orthogonal for recurrent layers), `xavier`, `he`, `orthogonal` (recurrent layers only) |
 | loss | `mse` (½·squared error), `cross_entropy`/`ce` (fused with a softmax output) |
 | optimizer | `--optimizer sgd` (`--momentum`) or `adam` (`--beta1 --beta2 --eps`), `--lr` |
 | schedule | `--schedule constant\|step\|cosine`, `--step-size N --gamma X`, `--min-lr X` |
 | data | `--normalize none\|minmax\|zscore` (fitted at the first `train`, saved) |
-| text | input `text` with `--data FILE` (vocabulary), `embed:D`, `rnn:H`, `vocab[:ACT]` (one output per character); `--items`/`--no-items` |
+| text | input `text` with `--data FILE` (vocabulary), `embed:D`, `rnn:H`, `lstm:H[:forget_bias=F]`, `gru:H`, `vocab[:ACT]` (one output per character); stack recurrent layers with `dropout:R` between them; `--items`/`--no-items`; `--strip-diacritics`, `--unify-alef` (Arabic) |
 | training | `--batch`, `--epochs`, `--target-loss`, `--no-shuffle`, `--seed` |
-| validation, stopping | `--val FRACTION` (the last part of the data is held out), `--patience N` (early stopping, keeps the best weights) |
+| validation, stopping | `--val FRACTION` (the last part of the data is held out) or, for `train`, `--val-file FILE` (a separate set), `--patience N` (early stopping, keeps the best weights) |
 | recurrent | `--seq-len N` (BPTT window), `--carry`/`--no-carry` (hidden state carried between batches), `--clip NORM` |
 
 * `train DATA [options]` overrides the stored settings for one run;
   `set --optimizer adam --lr 0.001 ...` changes the settings saved with the model.
   `DATA` is a CSV file, `mnist` (training set for `train`, test set for
   `test`), `mnist:train`/`mnist:test`, or an IDX images file.
-* `show` / `show weights` / `show filters` / `show sample N [--data SPEC]`,
+* `show` / `show weights` / `show filters` / `show vocab` / `show gates
+  --data FILE` / `show sample N [--data SPEC]`, `compare A.nmz B.nmz ...
+  --text TEXT`, `generate`,
   `test DATA`, `predict X... | --sample N`, `reinit [SEED]`,
   `save [FILE] [--no-optimizer]`, `load FILE`, `clear`, `help [COMMAND]`.
 * One-shot use composes in shell scripts: `-m FILE` loads a model before the
@@ -540,40 +780,89 @@ products; the default). Both pass the same gradient checks and agree to
 With `-O2` instead of `-O3` im2col was only ~1.1× faster: GCC 12's `-O2` does
 not vectorise the inner loops, so `-O3` is now the default (DESIGN decision 46).
 
-**Character RNNs** (`sh examples/benchmark_text.sh`): the presets, seed 42,
-same machine; the validation split is the last 10 % of each text, early
-stopping with patience 3.
+**Recurrent text models: RNN vs LSTM vs GRU** (`sh examples/benchmark_gated.sh`,
+part of `make bench`): the same parameter budget for the three
+architectures (`rnn:128`, `lstm:64`, `gru:75`: ±3 %), seed 42, the same
+machine, one thread. The validation split is the last 10 % of each text;
+early stopping with patience 3. Learning rates are the best of a small sweep
+per architecture: RNN 0.003 (names; 0.006 gave 2.108) and 0.004 (books;
+0.008 was worse), LSTM and GRU 0.01 (better than 0.005 on names and than
+0.004/0.006 on Alice). Validation loss is in nats per character; lower is
+better.
 
-| model | data | parameters | stopped / best epoch | validation loss (nats/char) | perplexity | next-char accuracy | training time |
-|---|---|---|---|---|---|---|---|
-| `--preset names` (embed 16, rnn 128) | 5163 English names, 36 k chars | 26 245 | 15 / 12 | 2.112 | 8.27 | 32.6% | 31 s |
-| `--preset names --data examples/names_ar.txt` | 504 Arabic names, 2.7 k chars | 23 925 | 18 / 15 | 2.655 | 14.22 | 28.9% | 3 s |
-| `--preset char-rnn` (embed 32, rnn 128, carried state) | Alice, 145 k chars | 32 683 | 16 / 13 | 1.634 | 5.12 | 53.9% | 155 s |
+| data | RNN (rnn:128) | LSTM (lstm:64) | GRU (gru:75) |
+|---|---|---|---|
+| English names (5163, 36 k chars) | 2.118 · ppl 8.31 · 26 s | **2.028** · ppl 7.60 · 38 s | 2.056 · ppl 7.81 · 19 s |
+| Arabic names (504, 2.7 k chars) | 2.660 · ppl 14.30 · 2 s | **2.460** · ppl 11.70 · 3 s | 2.464 · ppl 11.75 · 2 s |
+| Alice (145 k chars, state carried) | 1.638 · ppl 5.15 · 146 s | 1.614 · ppl 5.03 · 270 s | **1.580** · ppl 4.86 · 187 s |
+| Kalila wa-Dimna (240 k chars, Arabic) | 1.965 · ppl 7.14 · 235 s | 1.951 · ppl 7.03 · 421 s | **1.938** · ppl 6.95 · 160 s |
+| parameters (names / Alice / Kalila) | 26.2 k / 32.7 k / 29.1 k | 25.0 k / 32.1 k / 30.0 k | 25.6 k / 32.4 k / 30.0 k |
 
-Generated with `--seed 1` (unedited):
+Stopping epochs (stopped / best): names 15/12, 17/14, 10/7; Arabic names
+16/13, 19/16, 15/12; Alice 17/14, 30/30 (the limit), 21/18; Kalila 18/15,
+26/23, 12/9. Also on Kalila: `--preset char-lstm --strip-diacritics` 1.935
+(ppl 6.92, 45 instead of 53 characters; a slightly different task, see
+"Arabic prose" above), and `--preset arabic-text` (two stacked LSTMs of 96,
+130 k parameters, 4.3× the others) **1.863** (ppl 6.44, 15 epochs, 865 s): on
+the largest text, more capacity helps more than the choice of cell.
 
-* **English names**: Dauri, Corlerte, Shanniea, Rananda, Elexie, Kathalle,
-  Sasely, Irbin, Tamika *(in the training data)*, Danyly.
-* **Arabic names**: رامى، حهيد، نسدة، ماسة، سححير، طالح، ناوب، ششام، نؤة، راريءف
-* **Alice** (`--prime "Alice " --length 300 --temperature 0.7`):
+Honest summary: **the gated models win everywhere, but by small margins on
+the long texts** (0.01–0.06 nats per character on the books, 0.06–0.09 on
+English names) and by a lot on the small Arabic list (0.2: the gates seem
+to help most when data is scarce). The GRU is the best on both books and the faster of the
+two gated models; the LSTM learns more slowly (Alice: still improving at
+the 30-epoch limit). Orthogonal initialisation changed nothing measurable for
+the RNN (names 2.118 vs 2.112 with the phase-3 Glorot init, Alice 1.638 vs
+1.634). Character-level prediction is dominated by the last few characters,
+which is exactly where a vanilla RNN is fine; the long-range gradient that
+the LSTM keeps (`compare` above) is worth a few hundredths of a nat here.
 
-  > Alice said to Alice, as she had not quite all the ever, and said this was
-  > the Queen’s be a throat for a serpeation and said, “Soupan. “Fithouted the
-  > other she went on, “treat is again, so she had see in a trying and more
-  > that she said would be in say?” the Hatter upoomester.
+Generated with `--seed 1` (unedited; names marked "(in the training data)"
+were not invented):
 
-Honest assessment: the **English names** are pronounceable and mostly look
-like plausible names (Shanniea, Rananda, Elexie, Kathalle); a few are odd
-(Corlerte). The **Arabic names** are mixed: ماسة is a real given name and رامى
-a common spelling variant of رامي; نسدة and ناوب follow Arabic letter
-patterns but are not names; طالح is a real word but not a name (it is the opposite of the name
-صالح, which the model has seen); حهيد, ششام, راريءف break Arabic spelling
-habits. That is about what 504 training names allow — the model starts to
-overfit after ~15 epochs. The **Alice** text has the book's
-style — real words, quotes, punctuation, "said the Hatter", line breaks — but
-no grammar or meaning beyond a few words: what a 128-unit vanilla RNN
-trained for 2.5 minutes on 145 k characters can do. The vanishing gradient
-shown above is the main limit; an LSTM is the next step.
+* **English names** — RNN: Ebron, Corinetta, Shannna, Samarda, Fantta,
+  Karlene *(in the data)*, Sasfita, Jeish, Tamina, Dantor. LSTM: Darrice,
+  Corine *(in the data)*, Shannury, Samard, Elizonda, Janice *(in the
+  data)*, Sara *(in the data)*, Helora, Tamila, Damrus. GRU: Ebmie, Doshing,
+  Thanniah, Sambie, Hantonda, Latiche, Tathawana, Jebria, Tamika *(in the
+  data)*, Eghris.
+* **Arabic names** — RNN: رامم، حنية، نشاد، ماسة، رادية، ضالف، نان، سطام، هؤار، ذارية.
+  LSTM: رالي، حهيد، نفاد، مجرال، زجديل، طبوف، نان، شعال، هؤاف، ذجديفن.
+  GRU: ذالي، حوناء، نصار *(in the data)*، مجراف، زحبيد، ضاقر، نان، ششام، هادر، دجحيرة.
+* **Alice** (`--prime Alice --temperature 0.7`) — GRU:
+
+  > Alice another of cerion, he _chourn_ timid. “Bith on of the botting of
+  > her know put it back—” “I? They a crose to say who been to be all very
+  > enpleeg,” said the Kings weind down all the seating and not to the
+  > Lorybe, said to play would be in a poon, and party, cried the Caterpillar.
+
+  LSTM: *“…the King, and the Queen was nothing of the Mock Turtle side it
+  would be little miss near-for could her a tall pallent.”* RNN: *“…The
+  March Hare had not they down as you can a little both are no at the
+  dinning the Gryphon.”*
+* **Kalila wa-Dimna** (`--prime قال --temperature 0.7`) — GRU:
+
+  > قال الملك وأنا الصديق إلى أشراوز في الناس في القول، والفيل الملك لهم إلى
+  > الملك قيل البراه يواعد في أمهاً التي التيت لا أنا بزوجه ونعافه ما يعلم بين
+  > يده، ولا يتم تنطعم وأنا على القتال والحسن في ذلك في الملوك.
+
+  LSTM, tashkeel stripped: *قال الملك وأنا أمر ما أعد أمرهم عنده من حتى إلى
+  ما كان في الملك وفي دمنة من الأسواد من أهلهم وبين العقل؟ قال دمنة: …*
+
+Judged honestly: the **English names** of all three are pronounceable and
+name-like; the LSTM's are the most convincing (Darrice, Elizonda, Helora,
+Tamila) but it also repeats more training names. The **Arabic names** are
+still weak with 504 examples: one real name (ماسة; نصار was in the data),
+a few plausible-looking forms (رادية, هادر, سطام), several non-words that
+break Arabic patterns (ذجديفن, زجديل, مجرال), and نان from all three. **Alice**: book
+style, dialogue punctuation, the right characters (the King, the Queen, the
+Mock Turtle, the Caterpillar), real words, no sense — no visible difference
+in kind between the three. **Kalila**: the most striking output: mostly real
+Arabic words (قال الملك، الصديق، الناس، القول، العقل، العدو، الملوك), the book's
+names (دمنة, الفيل) and its rhetorical rhythm ("قال دمنة: …", "وأنا …"),
+correctly attached prefixes (و، ف، ب، ال), but invented words in between
+(أشراوز، تنطعم) and no syntax beyond a few words. A character model of this
+size learns spelling and the shape of phrases, not meaning.
 
 **Small datasets** (`sh examples/benchmark.sh ./build/neuromz 20`, seeds 1–20,
 defaults unless shown). Iris: 120 training rows, accuracy on the 30 held-out
@@ -596,7 +885,7 @@ MSE, 0.07 for cross-entropy) before 5000 epochs.
 
 ## Tests
 
-`make test` runs 57 tests (~105 000 checks) in a few seconds:
+`make test` runs 72 tests (~105 000 checks) in a few seconds:
 
 * **numerical gradient checks** for Dense, every activation (incl. the softmax
   Jacobian), MSE, fused softmax+cross-entropy, a deep mixed network, batch
@@ -624,13 +913,28 @@ MSE, 0.07 for cross-entropy) before 5000 epochs.
   the vocabulary round trip through save/load, deterministic generation
   (seed, greedy top-1, temperature), an Arabic model generating valid UTF-8,
   and **a format-3 file from phase 2 (without the new sections) still loads**;
+* **gated layers**: the LSTM and GRU forward against hand-computed values;
+  gradient checks over 6 steps with per-step heads, with the loss on the
+  last step only, with a carried state (h and c ≠ 0), stacked (lstm→lstm,
+  gru→gru, lstm→dropout→gru→dropout→rnn in evaluation mode, lstm→dropout→
+  lstm in training mode); **the gradient into c_{t−1} and h_{t−1}** from
+  the trace against central differences of the loss in the carried state;
+  carrying the state over two halves = one pass over the whole; orthogonal
+  initialisation (WᵀW = I for every gate block); forget-gate bias, save and
+  load of both layers;
+* **phase 4 text**: Arabic normalisation (tashkeel, tatweel, alef forms;
+  the vocabulary and the saved flags), batch generation equals one-at-a-time
+  generation row by row, a separate validation set, and **a character RNN
+  written by the last phase-3 commit still loads and generates exactly the
+  same names**;
 * CSV and IDX parsing errors; every API entry point with `NULL`/bad input.
 
-`make sanitize` runs all of that plus `tests/cli_smoke.sh` (130 CLI cases,
+`make sanitize` runs all of that plus `tests/cli_smoke.sh` (168 CLI cases,
 including image layers on a generated dataset, English and Arabic name
 models, generation determinism, traces in UTF-8 and ASCII, invalid UTF-8,
-no-network commands, malformed input, a 300 KB line and random binary input,
-and MNIST and Alice when present) under
+LSTM/GRU traces, `show gates`, `compare`, stacked models, Arabic
+normalisation, no-network commands, malformed input, a 300 KB line and random
+binary input, and MNIST, Alice and Kalila wa-Dimna when present) under
 ASan + UBSan with leak detection. The slow benchmarks are in `make bench`.
 
 ## Layout
@@ -640,20 +944,22 @@ include/neuromz.h        public API          src/        libneuromz (portable C1
 include/neuromz_layer.h  layer-author API    cli/        the neuromz program
 docs/DESIGN.md           design + decisions  tests/      test suite + CLI smoke test
 examples/                data, C demo, benchmarks        scripts/    MNIST / text download
-legacy/                  v1 (2017–2020)      data/       MNIST, Alice (downloaded, gitignored)
+legacy/                  v1 (2017–2020)      data/       MNIST, Alice, Kalila (downloaded, gitignored)
 ```
 
 Dataset sources and licenses: [`examples/DATASETS.md`](examples/DATASETS.md).
 
 Model files (`.nmz`) use a portable little-endian format with a magic number,
 version, optional sections (normalization, optimizer state, vocabulary,
-text-training settings) and CRC-32 (see DESIGN §7).
+text normalisation, text-training settings) and CRC-32 (see DESIGN §7).
 
 ## Roadmap
 
 Done: dense networks (phase 1); convolution, pooling, dropout, Adam,
 schedules, normalization and MNIST (phase 2); text, embeddings, a vanilla RNN
 with truncated BPTT, clipping, validation/early stopping and generation
-(phase 3). Next: an LSTM layer — DESIGN §3.1 describes how it plugs in with no
-engine change — then a tiny Transformer trained on text, and a GUI that
-consumes the trace events.
+(phase 3); LSTM, GRU, orthogonal initialisation, stacking, gate traces, the
+gradient-survival comparison, Arabic prose and batch generation (phase 4 —
+added with no change to the engine, as DESIGN §3.1 planned). Next: attention
+and a tiny Transformer trained on text, and a GUI that consumes the trace
+events.
