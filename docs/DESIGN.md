@@ -8,7 +8,8 @@ intermediate value — `z`, `a`, `δ`, gradients, weight updates — so the math
 can be printed now and visualised later.
 
 Status of this document: written before implementation, then corrected where
-the implementation taught us something (see the git history of this file).
+the implementation taught us something (see the git history of this file and
+decisions 27–33, which were added during implementation).
 
 ---
 
@@ -34,12 +35,15 @@ src/                   libneuromz — platform-independent C11, libc + libm only
   defaults.c           "quick mode" defaults and the reasons for them
   internal.h           private helpers shared by the library sources
 cli/                   the `neuromz` program (may use POSIX/terminal code)
-  main.c               entry point, REPL, argv dispatch
+  cli.h                CLI-internal declarations
+  main.c               entry point, REPL, argv dispatch (-m/-o/--ascii)
   commands.c           new/show/train/test/predict/save/load/trace/step/...
   print.c              table + formula printer for trace events
   line.c               dynamic line reader and tokenizer (no fixed buffers)
-tests/                 unit + integration tests (run under sanitizers too)
-examples/              xor.csv, xor_and.csv, iris.csv, api_xor.c, scripts
+tests/                 test_*.c (unit, gradient checks, convergence, I/O),
+                       cli_smoke.sh (CLI abuse test); all run under sanitizers
+examples/              xor.csv, xor_and.csv, iris.csv (+ 120/30 train/test
+                       split), api_xor.c, run_examples.sh, benchmark.sh
 docs/DESIGN.md         this file
 legacy/                v1 sources (2017–2020), unchanged, tag `v1-legacy`
 Makefile               lib, cli, test, sanitize, examples, clean
@@ -209,7 +213,8 @@ typedef struct nmz_trace_event {
     const char *layer_type;  /* "dense", "activation", "loss", ...         */
     const char *detail;      /* "sigmoid", "mse", "softmax+cross_entropy",
                                 "W"/"b" for updates, ...                   */
-    double      scalar;      /* loss value for LOSS events, else NaN        */
+    int         n_scalars;   /* named numbers: "L" for loss events,         */
+    nmz_trace_scalar scalars[4]; /* "lr", "momentum" for update events  */
     int         n_items;
     nmz_trace_item items[NMZ_TRACE_MAX_ITEMS];
 } nmz_trace_event;
@@ -221,11 +226,11 @@ Item names are a fixed, documented vocabulary (tensors are `[B, …]`):
 |---|---|
 | dense forward | `x` (input a⁽ˡ⁻¹⁾), `W`, `b`, `z` |
 | activation forward | `z`, `a` |
-| loss | `y` (prediction), `t` (target); `scalar` = L |
+| loss | `y` (prediction), `t` (target); scalar `L` |
 | loss backward | `dL/dy` — or, fused softmax+CE, `dL/dz` (= p − t) |
 | activation backward | `dL/da`, `f'(z)` (omitted for softmax), `dL/dz` |
 | dense backward | `dL/dz` (= δ), `x`, `dL/dW`, `dL/db`, `dL/dx` |
-| update (per param) | `value` (before), `grad`, `velocity`, `delta`; `detail` = param name |
+| update (per param) | `value` (before), `grad`, `velocity_prev`, `delta` (= new velocity); scalars `lr`, `momentum`; `detail` = param name |
 
 The CLI's `trace`/`step` commands turn these into tables with formulas, e.g.
 `z_j = Σ_i x_i·W_ij + b_j`. A future GUI consumes the same events (live via the
@@ -249,10 +254,13 @@ All names use the `nmz_` / `NMZ_` prefix. The full header is
                   nmz_layer_dense(units, init); nmz_layer_activation(act, alpha)
                   nmz_net_set_loss(net, loss); nmz_net_build(net);
                   nmz_net_create_quick(&net, n_sizes, sizes, seed, &quick)
+                  nmz_quick_defaults / nmz_quick_train_defaults (choices + reasons)
 /* inspect */     nmz_net_layer_count/layer/input_size/output_size/param_count,
-                  nmz_layer_type/describe/param_count/param, nmz_net_summary
+                  nmz_layer_type/describe/param_count/param_*, nmz_net_summary,
+                  nmz_layer_activation_kind, nmz_layer_dense_init
 /* compute */     nmz_net_forward(net, x, &y); nmz_net_predict(net, x, y);
                   nmz_net_backward(net, t, &loss); nmz_net_update(net, lr, mu);
+                  nmz_net_preview_update(net, lr, mu) /* trace only, no change */
                   nmz_net_compute_loss(net, t, &loss)
 /* train */       nmz_train_opts (max_epochs, batch_size, learning_rate, momentum,
                   shuffle, target_loss, on_epoch callback);
@@ -437,3 +445,28 @@ Each non-obvious choice and why.
     the owner's call.
 26. **CLI is one-shot + shell**, not only a shell: one-shot commands with
     `-m/-o` are scriptable and testable; the shell keeps v1's interactive feel.
+
+Added during implementation:
+
+27. **Default seed is 42**, not the clock: a beginner who repeats a lesson gets
+    the same numbers as the README and the teacher.
+28. **Quick-mode hyper-parameters were measured, not guessed.** For
+    softmax+cross-entropy, lr 0.05 (the first guess) stalled at 66.7% on some
+    Iris seeds, lr 0.02 converged on 30/30; the Iris training loss plateaus at
+    ≈0.06–0.07, so the CE target is 0.07 (lower mostly memorises the data).
+    MSE/sigmoid uses lr 0.5, target 0.001 (XOR: 20/20 seeds). See the README
+    results table and `examples/benchmark.sh`.
+29. **One step number per pass.** Forward events carry `step + 1` and the
+    backward pass increments `step`, so all events of one forward/backward/
+    update pass share a number (a GUI can group them).
+30. **`nmz_net_preview_update`** emits the update events without touching
+    weights or velocity, so `trace` can show "what the next step would do"
+    without the CLI needing private access to optimizer state.
+31. **CSV column split comes from the network** (`n_inputs`): the first
+    `input_size` columns are inputs and the rest targets, so `train` needs no
+    extra flags for multi-output data.
+32. **Evaluation passes are not traced** (`nmz_net_evaluate` suspends the
+    callback): the whole-set loss check after each epoch is bookkeeping, not
+    part of the learning math a student follows.
+33. **Saving is atomic**: the model is written to `FILE.tmp` and renamed, so a
+    failed save never destroys the previous good file.
