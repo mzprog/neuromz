@@ -116,9 +116,61 @@ static void test_text_dataset_errors(void) {
     CHECK(ds == NULL);
 }
 
+
+/* optional Arabic normalisation: tashkeel + tatweel, alef forms */
+static void test_arabic_normalize(void) {
+    /* "مُحَمَّدٌ كـــتاب" (with harakat, shadda, tanwin, tatweel) "أحمد إبراهيم آمنة ٱلله" */
+    const char *in = "\xd9\x85\xd9\x8f\xd8\xad\xd9\x8e\xd9\x85\xd9\x91\xd9\x8e\xd8\xaf\xd9\x8c \xd9\x83\xd9\x80\xd9\x80"
+                     "\xd9\x80\xd8\xaa\xd8\xa7\xd8\xa8 \xd8\xa3\xd8\xad\xd9\x85\xd8\xaf \xd8\xa5\xd8\xa8\xd8\xb1\xd8\xa7\xd9\x87"
+                     "\xd9\x8a\xd9\x85 \xd8\xa2\xd9\x85\xd9\x86\xd8\xa9 \xd9\xb1\xd9\x84\xd9\x84\xd9\x87";
+    static const uint32_t strip[] = {0x645, 0x62D, 0x645, 0x62F, ' ', 0x643, 0x62A, 0x627, 0x628, ' ', 0x623, 0x62D,
+                                     0x645, 0x62F, ' ', 0x625, 0x628, 0x631, 0x627, 0x647, 0x64A, 0x645, ' ', 0x622,
+                                     0x645, 0x646, 0x629, ' ', 0x671, 0x644, 0x644, 0x647};
+    uint32_t *cp = NULL;
+    size_t n = 0, bad = 0, m, i;
+    CHECK_OK(nmz_utf8_decode(in, strlen(in), &cp, &n, &bad));
+    if (!cp) return;
+    CHECK(nmz_text_normalize(cp, n, 0) == n); /* off: unchanged */
+    m = nmz_text_normalize(cp, n, NMZ_TEXT_STRIP_DIACRITICS);
+    CHECK_MSG(m == sizeof strip / sizeof strip[0] && n - m == 8, "%zu -> %zu", n, m); /* 5 marks + 3 tatweel */
+    for (i = 0; i < m && i < sizeof strip / sizeof strip[0]; i++) CHECK_MSG(cp[i] == strip[i], "[%zu] U+%04X", i, cp[i]);
+    m = nmz_text_normalize(cp, m, NMZ_TEXT_UNIFY_ALEF); /* أ إ آ ٱ → ا, nothing removed */
+    CHECK(m == sizeof strip / sizeof strip[0] && cp[10] == 0x627 && cp[15] == 0x627 && cp[23] == 0x627 && cp[28] == 0x627);
+    CHECK(cp[2] == 0x645 && cp[18] == 0x627); /* other letters untouched */
+    free(cp);
+    {
+        /* a dataset with the flags: vocabulary without the marks, flags kept, removals counted */
+        const char *path = test_path("t_tashkeel.txt");
+        nmz_text_opts o = nmz_text_defaults();
+        nmz_dataset *plain = NULL, *norm = NULL;
+        write_bytes(path, in, strlen(in));
+        o.seq_len = 4;
+        CHECK_OK(nmz_dataset_load_text(&plain, path, &o));
+        o.normalize = NMZ_TEXT_NORMALIZE_ALL;
+        CHECK_OK(nmz_dataset_load_text(&norm, path, &o));
+        if (plain && norm) {
+            CHECK(plain->vocab->normalize == 0 && plain->n_removed == 0);
+            CHECK(norm->vocab->normalize == NMZ_TEXT_NORMALIZE_ALL && norm->n_removed == 8);
+            CHECK(nmz_vocab_index(plain->vocab, 0x64F) >= 0 && nmz_vocab_index(norm->vocab, 0x64F) < 0); /* damma */
+            CHECK(nmz_vocab_index(norm->vocab, 0x640) < 0 && nmz_vocab_index(norm->vocab, 0x623) < 0);
+            CHECK_MSG(plain->vocab->size - norm->vocab->size == 9, /* ُ َ ّ ٌ ـ and أ إ آ ٱ */ "%d vs %d", plain->vocab->size, norm->vocab->size);
+            /* encoding with the model's vocabulary applies the model's flags */
+            o.normalize = 0;
+            o.vocab = norm->vocab;
+            nmz_dataset_free(plain);
+            plain = NULL;
+            CHECK_OK(nmz_dataset_load_text(&plain, path, &o));
+            CHECK(plain && plain->n_removed == 8 && plain->n_samples == norm->n_samples);
+        }
+        nmz_dataset_free(plain);
+        nmz_dataset_free(norm);
+    }
+}
+
 const test_case text_tests[] = {
     {"text/utf8_arabic_and_invalid", test_utf8},
     {"text/vocab_codepoints", test_vocab},
     {"text/dataset_arabic_items", test_text_dataset_arabic},
     {"text/dataset_errors", test_text_dataset_errors},
+    {"text/arabic_normalization", test_arabic_normalize},
     {NULL, NULL}};

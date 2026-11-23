@@ -462,6 +462,174 @@ static void test_carry_continues_stream(void) {
     }
 }
 
+
+/* a character RNN written by the last phase-3 commit (b0047fc): format 3
+ * with vocab and train_ext sections, rnn with the phase-3 (Glorot) init.
+ * It must load and generate exactly what phase 3 generated. */
+static void test_phase3_file_loads(void) {
+    static const char *const want[4] = {
+        "\xd8\xad\xd8\xa8\xd8\xaa\xd9\x87\xd9\x85\xd8\xa8\xd9\x81\xd8\xae\x0a",
+        "\xd8\xb4\xd8\xa6\xd8\xb9\xd8\xb6\xd8\xa7\xd8\xaf\xd9\x84\xd8\xb6\x0a",
+        "\xd9\x87\xd8\xa2\xd9\x85\xd8\xa4\xd8\xad\xd9\x8a\xd8\xa3\xd8\xb3\xd8\xa7\xd8\xa1\xd8\xad\xd8\xb4"
+        "\xd8\xb1\xd8\xaf\xd8\xb3\xd8\xb7\x0a",
+        "\xd8\xb1\xd8\xb3\xd8\xa6\xd9\x84\xd8\xb9\xd8\xa5\x0a"};
+    nmz_net *net = NULL;
+    nmz_gen_opts g = nmz_gen_defaults();
+    int s;
+    CHECK_OK(nmz_net_load(&net, "tests/data/v3_phase3_names_ar.nmz"));
+    if (!net) return;
+    CHECK(nmz_net_is_sequence(net) && nmz_net_vocab(net) && nmz_net_vocab(net)->items == 1);
+    CHECK(!strcmp(nmz_layer_type(nmz_net_layer(net, 1)), "rnn"));
+    CHECK(nmz_layer_init_used(nmz_net_layer(net, 1)) == NMZ_INIT_XAVIER);
+    CHECK(nmz_net_vocab(net)->normalize == 0);
+    g.stop_at_end = 1;
+    g.length = 64;
+    for (s = 0; s < 4; s++) {
+        char *out = NULL;
+        g.seed = (uint64_t)(5 + s);
+        CHECK_OK(nmz_net_generate(net, &g, &out, NULL));
+        CHECK_MSG(out && !strcmp(out, want[s]), "seed %d: '%s'", 5 + s, out ? out : "");
+        free(out);
+    }
+    nmz_net_free(net);
+}
+
+/* batch generation: row r == a single run with seed + r, whatever the batch
+ * size; items finish at different steps */
+static void test_batch_generation(void) {
+    static const int kinds[2] = {0, 1};
+    const char *text = "\nanna\nbob\nada\nabba\nnoon\nabc\n";
+    uint32_t *cp = NULL;
+    size_t n = 0, bad = 0;
+    nmz_vocab *v = NULL;
+    nmz_net *net;
+    int items, r;
+    CHECK_OK(nmz_utf8_decode(text, strlen(text), &cp, &n, &bad));
+    CHECK_OK(nmz_vocab_build(&v, cp, n));
+    free(cp);
+    if (!v) return;
+    net = char_net2(v->size, 4, kinds, 2, 6, 0, 61);
+    CHECK(net != NULL);
+    if (!net) {
+        nmz_vocab_free(v);
+        return;
+    }
+    for (items = 0; items < 2; items++) {
+        nmz_gen_opts g = nmz_gen_defaults();
+        char *batch[5] = {NULL}, *small[3] = {NULL};
+        size_t nb[5];
+        v->items = items;
+        CHECK_OK(nmz_net_set_vocab(net, v));
+        g.seed = 10;
+        g.length = items ? 40 : 25;
+        g.stop_at_end = items;
+        g.prime = items ? NULL : "ab";
+        CHECK_OK(nmz_net_generate_batch(net, &g, 5, batch, nb));
+        CHECK_OK(nmz_net_generate_batch(net, &g, 3, small, NULL));
+        for (r = 0; r < 5; r++) {
+            char *one = NULL;
+            size_t n1 = 0;
+            nmz_gen_opts g1 = g;
+            g1.seed = g.seed + (uint64_t)r;
+            CHECK_OK(nmz_net_generate(net, &g1, &one, &n1));
+            CHECK_MSG(one && batch[r] && !strcmp(one, batch[r]) && n1 == nb[r], "row %d: '%s' vs '%s'", r,
+                      batch[r] ? batch[r] : "", one ? one : "");
+            if (r < 3) CHECK(small[r] && batch[r] && !strcmp(small[r], batch[r]));
+            if (!items) CHECK(nb[r] == 25);
+            if (items) CHECK(nb[r] >= 1 && batch[r] && batch[r][strlen(batch[r]) - 1] == '\n');
+            free(one);
+        }
+        if (items) test_note("items, 5 rows at once: lengths %zu %zu %zu %zu %zu (each = its single run)", nb[0], nb[1],
+                             nb[2], nb[3], nb[4]);
+        for (r = 0; r < 5; r++) free(batch[r]);
+        for (r = 0; r < 3; r++) free(small[r]);
+    }
+    {
+        char *o[2];
+        nmz_gen_opts g = nmz_gen_defaults();
+        CHECK_STATUS(nmz_net_generate_batch(net, &g, 0, o, NULL), NMZ_ERR_ARG);
+    }
+    nmz_vocab_free(v);
+    nmz_net_free(net);
+}
+
+/* text normalisation is stored with the model and applied to the prime */
+static void test_normalize_saved(void) {
+    static const int kinds[1] = {0};
+    /* "محمد" with damma + fatha marks, and "أ" */
+    const char *text = "\xd9\x85\xd8\xad\xd9\x85\xd8\xaf \xd8\xa3\xd8\xad\xd9\x85\xd8\xaf\n";
+    const char *prime = "\xd9\x85\xd9\x8f\xd8\xad\xd9\x8e\xd9\x80\xd9\x85\xd8\xa5"; /* مُحَـمإ */
+    uint32_t *cp = NULL;
+    size_t n = 0, bad = 0;
+    nmz_vocab *v = NULL;
+    nmz_net *net, *back = NULL;
+    nmz_gen_opts g = nmz_gen_defaults();
+    char *a = NULL, *b = NULL;
+    CHECK_OK(nmz_utf8_decode(text, strlen(text), &cp, &n, &bad));
+    n = nmz_text_normalize(cp, n, NMZ_TEXT_NORMALIZE_ALL);
+    CHECK_OK(nmz_vocab_build(&v, cp, n));
+    free(cp);
+    if (!v) return;
+    v->normalize = NMZ_TEXT_NORMALIZE_ALL;
+    net = char_net2(v->size, 3, kinds, 1, 4, 0, 71);
+    if (!net) {
+        nmz_vocab_free(v);
+        return;
+    }
+    CHECK_OK(nmz_net_set_vocab(net, v));
+    g.prime = prime; /* its marks, tatweel and إ are not in the vocabulary: normalised away / to ا */
+    g.length = 10;
+    CHECK_OK(nmz_net_generate(net, &g, &a, NULL));
+    CHECK_OK(nmz_net_save(net, test_path("t_norm.nmz")));
+    CHECK_OK(nmz_net_load(&back, test_path("t_norm.nmz")));
+    if (back) {
+        CHECK(nmz_net_vocab(back)->normalize == NMZ_TEXT_NORMALIZE_ALL);
+        CHECK_OK(nmz_net_generate(back, &g, &b, NULL));
+        CHECK(a && b && !strcmp(a, b));
+    }
+    v->normalize = 0; /* without the flags the same prime is rejected */
+    CHECK_OK(nmz_net_set_vocab(net, v));
+    free(b);
+    b = NULL;
+    CHECK_STATUS(nmz_net_generate(net, &g, &b, NULL), NMZ_ERR_ARG);
+    free(a);
+    free(b);
+    nmz_vocab_free(v);
+    nmz_net_free(back);
+    nmz_net_free(net);
+}
+
+/* a separate validation set (--val-file): all training data trains, the
+ * reported validation loss is the loss on the other set */
+static void test_val_file(void) {
+    nmz_dataset *tr = NULL, *te = NULL, *xr = NULL;
+    nmz_csv_opts co = nmz_csv_defaults();
+    nmz_net *net = NULL;
+    nmz_train_opts o;
+    nmz_train_result res;
+    int sizes[3] = {4, 8, 3};
+    double L = 0, acc = 0;
+    CHECK_OK(nmz_dataset_load_csv(&tr, "examples/iris_train.csv", &co));
+    CHECK_OK(nmz_dataset_load_csv(&te, "examples/iris_test.csv", &co));
+    CHECK_OK(nmz_dataset_load_csv(&xr, "examples/xor.csv", &co));
+    CHECK_OK(nmz_net_create_quick(&net, 3, sizes, 3, NULL));
+    if (!tr || !te || !xr || !net) goto out;
+    o = *nmz_net_train_config(net);
+    o.max_epochs = 30;
+    o.val_fraction = 0.5f; /* ignored when a validation set is given */
+    CHECK_OK(nmz_net_train_val(net, tr, te, &o, &res));
+    CHECK_OK(nmz_net_evaluate(net, te, &L, &acc));
+    CHECK_MSG(fabs(res.val_loss - L) < 1e-12 && res.val_accuracy == acc, "val %g vs %g", res.val_loss, L);
+    CHECK_OK(nmz_net_evaluate(net, tr, &L, NULL));
+    CHECK(fabs(res.loss - L) < 1e-12); /* the training loss is over all 120 training samples */
+    CHECK_STATUS(nmz_net_train_val(net, tr, xr, &o, &res), NMZ_ERR_SHAPE);
+out:
+    nmz_dataset_free(tr);
+    nmz_dataset_free(te);
+    nmz_dataset_free(xr);
+    nmz_net_free(net);
+}
+
 const test_case gated_tests[] = {
     {"gated/lstm_forward_by_hand", test_lstm_by_hand},
     {"gated/gru_forward_by_hand", test_gru_by_hand},
@@ -473,5 +641,9 @@ const test_case gated_tests[] = {
     {"gated/orthogonal_init", test_orthogonal_init},
     {"gated/forget_bias_saveload", test_forget_bias_and_saveload},
     {"gated/carry_continues_stream", test_carry_continues_stream},
+    {"io/phase3_char_rnn_file_loads", test_phase3_file_loads},
+    {"gen/batch_equals_single_runs", test_batch_generation},
+    {"gen/text_normalization_saved", test_normalize_saved},
+    {"train/separate_validation_set", test_val_file},
     {NULL, NULL},
 };

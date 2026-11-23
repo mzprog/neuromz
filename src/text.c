@@ -131,8 +131,11 @@ nmz_status nmz_vocab_create(nmz_vocab **out, int size, const uint32_t *codepoint
 }
 
 nmz_status nmz_vocab_copy(nmz_vocab **out, const nmz_vocab *v) {
+    nmz_status s;
     if (!v) return nmz__fail(NMZ_ERR_ARG, "vocabulary is NULL");
-    return nmz_vocab_create(out, v->size, v->codepoints, v->counts, v->items);
+    s = nmz_vocab_create(out, v->size, v->codepoints, v->counts, v->items);
+    if (s == NMZ_OK) (*out)->normalize = v->normalize;
+    return s;
 }
 
 static int cmp_u32(const void *a, const void *b) {
@@ -195,6 +198,7 @@ nmz_text_opts nmz_text_defaults(void) {
     o.seq_len = 64;
     o.items = 0;
     o.vocab = NULL;
+    o.normalize = 0;
     return o;
 }
 
@@ -233,6 +237,20 @@ static nmz_status read_file(const char *path, char **buf, size_t *len) {
 
 /* BOM, CR LF / CR → LF; in items mode: drop empty lines, trim trailing
  * spaces, start with '\n' and end every item with '\n'. In place. */
+size_t nmz_text_normalize(uint32_t *c, size_t n, unsigned flags) {
+    size_t i, k = 0;
+    if (!c) return 0;
+    for (i = 0; i < n; i++) {
+        uint32_t ch = c[i];
+        if ((flags & NMZ_TEXT_STRIP_DIACRITICS) && ((ch >= 0x064B && ch <= 0x0652) || ch == 0x0670 || ch == 0x0640))
+            continue;
+        if ((flags & NMZ_TEXT_UNIFY_ALEF) && (ch == 0x0623 || ch == 0x0625 || ch == 0x0622 || ch == 0x0671))
+            ch = 0x0627;
+        c[k++] = ch;
+    }
+    return k;
+}
+
 static size_t normalise(uint32_t *c, size_t n, int items) {
     size_t i = 0, k = 0;
     while (i < n && c[i] == 0xFEFF) i++; /* BOM(s) */
@@ -259,7 +277,7 @@ static size_t normalise(uint32_t *c, size_t n, int items) {
 nmz_status nmz_dataset_load_text(nmz_dataset **out, const char *path, const nmz_text_opts *opts) {
     nmz_text_opts o = opts ? *opts : nmz_text_defaults();
     char *bytes = NULL;
-    size_t nbytes = 0, ncp = 0, bad = 0, i, n_seq, t;
+    size_t nbytes = 0, ncp = 0, bad = 0, i, n_seq, t, removed = 0;
     uint32_t *cps = NULL;
     int *ids = NULL;
     nmz_dataset *ds = NULL;
@@ -285,6 +303,12 @@ nmz_status nmz_dataset_load_text(nmz_dataset **out, const char *path, const nmz_
             ncp++;
         }
     }
+    {
+        unsigned flags = o.vocab ? o.vocab->normalize : o.normalize;
+        size_t before = ncp;
+        ncp = nmz_text_normalize(cps, ncp, flags);
+        removed = before - ncp;
+    }
     ncp = normalise(cps, ncp, o.items);
     if (ncp < (size_t)o.seq_len + 1) {
         s = nmz__fail(NMZ_ERR_FORMAT, "%s: %zu characters are not enough for one sequence of %d (+1)", path, ncp,
@@ -300,6 +324,7 @@ nmz_status nmz_dataset_load_text(nmz_dataset **out, const char *path, const nmz_
         if ((s = nmz_vocab_copy(&ds->vocab, o.vocab)) != NMZ_OK) goto done;
     } else {
         if ((s = nmz_vocab_build(&ds->vocab, cps, ncp)) != NMZ_OK) goto done;
+        ds->vocab->normalize = o.normalize & NMZ_TEXT_NORMALIZE_ALL;
     }
     ds->vocab->items = o.items;
     ids = malloc(ncp * sizeof *ids);
@@ -335,6 +360,7 @@ nmz_status nmz_dataset_load_text(nmz_dataset **out, const char *path, const nmz_
     ds->sample_shape[0] = o.seq_len;
     ds->n_tokens = ncp;
     ds->invalid_utf8 = bad;
+    ds->n_removed = removed;
     ds->x = malloc(n_seq * (size_t)o.seq_len * sizeof(float));
     ds->y = malloc(n_seq * (size_t)o.seq_len * sizeof(float));
     if (!ds->x || !ds->y) {

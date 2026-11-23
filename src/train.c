@@ -184,25 +184,37 @@ static void params_copy(nmz_net *net, float *buf, int to_buf) {
 
 nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_opts *opts,
                          nmz_train_result *result) {
+    return nmz_net_train_val(net, ds, NULL, opts, result);
+}
+
+nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_dataset *val, const nmz_train_opts *opts,
+                             nmz_train_result *result) {
     nmz_train_opts o;
     nmz_train_result res;
     nmz_tensor xb = NMZ_TENSOR_EMPTY, tb = NMZ_TENSOR_EMPTY;
-    int *perm = NULL, epoch, i, bs, n, n_val = 0, used, best_epoch = 0;
+    int *perm = NULL, epoch, i, bs, n, n_val = 0, vfirst = 0, used, best_epoch = 0;
     double bl = 0.0, best_val = HUGE_VAL;
     float *best = NULL;
+    const nmz_dataset *vds = val ? val : ds; /* validation samples [vfirst, vfirst + n_val) of vds */
     nmz_status s;
     if (!net) return nmz__fail(NMZ_ERR_ARG, "net is NULL");
     o = opts ? *opts : net->train;
     if ((s = nmz__train_opts_validate(&o)) != NMZ_OK) return s;
     if ((s = nmz_net_build(net)) != NMZ_OK) return s;
     if ((s = nmz__net_check_dataset(net, ds)) != NMZ_OK) return s;
-    if (o.val_fraction > 0.0f) {
+    if (val) { /* a separate validation set: all of ds trains, val_fraction is ignored */
+        if ((s = nmz__net_check_dataset(net, val)) != NMZ_OK) return s;
+        if (val->n_samples < 1) return nmz__fail(NMZ_ERR_ARG, "the validation data set is empty");
+        n_val = val->n_samples;
+    } else if (o.val_fraction > 0.0f) {
         n_val = (int)((double)ds->n_samples * o.val_fraction);
         if (n_val < 1 || n_val >= ds->n_samples)
             return nmz__fail(NMZ_ERR_ARG, "a validation fraction of %g leaves no training or no validation samples "
                                           "(%d samples)", (double)o.val_fraction, ds->n_samples);
     }
-    n = ds->n_samples - n_val; /* the LAST n_val samples are the validation split */
+    /* without a separate set, the LAST n_val samples are the validation split */
+    n = val ? ds->n_samples : ds->n_samples - n_val;
+    vfirst = val ? 0 : n;
     if (net->norm != NMZ_NORM_NONE && !net->norm_fitted) { /* fitted once, on the first training data */
         nmz_dataset view = *ds;
         view.n_samples = n; /* statistics of the training split only */
@@ -287,7 +299,7 @@ nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_op
         net->carry = 0;
         nmz_net_reset_state(net);
         if ((s = evaluate_range(net, ds, 0, n, o.carry_state, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
-        if (n_val && (s = evaluate_range(net, ds, n, n_val, o.carry_state, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
+        if (n_val && (s = evaluate_range(net, vds, vfirst, n_val, o.carry_state, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
         res.epochs = epoch;
         if (!isfinite(res.loss)) {
             s = nmz__fail(NMZ_ERR_NUMERIC, "loss became NaN/Inf in epoch %d — the learning rate (%g) is probably too high",
@@ -316,7 +328,7 @@ nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_op
         params_copy(net, best, 0);
         res.best_epoch = best_epoch;
         if ((s = evaluate_range(net, ds, 0, n, o.carry_state, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
-        if ((s = evaluate_range(net, ds, n, n_val, o.carry_state, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
+        if ((s = evaluate_range(net, vds, vfirst, n_val, o.carry_state, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
     } else if (best) {
         res.best_epoch = best_epoch;
     }

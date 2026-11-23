@@ -414,6 +414,10 @@ nmz_gen_opts nmz_gen_defaults(void);
 /* *out receives malloc'd UTF-8 (free with free()); the prime is not
  * included. *n_chars (may be NULL) = characters generated. */
 nmz_status nmz_net_generate(nmz_net *net, const nmz_gen_opts *opts, char **out, size_t *n_chars);
+/* `count` texts at once (one forward pass per step for the whole batch).
+ * Text r uses seed opts->seed + r and equals nmz_net_generate with that
+ * seed. outs[0..count) receive malloc'd strings; n_chars may be NULL. */
+nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int count, char **outs, size_t *n_chars);
 
 /* Text models: the character vocabulary, saved with the model (copied). */
 nmz_status nmz_net_set_vocab(nmz_net *net, const nmz_vocab *v);
@@ -433,7 +437,19 @@ typedef struct nmz_vocab {
     uint32_t *codepoints; /* sorted ascending; id = position */
     uint64_t *counts;     /* occurrences in the text it was built from */
     int items;            /* 1: line-per-item text; '\n' ends an item */
+    unsigned normalize;   /* NMZ_TEXT_* flags applied to every text the
+                             model reads (training data, prime, trace) */
 } nmz_vocab;
+
+/* Optional Arabic normalisation (off by default; stored with the model):
+ * STRIP_DIACRITICS removes the tashkeel (harakat U+064B–U+0652: fathatan,
+ * dammatan, kasratan, fatha, damma, kasra, shadda, sukun; superscript alef
+ * U+0670) and the tatweel U+0640; UNIFY_ALEF writes أ إ آ ٱ as ا. */
+#define NMZ_TEXT_STRIP_DIACRITICS 1u
+#define NMZ_TEXT_UNIFY_ALEF 2u
+#define NMZ_TEXT_NORMALIZE_ALL (NMZ_TEXT_STRIP_DIACRITICS | NMZ_TEXT_UNIFY_ALEF)
+/* Apply NMZ_TEXT_* flags in place; returns the new length. */
+size_t nmz_text_normalize(uint32_t *cps, size_t n, unsigned flags);
 
 #define NMZ_REPLACEMENT_CHAR 0xFFFDu
 /* Decode UTF-8 (RFC 3629: no overlong forms, surrogates or values above
@@ -470,6 +486,7 @@ typedef struct nmz_dataset {
     nmz_vocab *vocab;
     size_t n_tokens;    /* characters in the text after normalisation */
     size_t invalid_utf8; /* bytes replaced by U+FFFD while decoding */
+    size_t n_removed;    /* characters removed by the text normalisation */
 } nmz_dataset;
 
 typedef struct nmz_text_opts {
@@ -479,6 +496,8 @@ typedef struct nmz_text_opts {
                                with '\n' so every item has a start context */
     const nmz_vocab *vocab; /* encode with this vocabulary (e.g. the model's);
                                NULL builds one from the text */
+    unsigned normalize;     /* NMZ_TEXT_* flags for a new vocabulary (with
+                               `vocab` set, the vocabulary's flags apply) */
 } nmz_text_opts;
 
 nmz_text_opts nmz_text_defaults(void);
@@ -521,6 +540,10 @@ nmz_status nmz_dataset_truncate(nmz_dataset *ds, int n);
  * stored training configuration is used. */
 nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds,
                          const nmz_train_opts *opts, nmz_train_result *result);
+/* Same, validating on a separate data set `val` (e.g. another file) instead
+ * of the last val_fraction of `ds`; all of `ds` is used for training. */
+nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_dataset *val, const nmz_train_opts *opts,
+                             nmz_train_result *result);
 /* Whole-set loss and accuracy (accuracy NaN when not meaningful). */
 nmz_status nmz_net_evaluate(nmz_net *net, const nmz_dataset *ds, double *loss,
                             double *accuracy);

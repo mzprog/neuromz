@@ -218,6 +218,10 @@ static void sec_vocab(nmz_net *net, nmz_writer *w) {
     }
 }
 
+/* phase 4: text normalisation flags of the vocabulary (only when set, so
+ * models without it are byte-identical to phase 3) */
+static void sec_text_norm(nmz_net *net, nmz_writer *w) { nmz_write_u32(w, net->vocab->normalize); }
+
 /* training settings added in phase 3 */
 static void sec_train_ext(nmz_net *net, nmz_writer *w) {
     nmz_write_f32(w, net->train.val_fraction);
@@ -290,10 +294,12 @@ static nmz_status save_body(nmz_net *net, nmz_writer *w, unsigned flags) {
         int with_norm = net->norm != NMZ_NORM_NONE;
         int with_opt = net->opt_kind >= 0 && !(flags & NMZ_SAVE_NO_OPTIMIZER);
         int with_vocab = net->vocab != NULL;
-        nmz_write_u32(w, (uint32_t)(with_norm + with_opt + with_vocab + 1));
+        int with_tnorm = with_vocab && net->vocab->normalize != 0;
+        nmz_write_u32(w, (uint32_t)(with_norm + with_opt + with_vocab + with_tnorm + 1));
         if (with_norm) write_section(net, w, "normalize", sec_normalize);
         if (with_opt) write_section(net, w, "optimizer", sec_optimizer);
         if (with_vocab) write_section(net, w, "vocab", sec_vocab);
+        if (with_tnorm) write_section(net, w, "text_norm", sec_text_norm);
         write_section(net, w, "train_ext", sec_train_ext);
     }
     return nmz_write_u32(w, w->crc); /* footer: CRC of everything above */
@@ -444,6 +450,15 @@ static nmz_status read_sections(nmz_reader *r, nmz_net *net) {
             read_vocab(r, net);
         else if (!strcmp(tag, "train_ext"))
             read_train_ext(r, net);
+        else if (!strcmp(tag, "text_norm")) {
+            uint32_t f = 0;
+            if (nmz_read_u32(r, &f) == NMZ_OK) {
+                if (!net->vocab || (f & ~NMZ_TEXT_NORMALIZE_ALL))
+                    r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt text_norm section");
+                else
+                    net->vocab->normalize = f;
+            }
+        }
         else { /* unknown: skip (written by a newer NeuroMZ) */
             unsigned char buf[256];
             uint32_t left = len;
