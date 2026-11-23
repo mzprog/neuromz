@@ -351,8 +351,9 @@ const nmz_tensor *nmz_net_activation(const nmz_net *net, int i) {
 /* Trace events carry the 1-based number of the forward/backward pass they
  * belong to: a forward pass is numbered step+1 (the backward pass that
  * follows it will increment step to that number). */
-static nmz_ctx make_ctx_step(const nmz_net *net, int layer, int training, long step) {
+static nmz_ctx make_ctx_step(nmz_net *net, int layer, int training, long step) {
     nmz_ctx c;
+    c.rng = &net->rng;
     c.trace = net->trace;
     c.trace_user = net->trace_user;
     c.step = step;
@@ -361,8 +362,9 @@ static nmz_ctx make_ctx_step(const nmz_net *net, int layer, int training, long s
     return c;
 }
 
-static nmz_ctx make_ctx(const nmz_net *net, int layer, int training) {
+static nmz_ctx make_ctx(nmz_net *net, int layer, int training) {
     nmz_ctx c;
+    c.rng = &net->rng;
     c.trace = net->trace;
     c.trace_user = net->trace_user;
     c.step = net->step;

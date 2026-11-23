@@ -28,6 +28,7 @@ typedef struct nmz_ctx {
     long step;
     int layer_index;
     int training; /* 1 during training passes, 0 for evaluation */
+    nmz_rng *rng; /* the net's PRNG (dropout masks); never NULL in forward */
 } nmz_ctx;
 
 /* Little-endian byte writer/reader used by save_config/load_config. */

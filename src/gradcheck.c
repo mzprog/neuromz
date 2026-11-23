@@ -14,8 +14,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-static nmz_status loss_at(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t, double *L) {
-    nmz_status s = nmz__net_forward(net, x, 1, NULL);
+/* Every forward pass starts from the same PRNG state, so stochastic layers
+ * (dropout) make identical choices and L is a deterministic function of w. */
+static nmz_status loss_at(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t, int training,
+                          const nmz_rng *rng0, double *L) {
+    nmz_status s;
+    net->rng = *rng0;
+    s = nmz__net_forward(net, x, training, NULL);
     if (s != NMZ_OK) return s;
     return nmz_net_compute_loss(net, t, L);
 }
@@ -43,6 +48,11 @@ static void compare(nmz_gradcheck_result *r, double *worst_ratio, double a, doub
 
 nmz_status nmz_net_gradcheck(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t, double eps,
                              double atol, double rtol, nmz_gradcheck_result *result) {
+    return nmz_net_gradcheck_mode(net, x, t, eps, atol, rtol, 1, result);
+}
+
+nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t, double eps,
+                                  double atol, double rtol, int training, nmz_gradcheck_result *result) {
     nmz_gradcheck_result r;
     nmz_trace_fn saved_fn;
     nmz_tensor xp = NMZ_TENSOR_EMPTY, grads = NMZ_TENSOR_EMPTY;
@@ -50,6 +60,7 @@ nmz_status nmz_net_gradcheck(nmz_net *net, const nmz_tensor *x, const nmz_tensor
     size_t total = 0, off, e;
     long saved_step;
     double worst = 0.0;
+    nmz_rng rng0;
     int k;
     if (!net || !x || !t || !result) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
     if (eps <= 0) eps = 1e-3;
@@ -59,11 +70,16 @@ nmz_status nmz_net_gradcheck(nmz_net *net, const nmz_tensor *x, const nmz_tensor
     memset(&r, 0, sizeof r);
     saved_fn = net->trace;
     saved_step = net->step;
+    rng0 = net->rng;
     net->trace = NULL;
 
     /* analytic gradients, copied out (they are overwritten by later passes) */
-    if ((s = nmz__net_forward(net, x, 1, NULL)) != NMZ_OK) goto out;
-    if ((s = nmz_net_backward(net, t, NULL)) != NMZ_OK) goto out;
+    net->rng = rng0;
+    if ((s = nmz__net_forward(net, x, training, NULL)) != NMZ_OK) goto out;
+    net->training = training;
+    s = nmz_net_backward(net, t, NULL);
+    net->training = 0;
+    if (s != NMZ_OK) goto out;
     for (k = 0; k < net->n_params; k++)
         total += nmz_layer_param_grad(net->layers[net->param_refs[k].layer], net->param_refs[k].index)->size;
     total += net->dacts[0].size;
@@ -87,9 +103,9 @@ nmz_status nmz_net_gradcheck(nmz_net *net, const nmz_tensor *x, const nmz_tensor
             float orig = w->data[e];
             double lp, lm;
             w->data[e] = (float)(orig + eps);
-            s = loss_at(net, x, t, &lp);
+            s = loss_at(net, x, t, training, &rng0, &lp);
             w->data[e] = (float)(orig - eps);
-            if (s == NMZ_OK) s = loss_at(net, x, t, &lm);
+            if (s == NMZ_OK) s = loss_at(net, x, t, training, &rng0, &lm);
             w->data[e] = orig;
             if (s != NMZ_OK) goto out;
             compare(&r, &worst, grads.data[off + e], (lp - lm) / (2.0 * eps), net->param_refs[k].layer,
@@ -103,9 +119,9 @@ nmz_status nmz_net_gradcheck(nmz_net *net, const nmz_tensor *x, const nmz_tensor
         float orig = xp.data[e];
         double lp, lm;
         xp.data[e] = (float)(orig + eps);
-        s = loss_at(net, &xp, t, &lp);
+        s = loss_at(net, &xp, t, training, &rng0, &lp);
         xp.data[e] = (float)(orig - eps);
-        if (s == NMZ_OK) s = loss_at(net, &xp, t, &lm);
+        if (s == NMZ_OK) s = loss_at(net, &xp, t, training, &rng0, &lm);
         xp.data[e] = orig;
         if (s != NMZ_OK) goto out;
         compare(&r, &worst, grads.data[off + e], (lp - lm) / (2.0 * eps), -1, "x", e, atol, rtol);
@@ -114,6 +130,7 @@ nmz_status nmz_net_gradcheck(nmz_net *net, const nmz_tensor *x, const nmz_tensor
 out:
     net->trace = saved_fn;
     net->step = saved_step;
+    net->rng = rng0; /* the check consumes no randomness */
     net->have_forward = net->have_grads = 0;
     nmz_tensor_free(&xp);
     nmz_tensor_free(&grads);

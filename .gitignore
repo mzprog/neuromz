@@ -60,3 +60,7 @@ build/
 *.nmz
 !examples/*.nmz
 trace*.jsonl
+!tests/data/*.nmz
+
+# downloaded datasets (make data)
+/data/

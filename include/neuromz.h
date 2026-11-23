@@ -338,7 +338,7 @@ typedef struct nmz_trace_item {
     const nmz_tensor *t;
 } nmz_trace_item;
 
-#define NMZ_TRACE_MAX_SCALARS 4
+#define NMZ_TRACE_MAX_SCALARS 8
 
 /* A named number attached to an event: "L" (loss), "lr", "momentum", ... */
 typedef struct nmz_trace_scalar {
@@ -405,6 +405,12 @@ typedef struct nmz_gradcheck_result {
 nmz_status nmz_net_gradcheck(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t,
                              double eps, double atol, double rtol,
                              nmz_gradcheck_result *result);
+/* Same, choosing the mode: training = 1 (dropout active; the PRNG state is
+ * replayed before every forward pass so each pass sees the same mask) or
+ * training = 0 (evaluation mode). nmz_net_gradcheck uses training = 1. */
+nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t,
+                                  double eps, double atol, double rtol, int training,
+                                  nmz_gradcheck_result *result);
 
 /* ----------------------------------------------------------------- summary */
 
