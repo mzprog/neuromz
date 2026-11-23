@@ -10,7 +10,8 @@ can be printed now and visualised later.
 Status of this document: written before implementation, then corrected where
 the implementation taught us something (see the git history of this file).
 Phase 1 (dense networks) added decisions 27–33; phase 2 (CNN, Adam,
-normalization, MNIST) added decisions 34–50.
+normalization, MNIST) added decisions 34–50; phase 3 (text, Embedding,
+RNN, generation) added decisions 51–70.
 
 ---
 
@@ -36,6 +37,9 @@ src/                   libneuromz — platform-independent C11, libc + libm only
   gradcheck.c          numerical gradient check (public: it is a teaching tool)
   io.c                 portable .nmz save/load, CRC32, byte writer/reader
   dataset.c            dataset type, CSV loader, IDX (MNIST) loader
+  text.c               UTF-8 decoding, code-point vocabularies, text datasets
+  recurrent.c          Embedding, RNN (time loop + BPTT inside the layer)
+  generate.c           sampling text: temperature, top-k, seeded PCG32
   defaults.c           "quick mode" defaults and the reasons for them
   internal.h           private helpers shared by the library sources
 cli/                   the `neuromz` program (may use POSIX/terminal code)
@@ -46,6 +50,7 @@ cli/                   the `neuromz` program (may use POSIX/terminal code)
   util.c               option parsing, dataset resolution (CSV/IDX/mnist)
   print.c              formula printer for dense/activation/loss/SGD events
   print_conv.c         conv/pool/flatten/dropout/normalize/Adam printers, heatmaps
+  print_seq.c          a character RNN unrolled through time, BPTT, vanishing gradients
   line.c               dynamic line reader and tokenizer (no fixed buffers)
 tests/                 test_*.c (unit, gradient checks, convergence, I/O),
                        cli_smoke.sh (CLI abuse test); all run under sanitizers
@@ -53,6 +58,7 @@ examples/              xor.csv, xor_and.csv, iris.csv (+ 120/30 train/test
                        split), api_xor.c, run_examples.sh, benchmark.sh,
                        benchmark_mnist.sh, bench_conv.c
 scripts/get_mnist.sh   downloads MNIST into data/ (gitignored), verifies MD5
+scripts/get_text.sh    downloads Alice (Gutenberg #11) into data/, verifies SHA-256
 docs/DESIGN.md         this file
 legacy/                v1 sources (2017–2020), unchanged, tag `v1-legacy`
 Makefile               lib, cli, test, sanitize, examples, data, bench, clean
@@ -127,6 +133,9 @@ typedef struct nmz_layer_ops {
     nmz_status (*load_config)(nmz_layer **out, nmz_reader *);
     void       (*describe)(const nmz_layer *, char *buf, size_t n);
     void       (*destroy)(nmz_layer *);
+    /* optional (phase 3): carried recurrent state, and NMZ_LAYER_* flags */
+    nmz_tensor *(*state)(nmz_layer *);
+    unsigned   flags;                            /* NMZ_LAYER_DISCRETE_INPUT */
 } nmz_layer_ops;
 
 struct nmz_layer {
@@ -148,42 +157,70 @@ gradient checker and the trace all iterate over the same list.
 
 ---
 
-## 3. Planned: sequences (BPTT) and embeddings
+## 3. Sequences: embeddings, RNN and BPTT (implemented in phase 3)
 
-Not implemented in this phase, but the data model is shaped for them:
+What was planned before phase 3 held up; this is what exists now.
 
-* **The layer owns its time loop.** An RNN/LSTM layer receives `[B, T, F]`
-  and returns `[B, T, H]`. Its forward pass keeps the per-timestep states
-  (`h_t`, gates, …) in its private `self` cache; its backward pass walks
-  `t = T-1 … 0` (backpropagation through time) and **accumulates** into the
-  shared weight gradients. The engine still sees one forward and one backward
-  call per layer, so `net.c` needs no change.
-* **Gradient accumulation convention.** The engine zeroes every gradient
-  before a backward pass and layers *add* into them. Dense would not need
-  this, but recurrent layers (weights shared over time) and tied embeddings
-  (same matrix used twice) do, so it is the rule from day one.
-* **Truncated BPTT / stateful RNNs** will add two optional vtable entries
-  (`reset_state`, `detach_state`). Optional entries are `NULL`-able; the engine
-  checks before calling, so existing layers are unaffected.
-* **Embedding** takes `[B, T]` token ids (floats, exact < 2^24) and returns
-  `[B, T, D]`. As the first layer it receives `dx == NULL` and computes no input
-  gradient. Its weight gradient is row-sparse but stored dense (fine at
-  char-level / tiny-Transformer scale).
-* **Losses work on rows.** MSE and cross-entropy treat the last dimension as
-  "features/classes" and every leading dimension as rows, so a `[B, T, V]`
-  language-model output is just `B·T` rows. This is already how `loss.c` is
-  written.
-* **Attention / residual connections** break the pure stack. The top level
-  stays a sequential stack; non-sequential wiring (residual add, layer norm,
-  multi-head split) lives inside *composite layers* (e.g. a
-  `transformer_block` layer that owns sub-layers and implements the same
-  vtable). The trace system already carries a `layer` index and a `detail`
-  string, so composite layers can emit events for their sub-steps.
-* **Trace events carry a `time_step` field** (`-1` for non-sequence layers) so
-  per-timestep values of an RNN can be shown later without changing the event
-  format.
-* **Training mode flag.** `nmz_ctx.training` is passed to every layer so
-  dropout/batch-norm style layers can behave differently in evaluation.
+* **The layer owns its time loop.** The RNN layer receives `[B, T, D]` and
+  returns all hidden states `[B, T, H]`. Its forward pass loops over `t`
+  and keeps what backward needs (the h_t are its output; the initial state
+  h₀ in its private cache). Its backward pass walks `t = T−1 … 0`
+  (backpropagation through time) and **adds** into the shared weight
+  gradients. The engine sees one forward and one backward call.
+* **Any-length time dimension.** A per-sample shape may start with
+  `NMZ_ANY_LENGTH` (0): text nets are created with input `[T]` and accept
+  `[B, T]` batches for any T — 64 in training, 1 per step when generating.
+  Every layer computes from the actual tensor shapes; the engine replaces
+  the 0 by the batch's T when it shapes the activation buffers; sizes such
+  as `nmz_net_output_size` are per time step.
+* **Gradient accumulation convention** (engine zeroes, layers add) is what
+  makes the shared RNN weights work with no special case.
+* **Carried state (truncated BPTT)** uses two optional vtable fields that
+  were appended to `nmz_layer_ops` (old layer tables set them to `NULL, 0`):
+  `state(l)` returns the tensor the layer carries between forward passes
+  (the RNN's last h, `[B, H]`; empty = start from zeros), and `flags`.
+  `nmz_ctx.carry` tells the layer to start from / update that state. The
+  engine resets it (`nmz_net_reset_state`) at every epoch start and around
+  evaluation and generation; gradcheck snapshots and restores it before
+  every pass, so the carried state is a constant input like x. The gradient
+  that would flow into the carried state is dropped — that is the
+  truncation, with window = `seq_len` (k1 = k2 in the usual notation). No
+  `detach_state` entry was needed: state is copied values, never a graph.
+* **Embedding** takes `[B, T]` token ids (floats, exact < 2^24), returns
+  `[B, T, D]`, has `NMZ_LAYER_DISCRETE_INPUT` (no input gradient; gradcheck
+  does not perturb ids) and writes only the gradient rows of tokens that
+  occur. The optimizer still updates the full matrix (decision 59).
+* **The per-step output head needed no wrapper:** Dense acts on the last
+  dimension and softmax + cross-entropy work on rows, so
+  `rnn → dense(V) → softmax` on `[B, T, H]` is a "time-distributed" head
+  with B·T rows. The loss is the mean over all B·T next-character
+  predictions (nats per character); perplexity = e^loss.
+* **Trace events carry `time_step`:** the RNN emits one summary event per
+  pass (`time_step` = −1: x, h₀, W_xh, W_hh, b, all h) and one event per
+  step (x_t, h_prev, z_t, h_t forward; dL/dh_out, dL/dh_next, dL/dh, dL/dz,
+  dL/dh_prev backward), so the CLI can draw the unrolled network.
+* **Attention / residual connections** (still planned) stay composite
+  layers inside the sequential stack.
+
+### 3.1 How LSTM slots in (next phase, no engine change)
+
+An `lstm.c` file with an `nmz_layer_ops` table and one registry line:
+
+| piece | LSTM |
+|---|---|
+| shapes | `setup`: `[T, D]` → `[T, H]`, exactly like the RNN |
+| parameters | `W_x` `[D, 4H]`, `W_h` `[H, 4H]`, `b` `[4H]` (gates i, f, g, o side by side; forget-gate bias initialised to 1) |
+| forward | per step: `[i f g o] = x_t·W_x + h_{t−1}·W_h + b`, i/f/o = σ, g = tanh, `c_t = f⊙c_{t−1} + i⊙g`, `h_t = o⊙tanh(c_t)`; the gate values and c_t are cached in `self` |
+| backward | BPTT inside the layer carrying both dL/dh and dL/dc backwards; adds into the three gradients |
+| carried state | `state()` returns one `[B, 2H]` tensor holding h and c side by side — the engine, gradcheck, carry, reset and generation treat it as opaque, so they work unchanged |
+| trace | the same event pattern as the RNN plus items `i`, `f`, `g`, `o`, `c_t`, `dL/dc`; per-step backward keeps the names `dL/dh`, `dL/dh_prev`, so the BPTT table and the vanishing-gradient view work as they are (the LSTM's point — the gradient survives along c — becomes visible in that view) |
+| file | `save_config`: units, init; parameters are saved generically |
+| CLI | spec `lstm:H` beside `rnn:H`; `print_seq.c` gets a gate view for the unrolled section |
+
+Everything engine-level — any-length time, carry/reset/state, discrete
+inputs, per-step trace events, clipping, validation, early stopping,
+vocabulary, generation — is layer-agnostic and was written against the
+vtable, not against the RNN.
 
 ---
 
@@ -245,6 +282,10 @@ Item names are a fixed, documented vocabulary (tensors are `[B, …]`):
 | maxpool2d forward | `x`, `y`, `argmax` (winner's flat index iy·W+ix per output); scalars `size`, `stride` |
 | maxpool2d backward | `dL/dy`, `argmax`, `dL/dx` |
 | flatten | forward `x`, `y`; backward `dL/dy`, `dL/dx` |
+| embedding | forward `ids`, `W` [V,D], `e`; backward `dL/de`, `ids`, `dL/dW` (only rows of occurring tokens non-zero) |
+| rnn (time_step −1) | forward `x`, `h0`, `W_xh`, `W_hh`, `b`, `h` (all steps); backward `dL/dW_xh`, `dL/dW_hh`, `dL/db`, `W_hh`, `dL/dx`; scalar `steps` |
+| rnn (time_step t) | forward `x_t`, `h_prev`, `z_t`, `h_t`; backward `dL/dh_out` (from the layer above at t), `dL/dh_next` (from step t+1), `dL/dh` (their sum), `dL/dz` (after tanh′), `dL/dh_prev` (sent to t−1) |
+| clip (update phase, layer −1) | scalars `norm` (before), `max_norm`, `scale`; `detail` = clipped / unchanged |
 | dropout | forward `x`, `y`, `mask` (training only); backward `dL/dy`, `dL/dx`, `mask`; scalars `rate`, `training` |
 | update, SGD (per param) | `value` (before), `grad`, `velocity_prev`, `delta` (= new velocity); scalars `lr`, `momentum`; `detail` = param name |
 | update, Adam (per param) | `value` (before), `grad`, `m`, `v` (new moments), `m_hat`, `v_hat`, `delta`; scalars `lr`, `beta1`, `beta2`, `epsilon`, `t` |
@@ -362,6 +403,10 @@ offset  field
                      "optimizer": u32 kind, u64 t, u32 n_params, then per
                                   parameter u32 count, count × f32 (velocity
                                   or Adam m), and for Adam count × f32 v
+                     "vocab":     u32 size V, u32 items, then V × (u32 code
+                                  point, u64 count), code points ascending
+                     "train_ext": f32 val_fraction, f32 clip_norm,
+                                  u32 carry_state, u32 seq_len, u32 patience
 end     u32          CRC-32 (IEEE, reflected 0xEDB88320) of every byte above
 ```
 
@@ -398,6 +443,12 @@ are named lists of such specs plus training options, each with its reason.
 Datasets are named by file (CSV, IDX) or as `mnist` (`mnist:train`,
 `mnist:test`); `--sample N` picks one sample for `predict`/`trace`/`step`/
 `gradcheck`/`show sample`.
+
+Text models use the input `text` (with `--data FILE` to build the
+vocabulary at creation time, so layer sizes are known) and the specs
+`embed:D`, `rnn:H` and `vocab[:ACT]` (a dense output with one unit per
+character). `generate` samples from them; `trace --text TEXT` draws the RNN
+unrolled through time.
 
 ---
 
@@ -599,3 +650,82 @@ Added in phase 2 (CNN, Adam, normalization, MNIST):
 50. **Presets are CLI data** (layer specs + options + one reason each), not a
     library API: they are a teaching/UI concern, and library users write the
     same network in five calls (see README).
+
+Added in phase 3 (text, Embedding, RNN, generation):
+
+51. **Tokens are Unicode code points, never bytes**, and the vocabulary is
+    sorted by code point (deterministic ids). Invalid UTF-8 is never fatal:
+    each invalid byte becomes U+FFFD and is counted and reported. One U+FFFD
+    per byte (rather than per "maximal subpart") is simpler and still
+    resynchronises at the next valid byte.
+52. **Text normalisation is minimal**: drop a BOM, turn CR LF / CR into LF.
+    No Unicode normalisation of the data — the model learns the text as it
+    is written (the Arabic list was NFC-normalised when it was compiled).
+53. **The end-of-item token is the newline itself.** In item mode (one item
+    per line) empty lines are dropped and the text starts with '\n', so
+    every item, including the first, follows an end token; generation of
+    one item = prime '\n', sample until '\n'. No separate special token
+    keeps the vocabulary = the characters of the file.
+54. **Sequence datasets store ids, not one-hot targets**; one-hot rows are
+    built per batch. The book as one-hot targets would need ~145k × 75 floats
+    per copy; ids need 145k.
+55. **Any-length time dimension (decision in §3)** instead of a fixed T in the
+    model: the same weights train on 64-step windows and generate one step
+    at a time.
+56. **No time-distributed wrapper**: Dense's rows convention already is one.
+57. **Optional vtable fields `state` and `flags` were appended** to
+    `nmz_layer_ops` instead of a parallel "stateful layer" interface; the
+    engine never needs to know which layers are recurrent.
+58. **RNN init: Glorot for W_xh and W_hh** — W_hh entries then have variance
+    1/H, a spectral radius near 1. Orthogonal init is better known for RNNs
+    but adds a QR decomposition to the library for little gain at this size.
+59. **Sparse embedding gradient, dense optimizer step** = exact Adam
+    ("lazy" Adam would freeze rows absent from a batch even though their
+    momentum is non-zero). Tested against a hand-computed Adam step for such
+    a row. At character scale the dense step costs nothing.
+60. **Truncated BPTT window = seq_len; carry arranges B parallel streams**
+    (row r of batch k+1 continues row r of batch k), without shuffling, and
+    the state is reset every epoch. Without carry, sequences start from
+    h = 0 and are shuffled.
+61. **A model trained with carried state is evaluated with carried state**
+    (the split read in order as one stream). Found by measuring: on Alice,
+    the stateless evaluation reported validation loss 1.671 after 20 epochs
+    for the carry model vs 1.615 for the shuffled one; evaluated as it is
+    run, the carry model reached 1.591 by epoch 16 — better, not worse.
+62. **Validation = the last fraction of the samples** (`val_fraction`),
+    generic for tabular, image and text data. For text, sequences don't
+    overlap, so the tail of the sequences is the tail of the text.
+    Normalisation is fitted on the training split only.
+63. **Early stopping (`patience`) restores the best weights** and
+    re-measures; the optimizer state is not rolled back (training after it
+    continues from the restored weights with the latest moments). Found
+    needed on the Arabic list (~2.7k characters), which overfits after
+    ~7–15 epochs.
+64. **Clipping by global L2 norm**, after the backward pass and before the
+    optimizer, default 5 for recurrent nets (off otherwise), traced as a
+    `clip` event so the CLI can show "‖g‖ = 7.3 > 5 → ×0.68".
+65. **The vocabulary is built at `new`** (`--data FILE`), so embedding and
+    output sizes are known when the layers are created; it is stored in a
+    `vocab` section, and training text is encoded with the model's
+    vocabulary (unknown characters are an error naming the code point).
+    Text-training settings went into a `train_ext` section, keeping format 3.
+66. **Generation has its own PCG32 stream** seeded by `--seed` (it never
+    disturbs the training PRNG); temperature divides the logits before the
+    softmax; top-k keeps ties at the k-th probability; `--count N` collects N
+    distinct items by retrying with seed+attempt; `--data FILE` marks items
+    already in the training data (`--new-only` skips them).
+67. **The RNN trace shows one hidden unit in full arithmetic** (by default
+    the one that changes most over the sequence) plus a heatmap of all
+    units; and a *second* backward pass with only the last step's loss
+    isolates the gradient that travels through time, so its per-step
+    factor (vanishing < 1 < exploding) can be read off directly.
+68. **`trace` runs in evaluation mode and changes nothing; `step` is a
+    training step** (applies clipping and the update) — as for CNNs.
+69. **Datasets**: English names from the US Census 1990 lists (public
+    domain), Arabic names compiled by hand (CC0), Alice from Project
+    Gutenberg through its mirrors with a SHA-256 check (www.gutenberg.org
+    refuses automated downloads). Sources in `examples/DATASETS.md`.
+70. **Arabic is printed in logical order as UTF-8**; shaping and right-to-
+    left ordering are left to the terminal (many do it imperfectly). Where
+    the trace puts one character per column the letters appear in their
+    isolated forms, which is what a character model actually sees.
