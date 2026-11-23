@@ -205,6 +205,26 @@ static void sec_optimizer(nmz_net *net, nmz_writer *w) {
     }
 }
 
+/* text models: the vocabulary (code point + count per id) */
+static void sec_vocab(nmz_net *net, nmz_writer *w) {
+    const nmz_vocab *v = net->vocab;
+    int i;
+    nmz_write_u32(w, (uint32_t)v->size);
+    nmz_write_u32(w, (uint32_t)v->items);
+    for (i = 0; i < v->size; i++) {
+        nmz_write_u32(w, v->codepoints[i]);
+        write_u64(w, v->counts[i]);
+    }
+}
+
+/* training settings added in phase 3 */
+static void sec_train_ext(nmz_net *net, nmz_writer *w) {
+    nmz_write_f32(w, net->train.val_fraction);
+    nmz_write_f32(w, net->train.clip_norm);
+    nmz_write_u32(w, (uint32_t)(net->train.carry_state != 0));
+    nmz_write_u32(w, (uint32_t)net->train.seq_len);
+}
+
 static void write_section(nmz_net *net, nmz_writer *w, const char *tag, void (*fn)(nmz_net *, nmz_writer *)) {
     writer_ext counter;
     memset(&counter, 0, sizeof counter);
@@ -267,9 +287,12 @@ static nmz_status save_body(nmz_net *net, nmz_writer *w, unsigned flags) {
     {
         int with_norm = net->norm != NMZ_NORM_NONE;
         int with_opt = net->opt_kind >= 0 && !(flags & NMZ_SAVE_NO_OPTIMIZER);
-        nmz_write_u32(w, (uint32_t)(with_norm + with_opt));
+        int with_vocab = net->vocab != NULL;
+        nmz_write_u32(w, (uint32_t)(with_norm + with_opt + with_vocab + 1));
         if (with_norm) write_section(net, w, "normalize", sec_normalize);
         if (with_opt) write_section(net, w, "optimizer", sec_optimizer);
+        if (with_vocab) write_section(net, w, "vocab", sec_vocab);
+        write_section(net, w, "train_ext", sec_train_ext);
     }
     return nmz_write_u32(w, w->crc); /* footer: CRC of everything above */
 }
@@ -351,6 +374,51 @@ static nmz_status read_optimizer(nmz_reader *r, nmz_net *net) {
     return r->err;
 }
 
+static nmz_status read_vocab(nmz_reader *r, nmz_net *net) {
+    uint32_t n = 0, items = 0, i;
+    uint32_t *cps = NULL;
+    uint64_t *counts = NULL;
+    nmz_read_u32(r, &n);
+    if (nmz_read_u32(r, &items) != NMZ_OK) return r->err;
+    if (n == 0 || n > NMZ_MAX_VOCAB || items > 1) return r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt vocab section");
+    cps = malloc(n * sizeof *cps);
+    counts = malloc(n * sizeof *counts);
+    if (!cps || !counts) {
+        free(cps);
+        free(counts);
+        return r->err = nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+    }
+    for (i = 0; i < n; i++) {
+        nmz_read_u32(r, &cps[i]);
+        read_u64(r, &counts[i]);
+    }
+    if (r->err == NMZ_OK) {
+        nmz_vocab_free(net->vocab);
+        net->vocab = NULL;
+        if (nmz_vocab_create(&net->vocab, (int)n, cps, counts, (int)items) != NMZ_OK)
+            r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt vocab section (code points must be sorted and valid)");
+    }
+    free(cps);
+    free(counts);
+    return r->err;
+}
+
+static nmz_status read_train_ext(nmz_reader *r, nmz_net *net) {
+    float vf = 0, clip = 0;
+    uint32_t carry = 0, seq = 0;
+    nmz_read_f32(r, &vf);
+    nmz_read_f32(r, &clip);
+    nmz_read_u32(r, &carry);
+    if (nmz_read_u32(r, &seq) != NMZ_OK) return r->err;
+    if (!(vf >= 0.0f && vf < 1.0f) || !(clip >= 0.0f) || carry > 1 || seq > 100000)
+        return r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt train_ext section");
+    net->train.val_fraction = vf;
+    net->train.clip_norm = clip;
+    net->train.carry_state = (int)carry;
+    net->train.seq_len = (int)seq;
+    return NMZ_OK;
+}
+
 static nmz_status read_sections(nmz_reader *r, nmz_net *net) {
     uint32_t n = 0, i, len = 0;
     if (nmz_read_u32(r, &n) != NMZ_OK) return r->err;
@@ -368,6 +436,10 @@ static nmz_status read_sections(nmz_reader *r, nmz_net *net) {
             read_normalize(r, net);
         else if (!strcmp(tag, "optimizer"))
             read_optimizer(r, net);
+        else if (!strcmp(tag, "vocab"))
+            read_vocab(r, net);
+        else if (!strcmp(tag, "train_ext"))
+            read_train_ext(r, net);
         else { /* unknown: skip (written by a newer NeuroMZ) */
             unsigned char buf[256];
             uint32_t left = len;
@@ -412,7 +484,7 @@ static nmz_status load_body(nmz_reader *r, nmz_net **out) {
     if (in_rank < 1 || in_rank > NMZ_MAX_RANK - 1) return nmz__fail(NMZ_ERR_FORMAT, "corrupt input rank %u", in_rank);
     for (i = 0; i < in_rank; i++) {
         if (nmz_read_u32(r, &u) != NMZ_OK) return r->err;
-        if (u == 0 || u > NMZ_MAX_DIM) return nmz__fail(NMZ_ERR_FORMAT, "corrupt input shape");
+        if ((u == 0 && i != 0) || u > NMZ_MAX_DIM) return nmz__fail(NMZ_ERR_FORMAT, "corrupt input shape");
         in_shape[i] = (int)u;
     }
     nmz_read_u32(r, &loss);

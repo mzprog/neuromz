@@ -331,7 +331,7 @@ static void test_unknown_section_skipped(void) {
     unsigned char *buf, extra[4 + 6 + 4 + 3] = {6, 0, 0, 0, 'f', 'u', 't', 'u', 'r', 'e', 3, 0, 0, 0, 'a', 'b', 'c'};
     long n;
     uint32_t crc;
-    CHECK_OK(nmz_net_create_quick(&net, 3, sizes, 1, NULL)); /* untrained, no normalization: 0 sections */
+    CHECK_OK(nmz_net_create_quick(&net, 3, sizes, 1, NULL)); /* untrained, no normalization: only train_ext */
     CHECK_OK(nmz_net_save(net, test_path("t_sec.nmz")));
     f = fopen(test_path("t_sec.nmz"), "rb");
     if (!f) return;
@@ -341,8 +341,12 @@ static void test_unknown_section_skipped(void) {
     buf = malloc((size_t)n + sizeof extra);
     if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n) {
         fclose(f);
-        CHECK(buf[n - 8] == 0 && buf[n - 7] == 0); /* section count 0 before the CRC */
-        buf[n - 8] = 1;
+        /* layout of the tail: u32 count = 1, "train_ext" section (4+9 + 4 + 16 bytes), CRC */
+        {
+            long cnt = n - 4 - 33 - 4;
+            CHECK(buf[cnt] == 1 && buf[cnt + 1] == 0 && buf[cnt + 4] == 9 && !memcmp(buf + cnt + 8, "train_ext", 9));
+            buf[cnt] = 2; /* append one more section after train_ext */
+        }
         memcpy(buf + n - 4, extra, sizeof extra);
         crc = crc32_ref(buf, (size_t)n - 4 + sizeof extra);
         buf[n - 4 + sizeof extra] = (unsigned char)crc;

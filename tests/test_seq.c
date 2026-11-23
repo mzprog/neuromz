@@ -405,7 +405,174 @@ static void test_char_training(void) {
     nmz_dataset_free(ds);
 }
 
+/* train a small model on the "abcde\n" pattern (shared by the next tests) */
+static nmz_net *trained_pattern_net(void) {
+    const char *p = test_path("t_abc2.txt");
+    char text[1201];
+    nmz_text_opts to = nmz_text_defaults();
+    nmz_dataset *ds = NULL;
+    nmz_net *net;
+    nmz_train_opts o = nmz_train_defaults();
+    int i;
+    for (i = 0; i < 1200; i++) text[i] = "abcde\n"[i % 6];
+    text[1200] = '\0';
+    write_text(p, text);
+    to.seq_len = 8;
+    if (nmz_dataset_load_text(&ds, p, &to) != NMZ_OK) return NULL;
+    net = char_net(ds->vocab->size, 4, 12, 3);
+    o.optimizer = NMZ_OPT_ADAM;
+    o.learning_rate = 0.02f;
+    o.batch_size = 8;
+    o.max_epochs = 15;
+    o.target_loss = 0;
+    o.seq_len = 8;
+    o.clip_norm = 5.0f;
+    if (net && nmz_net_train(net, ds, &o, NULL) != NMZ_OK) {
+        nmz_net_free(net);
+        net = NULL;
+    }
+    if (net) *nmz_net_train_config(net) = o;
+    nmz_dataset_free(ds);
+    return net;
+}
+
+static void test_generate(void) {
+    nmz_net *net = trained_pattern_net(), *back = NULL;
+    nmz_gen_opts g = nmz_gen_defaults();
+    char *a = NULL, *b = NULL, *c = NULL;
+    size_t n = 0;
+    CHECK(net != NULL);
+    if (!net) return;
+    g.prime = "abc";
+    g.length = 15;
+    g.seed = 7;
+    CHECK_OK(nmz_net_generate(net, &g, &a, &n));
+    CHECK_OK(nmz_net_generate(net, &g, &b, NULL));
+    CHECK(a && b && n == 15 && !strcmp(a, b)); /* same seed, same text */
+    CHECK_MSG(a && !strcmp(a, "de\nabcde\nabcde\n"), "learned pattern not reproduced: '%s'", a ? a : "");
+    free(b);
+    b = NULL;
+    /* greedy (top-k 1) ignores the seed; a high temperature with different seeds differs */
+    g.top_k = 1;
+    g.seed = 99;
+    CHECK_OK(nmz_net_generate(net, &g, &b, NULL));
+    CHECK(b && !strcmp(a, b));
+    free(b);
+    b = NULL;
+    g.top_k = 0;
+    g.temperature = 5.0f;
+    g.seed = 1;
+    CHECK_OK(nmz_net_generate(net, &g, &b, NULL));
+    g.seed = 2;
+    CHECK_OK(nmz_net_generate(net, &g, &c, NULL));
+    CHECK(b && c && strcmp(b, c) != 0);
+    free(b);
+    free(c);
+    b = c = NULL;
+    /* one item: stops right after the end-of-item token */
+    g.temperature = 1.0f;
+    g.prime = NULL; /* default prime: '\n' */
+    g.stop_at_end = 1;
+    g.length = 100;
+    CHECK_OK(nmz_net_generate(net, &g, &b, &n));
+    CHECK_MSG(b && !strcmp(b, "abcde\n") && n == 6, "item: '%s'", b ? b : "");
+    free(b);
+    b = NULL;
+    g.prime = "abz";
+    CHECK_STATUS(nmz_net_generate(net, &g, &b, NULL), NMZ_ERR_ARG);
+    CHECK(strstr(nmz_last_error(), "U+007A") != NULL && b == NULL);
+    g.prime = "abc";
+    g.temperature = 0.0f;
+    CHECK_STATUS(nmz_net_generate(net, &g, &b, NULL), NMZ_ERR_ARG);
+    /* vocabulary and text settings survive save/load; generation is identical */
+    CHECK_OK(nmz_net_save(net, test_path("t_charnet.nmz")));
+    CHECK_OK(nmz_net_load(&back, test_path("t_charnet.nmz")));
+    if (back) {
+        const nmz_vocab *v1 = nmz_net_vocab(net), *v2 = nmz_net_vocab(back);
+        CHECK(v2 && v2->size == v1->size && !memcmp(v1->codepoints, v2->codepoints, sizeof(uint32_t) * (size_t)v1->size));
+        CHECK(v2 && !memcmp(v1->counts, v2->counts, sizeof(uint64_t) * (size_t)v1->size));
+        CHECK(nmz_net_is_sequence(back));
+        CHECK(nmz_net_train_config(back)->seq_len == 8 && nmz_net_train_config(back)->clip_norm == 5.0f);
+        g.temperature = 1.0f;
+        g.stop_at_end = 0;
+        g.length = 15;
+        g.seed = 7;
+        CHECK_OK(nmz_net_generate(back, &g, &c, NULL));
+        CHECK(c && !strcmp(a, c));
+        free(c);
+        nmz_net_free(back);
+    }
+    free(a);
+    nmz_net_free(net);
+}
+
+static void test_generate_arabic(void) {
+    nmz_text_opts to = nmz_text_defaults();
+    nmz_dataset *ds = NULL;
+    nmz_net *net;
+    nmz_train_opts o = nmz_train_defaults();
+    nmz_gen_opts g = nmz_gen_defaults();
+    char *txt = NULL;
+    uint32_t *cp = NULL;
+    size_t n = 0, bad = 1, i, nl = 0;
+    to.items = 1;
+    to.seq_len = 12;
+    CHECK_OK(nmz_dataset_load_text(&ds, "examples/names_ar.txt", &to));
+    if (!ds) return;
+    CHECK(ds->invalid_utf8 == 0 && ds->vocab->size == 37); /* 36 Arabic letters + '\n' */
+    net = char_net(ds->vocab->size, 8, 32, 5);
+    o.optimizer = NMZ_OPT_ADAM;
+    o.learning_rate = 0.01f;
+    o.max_epochs = 3;
+    o.target_loss = 0;
+    CHECK_OK(nmz_net_train(net, ds, &o, NULL));
+    g.length = 40;
+    g.seed = 3;
+    CHECK_OK(nmz_net_generate(net, &g, &txt, NULL));
+    if (txt) {
+        CHECK_OK(nmz_utf8_decode(txt, strlen(txt), &cp, &n, &bad));
+        CHECK(n == 40 && bad == 0); /* 40 code points, valid UTF-8 (each Arabic letter is 2 bytes) */
+        for (i = 0; i < n; i++) {
+            CHECK(nmz_vocab_index(ds->vocab, cp[i]) >= 0);
+            nl += cp[i] == '\n';
+        }
+        CHECK(strlen(txt) > n); /* multi-byte */
+        free(cp);
+        free(txt);
+    }
+    nmz_net_free(net);
+    nmz_dataset_free(ds);
+}
+
+static void test_phase2_file_loads(void) {
+    /* format 3 written by the phase-2 code: no vocab / train_ext sections */
+    static const float want[3][3] = {{0x1.f78916p-1f, 0x1.dab4dp-7f, 0x1.0c16f6p-9f},
+                                     {0x1.a7cb68p-3f, 0x1.c26f5ap-2f, 0x1.69aaf2p-2f},
+                                     {0x1.76e92ep-12f, 0x1.5c02cap-5f, 0x1.ea10f6p-1f}};
+    nmz_net *net = NULL;
+    nmz_dataset *ds = NULL;
+    nmz_csv_opts co = nmz_csv_defaults();
+    int i, k;
+    CHECK_OK(nmz_net_load(&net, "tests/data/v3_phase2_iris.nmz"));
+    CHECK_OK(nmz_dataset_load_csv(&ds, "examples/iris_train.csv", &co));
+    if (net && ds) {
+        for (i = 0; i < 3; i++) {
+            float y[3];
+            CHECK_OK(nmz_net_predict(net, ds->x + 4 * 40 * i, y));
+            for (k = 0; k < 3; k++) CHECK_MSG(y[k] == want[i][k], "%a vs %a", (double)y[k], (double)want[i][k]);
+        }
+        CHECK(nmz_net_vocab(net) == NULL && nmz_net_train_config(net)->clip_norm == 0.0f);
+        CHECK(nmz_net_optimizer_state(net, NULL) == NMZ_OPT_ADAM);
+        CHECK(nmz_net_normalization(net, NULL, NULL, NULL, NULL) == NMZ_NORM_ZSCORE);
+    }
+    nmz_net_free(net);
+    nmz_dataset_free(ds);
+}
+
 const test_case seq_tests[] = {
+    {"gen/deterministic_topk_items_saveload", test_generate},
+    {"gen/arabic_model_valid_utf8", test_generate_arabic},
+    {"io/phase2_format3_file_loads", test_phase2_file_loads},
     {"seq/gradcheck_rnn_multistep", test_gradcheck_rnn},
     {"seq/gradcheck_char_rnn_head", test_gradcheck_char_rnn},
     {"seq/gradcheck_carried_state", test_gradcheck_carry},

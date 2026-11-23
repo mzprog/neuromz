@@ -127,6 +127,10 @@ nmz_status nmz__net_finish_build(nmz_net *net);
 nmz_status nmz__net_check_dataset(const nmz_net *net, const nmz_dataset *ds);
 nmz_status nmz__train_opts_validate(const nmz_train_opts *o);
 
+/* generate.c: temperature + top-k sampling from logits z[0..V); probs is
+ * scratch for V doubles and receives the final distribution. */
+int nmz__sample_next(const float *z, int V, double temperature, int top_k, nmz_rng *rng, double *probs);
+
 /* normalize.c */
 int nmz__norm_group_count(const nmz_net *net);
 /* group of element e (0-based within one sample) */

@@ -370,6 +370,22 @@ void nmz_net_set_carry(nmz_net *net, int on);
 void nmz_net_reset_state(nmz_net *net);
 /* 1 if the input has a NMZ_ANY_LENGTH time dimension. */
 int nmz_net_is_sequence(const nmz_net *net);
+/* Text generation from a character model (embedding input + vocabulary). */
+typedef struct nmz_gen_opts {
+    const char *prime;  /* UTF-8 text fed first; NULL/"" = the end-of-item
+                           token '\n' (or the most frequent character)   */
+    int length;         /* characters to generate (an upper bound with
+                           stop_at_end)                                    */
+    float temperature;  /* > 0: <1 sharper/safer, >1 flatter/wilder       */
+    int top_k;          /* sample only among the k most likely (0 = all)  */
+    uint64_t seed;      /* same seed + same model = same text             */
+    int stop_at_end;    /* stop after generating '\n' (one item)          */
+} nmz_gen_opts;
+nmz_gen_opts nmz_gen_defaults(void);
+/* *out receives malloc'd UTF-8 (free with free()); the prime is not
+ * included. *n_chars (may be NULL) = characters generated. */
+nmz_status nmz_net_generate(nmz_net *net, const nmz_gen_opts *opts, char **out, size_t *n_chars);
+
 /* Text models: the character vocabulary, saved with the model (copied). */
 nmz_status nmz_net_set_vocab(nmz_net *net, const nmz_vocab *v);
 const nmz_vocab *nmz_net_vocab(const nmz_net *net);
