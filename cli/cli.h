@@ -32,6 +32,11 @@ void cli_free_tokens(char **tok, int n);
 #define CLI_SET_OPTIMIZER 64u
 #define CLI_SET_BETAS 128u
 #define CLI_SET_SCHEDULE 256u
+#define CLI_SET_VAL 512u
+#define CLI_SET_CLIP 1024u
+#define CLI_SET_CARRY 2048u
+#define CLI_SET_PATIENCE 4096u
+#define CLI_SET_SEQLEN 8192u
 int cli_fail(const char *fmt, const char *arg); /* prints "error: ...", returns 1 */
 int cli_lib_fail(const char *what);               /* adds nmz_last_error()          */
 int cli_need_net(cli_state *st);
@@ -45,7 +50,12 @@ void cli_set_path(cli_state *st, const char *path);
 void cli_replace_net(cli_state *st, nmz_net *net, const char *path);
 void cli_print_train_config(const nmz_train_opts *o);
 int cli_train_option(int argc, char **argv, int *i, nmz_train_opts *o, unsigned *mask);
-int cli_load_data(cli_state *st, const char *spec, int want_test, int limit, int header, nmz_dataset **out);
+/* seq_len: for sequence nets, time steps per sample (0 = the model's setting) */
+int cli_load_data(cli_state *st, const char *spec, int want_test, int limit, int header, int seq_len,
+                  nmz_dataset **out);
+/* print one code point readably ("a", "⏎" for newline, "␣" for space; ASCII
+ * mode: \n, ' ', U+0645) into buf */
+const char *cli_char_label(uint32_t cp, char *buf, size_t n);
 const char *cli_act_reason(nmz_act a);
 const char *cli_init_reason(int init);
 

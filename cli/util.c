@@ -101,8 +101,13 @@ void cli_print_train_config(const nmz_train_opts *o) {
         printf(", step schedule (x%g every %d epochs)", (double)o->gamma, o->step_size);
     else if (o->schedule == NMZ_SCHED_COSINE)
         printf(", cosine schedule to %g", (double)o->min_lr);
-    printf(", batch %d, max epochs %d, target loss %g, shuffle %s\n", o->batch_size, o->max_epochs, o->target_loss,
+    printf(", batch %d, max epochs %d, target loss %g, shuffle %s", o->batch_size, o->max_epochs, o->target_loss,
            o->shuffle ? "on" : "off");
+    if (o->val_fraction > 0) printf(", validation %g%%", 100.0 * o->val_fraction);
+    if (o->patience > 0) printf(", patience %d", o->patience);
+    if (o->clip_norm > 0) printf(", clip %g", (double)o->clip_norm);
+    if (o->seq_len > 0) printf(", seq len %d%s", o->seq_len, o->carry_state ? " (state carried)" : "");
+    printf("\n");
 }
 
 /* returns 1 if consumed, 0 if not a training option, -1 on a bad value */
@@ -117,6 +122,32 @@ int cli_train_option(int argc, char **argv, int *i, nmz_train_opts *o, unsigned 
     if (!strcmp(a, "--shuffle") || !strcmp(a, "--no-shuffle")) {
         o->shuffle = !strcmp(a, "--shuffle");
         *mask |= CLI_SET_SHUFFLE;
+        return 1;
+    }
+    if (!strcmp(a, "--carry") || !strcmp(a, "--no-carry")) {
+        o->carry_state = !strcmp(a, "--carry");
+        *mask |= CLI_SET_CARRY;
+        return 1;
+    }
+    if (!strcmp(a, "--val") || !strcmp(a, "--clip") || !strcmp(a, "--patience") || !strcmp(a, "--seq-len")) {
+        if (!(v = cli_opt_value(argc, argv, i))) return -1;
+        if (!strcmp(a, "--val")) {
+            if (!cli_parse_double(v, &d) || d < 0 || d >= 1) return -cli_fail("--val is a fraction in [0, 1), got '%s'", v);
+            o->val_fraction = (float)d;
+            *mask |= CLI_SET_VAL;
+        } else if (!strcmp(a, "--clip")) {
+            if (!cli_parse_double(v, &d) || d < 0) return -cli_fail("--clip needs a norm >= 0 (0 = off), got '%s'", v);
+            o->clip_norm = (float)d;
+            *mask |= CLI_SET_CLIP;
+        } else if (!strcmp(a, "--patience")) {
+            if (!cli_parse_int(v, 0, 100000, &n)) return -cli_fail("--patience needs an integer >= 0, got '%s'", v);
+            o->patience = (int)n;
+            *mask |= CLI_SET_PATIENCE;
+        } else {
+            if (!cli_parse_int(v, 1, 100000, &n)) return -cli_fail("--seq-len needs a positive integer, got '%s'", v);
+            o->seq_len = (int)n;
+            *mask |= CLI_SET_SEQLEN;
+        }
         return 1;
     }
     for (k = 0; valued[k] && strcmp(a, valued[k]); k++) {
@@ -203,9 +234,23 @@ static int file_exists(const char *p) {
 
 /* "mnist", "mnist:train", "mnist:test", an IDX image file (labels found by
  * name), or a CSV file. */
-int cli_load_data(cli_state *st, const char *spec, int want_test, int limit, int header, nmz_dataset **out) {
+int cli_load_data(cli_state *st, const char *spec, int want_test, int limit, int header, int seq_len,
+                  nmz_dataset **out) {
     nmz_status s;
     *out = NULL;
+    if (st->net && nmz_net_is_sequence(st->net)) { /* text: the model's vocabulary and item mode */
+        nmz_text_opts to = nmz_text_defaults();
+        const nmz_vocab *v = nmz_net_vocab(st->net);
+        if (!v) return cli_fail("this sequence model has no vocabulary%s", NULL);
+        to.vocab = v;
+        to.items = v->items;
+        to.seq_len = seq_len > 0 ? seq_len : nmz_net_train_config(st->net)->seq_len > 0 ? nmz_net_train_config(st->net)->seq_len : 64;
+        if (nmz_dataset_load_text(out, spec, &to) != NMZ_OK) return cli_lib_fail("cannot read text");
+        if ((*out)->invalid_utf8)
+            fprintf(stderr, "warning: %s: %zu invalid UTF-8 byte(s) were read as U+FFFD\n", spec, (*out)->invalid_utf8);
+        if (limit > 0) nmz_dataset_truncate(*out, limit);
+        return 0;
+    }
     if (!strcmp(spec, "mnist") || !strcmp(spec, "mnist:train") || !strcmp(spec, "mnist:test")) {
         const char *dir = getenv("NEUROMZ_DATA");
         int test = !strcmp(spec, "mnist:test") || (!strcmp(spec, "mnist") && want_test);
@@ -261,6 +306,25 @@ const char *cli_act_reason(nmz_act a) {
     case NMZ_ACT_COUNT: break;
     }
     return "";
+}
+
+const char *cli_char_label(uint32_t cp, char *buf, size_t n) {
+    if (cp == '\n')
+        snprintf(buf, n, "%s", print_is_ascii() ? "\\n" : "⏎");
+    else if (cp == ' ')
+        snprintf(buf, n, "%s", print_is_ascii() ? "' '" : "␣");
+    else if (cp == '\t')
+        snprintf(buf, n, "\\t");
+    else if (cp < 0x20 || cp == 0x7f)
+        snprintf(buf, n, "U+%04X", (unsigned)cp);
+    else if (cp >= 0x80 && print_is_ascii())
+        snprintf(buf, n, "U+%04X", (unsigned)cp);
+    else {
+        char u[5];
+        nmz_utf8_encode(cp, u);
+        snprintf(buf, n, "%s", u);
+    }
+    return buf;
 }
 
 const char *cli_init_reason(int init) {

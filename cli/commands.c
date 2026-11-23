@@ -105,7 +105,7 @@ static int show_sample(cli_state *st, long idx, const char *spec, int header) {
     nmz_dataset *ds = NULL;
     const float *x;
     int i;
-    if (cli_load_data(st, spec, 1, (int)idx, header, &ds)) return 1;
+    if (cli_load_data(st, spec, 1, (int)idx, header, 0, &ds)) return 1;
     if (idx < 1 || idx > ds->n_samples) {
         fprintf(stderr, "error: sample %ld is out of range (1..%d)\n", idx, ds->n_samples);
         nmz_dataset_free(ds);
@@ -165,7 +165,10 @@ static int show_sample(cli_state *st, long idx, const char *spec, int header) {
 
 static void print_shape(const nmz_layer *l) {
     int i;
-    for (i = 0; i < l->in_rank; i++) printf(i ? "x%d" : "%d", l->in_shape[i]);
+    for (i = 0; i < l->in_rank; i++) {
+        if (l->in_shape[i] == NMZ_ANY_LENGTH) printf(i ? "xT" : "T");
+        else printf(i ? "x%d" : "%d", l->in_shape[i]);
+    }
 }
 
 static int cmd_show(cli_state *st, int argc, char **argv) {
@@ -179,6 +182,8 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
             weights = 1;
         else if (!strcmp(argv[i], "filters"))
             filters = 1;
+        else if (!strcmp(argv[i], "vocab"))
+            filters = 2;
         else if (!strcmp(argv[i], "sample")) {
             if (i + 1 >= argc || !cli_parse_int(argv[i + 1], 1, 1000000000L, &sample))
                 return fail("usage: show sample N [--data mnist:test|FILE]%s", NULL);
@@ -187,10 +192,39 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
             if (!(data = cli_opt_value(argc, argv, &i))) return 1;
         } else if (parse_header_opt(argv[i], &header)) {
         } else
-            return fail("show takes `weights`, `filters` or `sample N [--data SPEC]`, got '%s'", argv[i]);
+            return fail("show takes `weights`, `filters`, `vocab` or `sample N [--data SPEC]`, got '%s'", argv[i]);
     }
     if (sample) return show_sample(st, sample, data, header);
     if (!need_net(st)) return 1;
+    if (filters == 2) {
+        const nmz_vocab *v = nmz_net_vocab(st->net);
+        uint64_t total = 0, mx = 1;
+        int k;
+        if (!v) return fail("this model has no vocabulary (it is not a text model)%s", NULL);
+        for (k = 0; k < v->size; k++) {
+            total += v->counts[k];
+            if (v->counts[k] > mx) mx = v->counts[k];
+        }
+        printf("Vocabulary: %d characters (Unicode code points), %llu occurrences in the training text%s\n", v->size,
+               (unsigned long long)total, v->items ? "; ⏎ = end of an item" : "");
+        printf("  %4s  %-6s  %-8s %10s  %6s\n", "id", "char", "code", "count", "share");
+        for (k = 0; k < v->size; k++) {
+            char lbl[32];
+            int bar = (int)(30.0 * (double)v->counts[k] / (double)mx + 0.5), b;
+            cli_char_label(v->codepoints[k], lbl, sizeof lbl);
+            printf("  %4d  %s", k, lbl);
+            {
+                int w = 0, c;
+                for (c = 0; lbl[c]; c++) w += ((unsigned char)lbl[c] & 0xC0) != 0x80; /* characters, not bytes */
+                for (; w < 6; w++) putchar(' ');
+            }
+            printf("  U+%04X   %10llu  %5.1f%%  ", (unsigned)v->codepoints[k],
+                   (unsigned long long)v->counts[k], total ? 100.0 * (double)v->counts[k] / (double)total : 0.0);
+            for (b = 0; b < bar; b++) putchar('#');
+            putchar('\n');
+        }
+        return 0;
+    }
     if (filters) {
         show_filters(st);
         return 0;
@@ -198,8 +232,15 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
     printf("Network %s%s\n", st->path ? st->path : "(not saved yet)", st->dirty && st->path ? "  [unsaved changes]" : "");
     if (nmz_net_layer_count(st->net) > 0) {
         printf("  input        ");
-        print_shape(nmz_net_layer(st->net, 0));
-        printf(" (%d value(s) per sample)\n", nmz_net_input_size(st->net));
+        if (nmz_net_is_sequence(st->net)) {
+            const nmz_vocab *v = nmz_net_vocab(st->net);
+            printf("text: T character ids per sequence (any T)%s\n",
+                   v && v->items ? ", one item per line" : "");
+            if (v) printf("  vocabulary   %d characters (`show vocab` lists them)\n", v->size);
+        } else {
+            print_shape(nmz_net_layer(st->net, 0));
+            printf(" (%d value(s) per sample)\n", nmz_net_input_size(st->net));
+        }
     }
     norm = nmz_net_normalization(st->net, &fitted, &groups, NULL, NULL);
     if (norm != NMZ_NORM_NONE)
@@ -259,10 +300,115 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
     return 0;
 }
 
+/* -------------------------------------------------------------- generate */
+
+/* does `item` occur as a whole line of the file? (small files only) */
+static int line_in_file(const char *path, const char *item) {
+    FILE *f = fopen(path, "rb");
+    char *line;
+    int found = 0;
+    if (!f) return 0;
+    while (!found && (line = cli_read_line(f)) != NULL) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == ' ' || line[n - 1] == '\t')) line[--n] = '\0';
+        found = !strcmp(line, item) || (!strncmp(line, "\xef\xbb\xbf", 3) && !strcmp(line + 3, item));
+        free(line);
+    }
+    fclose(f);
+    return found;
+}
+
+static int cmd_generate(cli_state *st, int argc, char **argv) {
+    nmz_gen_opts g = nmz_gen_defaults();
+    const nmz_vocab *v;
+    const char *data = NULL;
+    long count = 0, n;
+    int i, length_set = 0, new_only = 0, made = 0, attempts = 0;
+    double d;
+    uint64_t seed = 1;
+    char **seen = NULL;
+    if (!need_net(st)) return 1;
+    v = nmz_net_vocab(st->net);
+    if (!v || !nmz_net_is_sequence(st->net)) return fail("generate needs a text model (see `new --preset names`)%s", NULL);
+    for (i = 1; i < argc; i++) {
+        const char *a = argv[i], *val;
+        if (!strcmp(a, "--new-only")) {
+            new_only = 1;
+            continue;
+        }
+        if (!(val = cli_opt_value(argc, argv, &i))) return 1;
+        if (!strcmp(a, "--prime")) g.prime = val;
+        else if (!strcmp(a, "--length")) {
+            if (!cli_parse_int(val, 1, 1000000, &n)) return fail("--length needs a positive integer, got '%s'", val);
+            g.length = (int)n;
+            length_set = 1;
+        } else if (!strcmp(a, "--temperature")) {
+            if (!cli_parse_double(val, &d) || d <= 0) return fail("--temperature must be > 0, got '%s'", val);
+            g.temperature = (float)d;
+        } else if (!strcmp(a, "--top-k")) {
+            if (!cli_parse_int(val, 0, 1000000, &n)) return fail("--top-k needs an integer >= 0, got '%s'", val);
+            g.top_k = (int)n;
+        } else if (!strcmp(a, "--seed")) {
+            if (!cli_parse_u64(val, &seed)) return fail("--seed needs a non-negative integer, got '%s'", val);
+        } else if (!strcmp(a, "--count")) {
+            if (!cli_parse_int(val, 1, 10000, &count)) return fail("--count needs a positive integer, got '%s'", val);
+        } else if (!strcmp(a, "--data")) {
+            data = val;
+        } else {
+            return fail("unknown option '%s' for generate (see `help generate`)", a);
+        }
+    }
+    if (new_only && !data) return fail("--new-only needs --data FILE (the training items to avoid)%s", NULL);
+    if (!v->items) { /* running text: one passage per seed */
+        if (!count) count = 1;
+        if (!length_set) g.length = 300;
+        for (i = 0; i < count; i++) {
+            char *out = NULL;
+            g.seed = seed + (uint64_t)i;
+            if (nmz_net_generate(st->net, &g, &out, NULL) != NMZ_OK) return lib_fail("generate");
+            if (count > 1) printf("--- seed %llu\n", (unsigned long long)g.seed);
+            printf("%s%s\n", g.prime ? g.prime : "", out);
+            free(out);
+        }
+        return 0;
+    }
+    /* items (names): stop at the end-of-item token, keep distinct ones */
+    if (!count) count = 10;
+    if (!length_set) g.length = 64;
+    g.stop_at_end = 1;
+    seen = calloc((size_t)count, sizeof *seen);
+    if (!seen) return fail("out of memory%s", NULL);
+    while (made < count && attempts < count * 50) {
+        char *out = NULL;
+        size_t len;
+        int dup = 0, k, known;
+        g.seed = seed + (uint64_t)attempts++;
+        if (nmz_net_generate(st->net, &g, &out, NULL) != NMZ_OK) {
+            for (k = 0; k < made; k++) free(seen[k]);
+            free(seen);
+            return lib_fail("generate");
+        }
+        len = strlen(out);
+        if (len && out[len - 1] == '\n') out[--len] = '\0';
+        for (k = 0; k < made && !dup; k++) dup = !strcmp(seen[k], out);
+        known = data && len ? line_in_file(data, out) : 0;
+        if (!len || dup || (new_only && known)) {
+            free(out);
+            continue;
+        }
+        seen[made++] = out;
+        printf("  %2d. %s%s%s\n", made, g.prime ? g.prime : "", out, known ? "   (in the training data)" : "");
+    }
+    if (made < count) printf("(only %d distinct item(s) after %d attempts)\n", made, attempts);
+    for (i = 0; i < made; i++) free(seen[i]);
+    free(seen);
+    return 0;
+}
+
 /* ----------------------------------------------------------------- train */
 
 typedef struct progress {
-    int every, quiet, tty, max_epochs;
+    int every, quiet, tty, max_epochs, ce, has_val;
     double t0, last_draw;
 } progress;
 
@@ -298,10 +444,18 @@ static int on_epoch(const nmz_epoch_info *info, void *user) {
     progress *p = user;
     if (p->quiet) return 0;
     clear_line(p);
-    if (info->epoch == 1 || info->epoch % p->every == 0 || info->epoch == p->max_epochs) {
-        printf("  epoch %6d   loss %-12.6g ", info->epoch, info->loss);
-        print_acc(info->accuracy);
-        printf("   lr %-9.3g %7.1fs\n", (double)info->learning_rate, cli_now() - p->t0);
+    if (info->epoch == 1 || info->epoch % p->every == 0 || info->epoch == p->max_epochs || p->has_val) {
+        printf("  epoch %6d   loss %-10.5g", info->epoch, info->loss);
+        if (p->ce) printf(" (ppl %6.2f)", exp(info->loss));
+        if (p->has_val) {
+            printf("  val %-9.5g", info->val_loss);
+            if (p->ce) printf(" (ppl %6.2f)", exp(info->val_loss));
+            printf(info->improved ? " *" : "  ");
+        }
+        printf("  ");
+        print_acc(p->has_val ? info->val_accuracy : info->accuracy);
+        if (info->clipped_batches) printf("  clipped %d", info->clipped_batches);
+        printf("   lr %-8.3g %6.1fs\n", (double)info->learning_rate, cli_now() - p->t0);
         fflush(stdout);
     }
     return 0;
@@ -345,11 +499,13 @@ static int cmd_train(cli_state *st, int argc, char **argv) {
         }
     }
     if (!spec) return fail("usage: train DATA [options]   DATA = FILE.csv, mnist, or an IDX images file%s", NULL);
-    if (cli_load_data(st, spec, 0, limit, header, &ds)) return 1;
+    if (cli_load_data(st, spec, 0, limit, header, o.seq_len, &ds)) return 1;
     pr.max_epochs = o.max_epochs;
     pr.every = every ? (int)every : (o.max_epochs >= 20 ? o.max_epochs / 20 : 1);
     pr.tty = cli_stdout_is_tty();
     pr.t0 = cli_now();
+    pr.ce = nmz_net_loss_kind(st->net) == NMZ_LOSS_CROSS_ENTROPY;
+    pr.has_val = o.val_fraction > 0;
     o.on_epoch = on_epoch;
     o.on_batch = on_batch;
     o.user = &pr;
@@ -372,12 +528,21 @@ static int cmd_train(cli_state *st, int argc, char **argv) {
     }
     if (res.converged)
         printf("Converged after %d epoch(s): loss %.6g <= target %g, ", res.epochs, res.loss, o.target_loss);
+    else if (res.best_epoch && res.best_epoch < res.epochs)
+        printf("Early stop after %d epoch(s): kept the weights of epoch %d (best validation loss), loss %.6g, ",
+               res.epochs, res.best_epoch, res.loss);
     else if (o.target_loss <= 0)
         printf("Finished %d epoch(s): loss %.6g, ", res.epochs, res.loss);
     else
         printf("Stopped at the epoch limit (%d): loss %.6g > target %g, ", res.epochs, res.loss, o.target_loss);
     print_acc(res.accuracy);
     printf(" (on the training data), %.1fs\n", cli_now() - pr.t0);
+    if (o.val_fraction > 0) {
+        printf("  validation (last %g%% of the data): loss %.6g", 100.0 * o.val_fraction, res.val_loss);
+        if (pr.ce) printf(", perplexity %.3f", exp(res.val_loss));
+        if (!isnan(res.val_accuracy)) printf(", accuracy %.1f%%", 100.0 * res.val_accuracy);
+        printf("\n");
+    }
     if (!res.converged && o.target_loss > 0)
         printf("  hint: try more epochs (--epochs), another learning rate (--lr), more hidden units, or a looser "
                "--target-loss\n");
@@ -405,15 +570,17 @@ static int cmd_test(cli_state *st, int argc, char **argv) {
         spec = argv[i];
     }
     if (!spec) return fail("usage: test DATA [--limit N]   DATA = FILE.csv, mnist (= test set), or an IDX file%s", NULL);
-    if (cli_load_data(st, spec, 1, limit, header, &ds)) return 1;
+    if (cli_load_data(st, spec, 1, limit, header, 0, &ds)) return 1;
     t0 = cli_now();
     if (nmz_net_evaluate(st->net, ds, &loss, &acc) != NMZ_OK) {
         nmz_dataset_free(ds);
         return lib_fail("test");
     }
     printf("Tested on %s: %d samples (%.1fs)\n  loss %.6g   ", spec, ds->n_samples, cli_now() - t0, loss);
+    if (nmz_net_loss_kind(st->net) == NMZ_LOSS_CROSS_ENTROPY && ds->time_steps)
+        printf("perplexity %.3f (per character)   ", exp(loss));
     print_acc(acc);
-    printf("\n");
+    printf(ds->time_steps ? " (next character)\n" : "\n");
     n_out = ds->n_outputs;
     n_cls = nmz_net_class_count(st->net);
     if (n_out > 1 && n_out <= 20 && (y = malloc(sizeof(float) * (size_t)n_out)) != NULL) {
@@ -545,7 +712,7 @@ static int parse_sample(cli_state *st, int argc, char **argv, sample_args *a, in
     }
     if (a->sample) {
         nmz_dataset *ds = NULL;
-        if (cli_load_data(st, a->data, 1, (int)a->sample, header, &ds)) return 1;
+        if (cli_load_data(st, a->data, 1, (int)a->sample, header, 0, &ds)) return 1;
         if (a->sample > ds->n_samples) {
             fprintf(stderr, "error: sample %ld is out of range (1..%d)\n", a->sample, ds->n_samples);
             nmz_dataset_free(ds);
@@ -833,7 +1000,7 @@ static const cmd k_cmds[] = {
      "           --optimizer sgd|adam --lr X --momentum X --beta1 X --beta2 X --eps X\n"
      "           --schedule constant|step|cosine --step-size N --gamma X --min-lr X\n"
      "           --batch N --epochs N --target-loss X --no-shuffle"},
-    {"show", cmd_show, "show [weights | filters | sample N [--data SPEC]]",
+    {"show", cmd_show, "show [weights | filters | vocab | sample N [--data SPEC]]",
      "Describe the network; `weights` prints every parameter, `filters` draws the conv kernels as\n"
      "  ASCII heatmaps, `sample N` draws sample N (default from mnist:test) with the prediction."},
     {"train", cmd_train, "train DATA [options]",
@@ -854,6 +1021,13 @@ static const cmd k_cmds[] = {
      "  --target may be a class name; with --sample the dataset label is the target."},
     {"step", cmd_step_fwd, "step (same arguments as trace) [--lr X] [--optimizer ...]",
      "Like trace, but in training mode and the weight update is applied: one step you can follow."},
+    {"generate", cmd_generate,
+     "generate [--prime TEXT] [--length N] [--temperature X] [--top-k K] [--seed N] [--count N] [--data FILE] [--new-only]",
+     "Sample text from a character model. Line-per-item models (names) print --count distinct items\n"
+     "  (default 10), each ended by the end-of-item token; with --data FILE items that occur in that\n"
+     "  file are marked, --new-only skips them. Running-text models print --length characters (300).\n"
+     "  --temperature < 1 is safer/more repetitive, > 1 wilder; --top-k K samples among the K most\n"
+     "  likely characters only; the same --seed gives the same text."},
     {"gradcheck", cmd_gradcheck, "gradcheck (X1 ... Xn --target T... | --sample N [--data SPEC])",
      "Compare every backprop gradient with a numerical derivative (L(w+e)-L(w-e))/2e."},
     {"save", cmd_save, "save [FILE] [--no-optimizer]",
