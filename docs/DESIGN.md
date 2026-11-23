@@ -8,8 +8,9 @@ intermediate value — `z`, `a`, `δ`, gradients, weight updates — so the math
 can be printed now and visualised later.
 
 Status of this document: written before implementation, then corrected where
-the implementation taught us something (see the git history of this file and
-decisions 27–33, which were added during implementation).
+the implementation taught us something (see the git history of this file).
+Phase 1 (dense networks) added decisions 27–33; phase 2 (CNN, Adam,
+normalization, MNIST) added decisions 34–50.
 
 ---
 
@@ -25,28 +26,36 @@ src/                   libneuromz — platform-independent C11, libc + libm only
   rng.c                PCG32 PRNG (seedable, reproducible everywhere)
   activation.c         activation functions + derivatives, Activation layer
   dense.c              Dense (fully connected) layer
+  conv2d.c             Conv2D (im2col by default, naive loops as reference)
+  shape_layers.c       MaxPool2D, Flatten, Dropout
+  normalize.c          input normalization, LR schedules, optimizer/schedule names
   loss.c               MSE, softmax+cross-entropy
   net.c                nmz_net: layer stack, forward/backward, optimizer step
   train.c              epochs, shuffling, mini-batches, stop rule, evaluation
   trace.c              trace events, recorder, JSON-lines export
   gradcheck.c          numerical gradient check (public: it is a teaching tool)
   io.c                 portable .nmz save/load, CRC32, byte writer/reader
-  dataset.c            dataset type + CSV loader
+  dataset.c            dataset type, CSV loader, IDX (MNIST) loader
   defaults.c           "quick mode" defaults and the reasons for them
   internal.h           private helpers shared by the library sources
 cli/                   the `neuromz` program (may use POSIX/terminal code)
   cli.h                CLI-internal declarations
-  main.c               entry point, REPL, argv dispatch (-m/-o/--ascii)
-  commands.c           new/show/train/test/predict/save/load/trace/step/...
-  print.c              table + formula printer for trace events
+  main.c               entry point, REPL, argv dispatch (-m/-o/--ascii), clock/tty
+  cmd_new.c            `new`: layer-spec grammar, presets, explanations
+  commands.c           show/train/test/predict/save/load/trace/step/...
+  util.c               option parsing, dataset resolution (CSV/IDX/mnist)
+  print.c              formula printer for dense/activation/loss/SGD events
+  print_conv.c         conv/pool/flatten/dropout/normalize/Adam printers, heatmaps
   line.c               dynamic line reader and tokenizer (no fixed buffers)
 tests/                 test_*.c (unit, gradient checks, convergence, I/O),
                        cli_smoke.sh (CLI abuse test); all run under sanitizers
 examples/              xor.csv, xor_and.csv, iris.csv (+ 120/30 train/test
-                       split), api_xor.c, run_examples.sh, benchmark.sh
+                       split), api_xor.c, run_examples.sh, benchmark.sh,
+                       benchmark_mnist.sh, bench_conv.c
+scripts/get_mnist.sh   downloads MNIST into data/ (gitignored), verifies MD5
 docs/DESIGN.md         this file
 legacy/                v1 sources (2017–2020), unchanged, tag `v1-legacy`
-Makefile               lib, cli, test, sanitize, examples, clean
+Makefile               lib, cli, test, sanitize, examples, data, bench, clean
 ```
 
 Build products go to `build/` (`build/libneuromz.a`, `build/neuromz`,
@@ -230,7 +239,15 @@ Item names are a fixed, documented vocabulary (tensors are `[B, …]`):
 | loss backward | `dL/dy` — or, fused softmax+CE, `dL/dz` (= p − t) |
 | activation backward | `dL/da`, `f'(z)` (omitted for softmax), `dL/dz` |
 | dense backward | `dL/dz` (= δ), `x`, `dL/dW`, `dL/db`, `dL/dx` |
-| update (per param) | `value` (before), `grad`, `velocity_prev`, `delta` (= new velocity); scalars `lr`, `momentum`; `detail` = param name |
+| normalize forward (layer −1) | `x` (raw), `offset`, `scale` (per group), `x_norm`; `detail` = minmax/zscore |
+| conv2d forward | `x`, `W` [F,C,KH,KW], `b`, `z`; scalars `stride`, `pad` |
+| conv2d backward | `dL/dz`, `x`, `W`, `dL/dW`, `dL/db`, `dL/dx` |
+| maxpool2d forward | `x`, `y`, `argmax` (winner's flat index iy·W+ix per output); scalars `size`, `stride` |
+| maxpool2d backward | `dL/dy`, `argmax`, `dL/dx` |
+| flatten | forward `x`, `y`; backward `dL/dy`, `dL/dx` |
+| dropout | forward `x`, `y`, `mask` (training only); backward `dL/dy`, `dL/dx`, `mask`; scalars `rate`, `training` |
+| update, SGD (per param) | `value` (before), `grad`, `velocity_prev`, `delta` (= new velocity); scalars `lr`, `momentum`; `detail` = param name |
+| update, Adam (per param) | `value` (before), `grad`, `m`, `v` (new moments), `m_hat`, `v_hat`, `delta`; scalars `lr`, `beta1`, `beta2`, `epsilon`, `t` |
 
 The CLI's `trace`/`step` commands turn these into tables with formulas, e.g.
 `z_j = Σ_i x_i·W_ij + b_j`. A future GUI consumes the same events (live via the
@@ -249,6 +266,10 @@ All names use the `nmz_` / `NMZ_` prefix. The full header is
 /* rng */         nmz_rng_seed/u32/below/uniform/normal
 /* names */       nmz_act_name/nmz_act_parse, nmz_init_*, nmz_loss_*
 /* build */       nmz_net_create(&net, rank, shape, seed); nmz_net_free(net);
+                  nmz_layer_conv2d(F, kh, kw, stride, pad|NMZ_PAD_SAME, init)
+                  nmz_layer_maxpool2d(size, stride); nmz_layer_flatten();
+                  nmz_layer_dropout(rate); nmz_layer_conv2d_set_algo(l, algo)
+                  nmz_net_set_normalization(net, NMZ_NORM_ZSCORE|MINMAX|NONE)
                   nmz_net_add(net, layer)             /* takes ownership      */
                   nmz_net_add_dense(net, units, act, init) /* Dense+Activation */
                   nmz_layer_dense(units, init); nmz_layer_activation(act, alpha)
@@ -261,17 +282,25 @@ All names use the `nmz_` / `NMZ_` prefix. The full header is
 /* compute */     nmz_net_forward(net, x, &y); nmz_net_predict(net, x, y);
                   nmz_net_backward(net, t, &loss); nmz_net_update(net, lr, mu);
                   nmz_net_preview_update(net, lr, mu) /* trace only, no change */
+                  nmz_net_optimizer_step(net, &opts, lr)  /* SGD or Adam */
+                  nmz_net_optimizer_preview(net, &opts, lr)
+                  nmz_net_forward_mode(net, x, training, &y)
                   nmz_net_compute_loss(net, t, &loss)
 /* train */       nmz_train_opts (max_epochs, batch_size, learning_rate, momentum,
-                  shuffle, target_loss, on_epoch callback);
+                  shuffle, target_loss, optimizer, beta1/beta2/epsilon,
+                  schedule/step_size/gamma/min_lr, on_epoch/on_batch callbacks);
+                  nmz_schedule_lr(&opts, epoch); nmz_net_fit_normalization
                   nmz_net_train(net, ds, &opts, &result);
                   nmz_net_evaluate(net, ds, &loss, &accuracy);
                   nmz_net_train_config(net)  /* defaults stored with the model */
 /* data */        nmz_dataset_load_csv(&ds, path, &csv_opts); nmz_dataset_create;
-                  nmz_dataset_free
-/* io */          nmz_net_save(net, path); nmz_net_load(&net, path)
+                  nmz_dataset_load_idx(&ds, images, labels, limit);
+                  nmz_dataset_truncate; nmz_dataset_free
+/* io */          nmz_net_save(net, path); nmz_net_save_ex(net, path, flags);
+                  nmz_net_load(&net, path)
 /* trace */       nmz_net_set_trace; nmz_trace_recorder_*; nmz_trace_event_write_json
-/* teaching */    nmz_net_gradcheck(net, x, t, eps, &result)
+/* teaching */    nmz_net_gradcheck(net, x, t, eps, atol, rtol, &result);
+                  nmz_net_gradcheck_mode(..., training, &result)
 ```
 
 Ownership: `nmz_net_add` always takes ownership of the layer (it frees it on
@@ -298,7 +327,7 @@ the caller and freed with the matching `*_free`.
 
 ---
 
-## 7. File format (`.nmz`, format version 2)
+## 7. File format (`.nmz`, format version 3; version 2 is still read)
 
 All integers are fixed-width **little-endian**; floats are IEEE-754 binary32
 (`f32`) / binary64 (`f64`) stored little-endian. Strings are `u32 length` +
@@ -308,7 +337,7 @@ bytes (no terminator, max 4096). The writer never dumps C structs, so padding,
 ```
 offset  field
 0       magic        8 bytes: 89 4E 4D 5A 0D 0A 1A 0A  ("\x89NMZ\r\n\x1a\n")
-8       u32          format version = 2
+8       u32          format version = 3 (2 is accepted)
 12      u32          flags = 0 (reserved)
         u32          input rank R, then R × u32 input dims (per sample)
         u32          loss kind (0 = mse, 1 = cross_entropy)
@@ -316,21 +345,34 @@ offset  field
         u64          step counter
         train config u32 max_epochs, u32 batch_size, f32 learning_rate,
                      f32 momentum, u32 shuffle, f64 target_loss
+   [v3] train ext.   u32 optimizer, f32 beta1, f32 beta2, f32 epsilon,
+                     u32 schedule, u32 step_size, f32 gamma, f32 min_lr
         u32          class-name count C, then C × string
         u32          layer count N, then per layer:
-                       string   type ("dense", "activation", ...)
+                       string   type ("dense", "activation", "conv2d",
+                                "maxpool2d", "flatten", "dropout")
                        u32      config byte length, then config bytes
                        u32      parameter count P, then per parameter:
                                 string name, u32 rank, rank × u32 dims,
                                 product(dims) × f32
+   [v3] u32          section count S, then per section:
+                       string tag, u32 byte length, bytes
+                     "normalize": u32 kind, u32 fitted, u32 groups G,
+                                  G × f32 offset, G × f32 scale
+                     "optimizer": u32 kind, u64 t, u32 n_params, then per
+                                  parameter u32 count, count × f32 (velocity
+                                  or Adam m), and for Adam count × f32 v
 end     u32          CRC-32 (IEEE, reflected 0xEDB88320) of every byte above
 ```
 
 The magic follows PNG's trick: the high byte catches 7-bit transfers, the
 CR-LF/LF pair catches newline translation, `0x1A` stops `type` on Windows.
 The loader checks magic, version, every count against sane limits, every
-parameter shape against what the layer expects after `setup`, and the CRC.
-Optimizer velocity is *not* saved (decision 17).
+parameter shape against what the layer expects after `setup`, every section
+length, and the CRC. Unknown section tags are skipped, so later versions can
+add sections without breaking this reader. A version-2 file loads with SGD,
+a constant schedule, no normalization and no optimizer state
+(`tests/data/v2_xor.nmz` is a real phase-1 file used as a fixture).
 
 ---
 
@@ -346,6 +388,16 @@ Layer spec grammar (one argument per layer after the input size):
 `new 2 4 1` is quick mode; `new 4 8:relu:he 3:softmax --loss ce` is advanced
 mode — the same command, quick mode is just "everything defaulted", and every
 defaulted choice is printed with a one-line reason.
+
+Image layers use the same style: the first field names the layer, the rest
+are activation/init names or `key=value` options:
+`conv:FILTERS:K[:ACT][:INIT][:stride=S][:pad=P|same]`, `pool:K[:stride=S]`,
+`flatten`, `dropout:RATE`, and `dense:N` as a long form of `N`. The input may
+be an image shape (`1x28x28`). Presets (`new --preset mnist-cnn|mnist-mlp`)
+are named lists of such specs plus training options, each with its reason.
+Datasets are named by file (CSV, IDX) or as `mnist` (`mnist:train`,
+`mnist:test`); `--sample N` picks one sample for `predict`/`trace`/`step`/
+`gradcheck`/`show sample`.
 
 ---
 
@@ -470,3 +522,80 @@ Added during implementation:
     part of the learning math a student follows.
 33. **Saving is atomic**: the model is written to `FILE.tmp` and renamed, so a
     failed save never destroys the previous good file.
+
+Added in phase 2 (CNN, Adam, normalization, MNIST):
+
+34. **Normalization belongs to the net, not to a layer.** It has fitted (not
+    learned) parameters; as a layer the optimizer, gradcheck and the
+    parameter list would all need a "non-trainable" notion. As net state it
+    is fitted once at the first `train` (then frozen, so test data is scaled
+    with training statistics), saved as a section, applied by forward and
+    predict, traced as a `normalize` event (layer −1), and the input
+    gradient is reported w.r.t. the raw input.
+35. **Normalization groups**: one per channel for `[C,H,W]` inputs (per-pixel
+    statistics on MNIST would divide by zero on the always-black border and
+    are not what CNNs use), one per feature otherwise (Iris-style columns).
+36. **Optimizer state lives in the net, one pair of tensors per parameter**
+    (velocity, or Adam's m and v) plus Adam's t. Switching optimizer resets
+    it. It is saved by default (an optional section), so training resumes
+    exactly; `save --no-optimizer` / `NMZ_SAVE_NO_OPTIMIZER` drops it.
+    Supersedes decision 17.
+37. **Adam trace values are the weight *before* the step** plus m, v, m̂, v̂
+    and Δ, like the SGD events; the printer derives "w new = w + Δ". Traced
+    updates compute everything into scratch tensors first, emit, then apply,
+    so preview and apply show identical numbers.
+38. **Schedules are per epoch** (constant, step, cosine), computed by
+    `nmz_schedule_lr`, reported in `nmz_epoch_info.learning_rate`. Per-batch
+    warm-up etc. are deferred: per-epoch values are easy to show and reason
+    about.
+39. **Each epoch's shuffle starts from the identity permutation**, so its order
+    depends only on the PRNG state. Found by the resume test: 5 + 5 epochs
+    (also across save/load) must equal 10 epochs, and did not while the
+    permutation was carried from epoch to epoch.
+40. **File format 3 = format 2 + extra header fields + optional sections.**
+    New data goes into tagged, length-prefixed sections that unknown readers
+    skip; the version number only changes when the fixed part changes.
+41. **Conv shape convention**: per-sample `[C,H,W]`, batch `[B,C,H,W]`,
+    weights `[F,C,KH,KW]`; it is cross-correlation (no kernel flip), as in
+    every deep-learning library. Max-pool has no padding; ties go to the
+    first maximum in row-major order; overlapping windows add gradients.
+42. **Conv AUTO init is He** unless a tanh/sigmoid activation follows (then
+    Glorot) — "He by default" for the usual conv+relu.
+43. **Flatten is explicit in the library, automatic in the CLI.** Dense acts
+    on the last dimension (rows convention), so Dense after `[C,H,W]` would
+    silently mix only the W axis; the library leaves the choice to the
+    caller, while the CLI inserts (and announces) a flatten before a dense
+    layer that follows conv/pool.
+44. **Dropout uses the net's PRNG through `nmz_ctx.rng`**, so masks are
+    reproducible; it is "inverted" (scale 1/(1−p) in training, identity in
+    evaluation). `trace` runs in evaluation mode and changes nothing; `step`
+    runs a real training step (dropout active). Gradcheck replays the PRNG
+    state before every forward, so dropout can be checked in training mode.
+45. **Gradcheck skips kinks.** If a ±ε perturbation flips a relu input's sign
+    or a max-pool winner, the loss is not differentiable between the two
+    points and the difference quotient is meaningless; such checks are
+    counted as `kinks`, not failures. Found when gradchecking a trained CNN
+    from the CLI: one dense unit sat 0.006 from its kink while its input was
+    6.9, so ε = 0.001 crossed it for 144 weights at once.
+46. **im2col is the default conv implementation; the naive loops stay** as the
+    readable reference (`nmz_layer_conv2d_set_algo`). Both pass the same
+    gradchecks and agree to 1e-5. With `-O3` (now the default CFLAGS) im2col
+    is 2.1–2.4× faster on the MNIST CNN; at `-O2` only ~1.1× because GCC 12's
+    -O2 cost model does not vectorise the inner loops. The im2col forward sums
+    in float (≤ C·KH·KW terms per output; vectorisable), the weight gradient
+    uses 8 partial sums per dot product and a double batch accumulator.
+47. **IDX pixels stay raw (0..255)** in the dataset; scaling is the model's
+    normalization, so `predict` and `show sample` take raw images. Class
+    counts come from all labels in the file, not from a `--limit` subset
+    (a bug found when `show sample 1` saw only 8 classes).
+48. **MNIST download**: two public mirrors (the original host now refuses
+    automated downloads), MD5 sums from torchvision as the independent
+    reference, data in `data/` (gitignored), `NEUROMZ_DATA` to relocate.
+49. **Trace focus for feature maps**: one output position per spatial layer,
+    by default where channel 1's output is largest ("where the filter
+    fires"), remembered per layer so the backward pass shows the same
+    position; `--at F,Y,X` (1-based) overrides. A centred default showed
+    blank background patches on most digits.
+50. **Presets are CLI data** (layer specs + options + one reason each), not a
+    library API: they are a teaching/UI concern, and library users write the
+    same network in five calls (see README).
