@@ -6,6 +6,8 @@
 #   make test       build and run the test suite
 #   make sanitize   build everything with ASan + UBSan, run tests + CLI smoke test
 #   make examples   train the bundled examples (XOR, XOR+AND, Iris)
+#   make data       download MNIST into data/ and verify checksums
+#   make bench      slow benchmarks (seeds sweep + MNIST); not part of `make test`
 #   make clean
 
 CC      ?= cc
@@ -31,7 +33,7 @@ LIB      := $(BUILD)/libneuromz.a
 CLI      := $(BUILD)/neuromz
 TESTBIN  := $(BUILD)/test_neuromz
 
-.PHONY: all lib cli test sanitize examples clean
+.PHONY: all lib cli test sanitize examples data bench clean
 
 all: lib cli
 
@@ -67,6 +69,13 @@ $(BUILD)/api_xor: examples/api_xor.c $(LIB)
 examples: $(CLI) $(BUILD)/api_xor
 	./$(BUILD)/api_xor
 	sh examples/run_examples.sh ./$(CLI)
+
+data:
+	sh scripts/get_mnist.sh data
+
+bench: $(CLI)
+	sh examples/benchmark.sh ./$(CLI)
+	sh examples/benchmark_mnist.sh ./$(CLI)
 
 clean:
 	rm -rf build

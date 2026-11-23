@@ -342,3 +342,117 @@ done:
     free(buf);
     return s;
 }
+
+/* ------------------------------------------------------------------- IDX */
+
+nmz_status nmz_dataset_truncate(nmz_dataset *ds, int n) {
+    if (!ds || n < 1) return nmz__fail(NMZ_ERR_ARG, "limit must be >= 1");
+    if (n < ds->n_samples) ds->n_samples = n;
+    return NMZ_OK;
+}
+
+static int read_be32(FILE *f, uint32_t *v) {
+    unsigned char b[4];
+    if (fread(b, 1, 4, f) != 4) return 0;
+    *v = (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | b[3];
+    return 1;
+}
+
+static nmz_status idx_open(const char *path, uint32_t magic, int ndims, uint32_t *dims, FILE **out) {
+    FILE *f = fopen(path, "rb");
+    uint32_t m = 0;
+    int i;
+    if (!f) return nmz__fail(NMZ_ERR_IO, "cannot open '%s': %s", path, strerror(errno));
+    if (!read_be32(f, &m) || m != magic) {
+        fclose(f);
+        return nmz__fail(NMZ_ERR_FORMAT, "%s: not an IDX file of the expected kind (magic 0x%08x, wanted 0x%08x)",
+                         path, m, magic);
+    }
+    for (i = 0; i < ndims; i++)
+        if (!read_be32(f, &dims[i]) || dims[i] == 0 || dims[i] > 100000000u) {
+            fclose(f);
+            return nmz__fail(NMZ_ERR_FORMAT, "%s: corrupt IDX header", path);
+        }
+    *out = f;
+    return NMZ_OK;
+}
+
+nmz_status nmz_dataset_load_idx(nmz_dataset **out, const char *images_path, const char *labels_path, int limit) {
+    FILE *fi = NULL, *fl = NULL;
+    uint32_t di[3], dl[1];
+    nmz_dataset *ds = NULL;
+    unsigned char *pixels = NULL, *labels = NULL;
+    size_t pix, n, i, k;
+    int max_label = 0;
+    nmz_status s;
+    if (!out || !images_path || !labels_path) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
+    *out = NULL;
+    if ((s = idx_open(images_path, 0x00000803u, 3, di, &fi)) != NMZ_OK) return s;
+    if ((s = idx_open(labels_path, 0x00000801u, 1, dl, &fl)) != NMZ_OK) goto done;
+    if (di[0] != dl[0]) {
+        s = nmz__fail(NMZ_ERR_FORMAT, "%s has %u images but %s has %u labels", images_path, di[0], labels_path, dl[0]);
+        goto done;
+    }
+    if (di[1] > 4096 || di[2] > 4096) {
+        s = nmz__fail(NMZ_ERR_FORMAT, "%s: images of %ux%u are too large", images_path, di[1], di[2]);
+        goto done;
+    }
+    n = di[0];
+    if (limit > 0 && (size_t)limit < n) n = (size_t)limit;
+    pix = (size_t)di[1] * di[2];
+    labels = malloc(n);
+    pixels = malloc(pix);
+    ds = calloc(1, sizeof *ds);
+    if (!labels || !pixels || !ds) {
+        s = nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+        goto done;
+    }
+    if (fread(labels, 1, n, fl) != n) {
+        s = nmz__fail(NMZ_ERR_FORMAT, "%s: truncated (expected %zu labels)", labels_path, n);
+        goto done;
+    }
+    for (i = 0; i < n; i++)
+        if (labels[i] > max_label) max_label = labels[i];
+    ds->n_samples = (int)n;
+    ds->n_inputs = (int)pix;
+    ds->n_classes = max_label + 1 < 2 ? 2 : max_label + 1;
+    ds->n_outputs = ds->n_classes;
+    ds->sample_rank = 3;
+    ds->sample_shape[0] = 1;
+    ds->sample_shape[1] = (int)di[1];
+    ds->sample_shape[2] = (int)di[2];
+    ds->x = malloc(n * pix * sizeof(float));
+    ds->y = calloc(n * (size_t)ds->n_outputs, sizeof(float));
+    ds->class_names = calloc((size_t)ds->n_classes, sizeof *ds->class_names);
+    if (!ds->x || !ds->y || !ds->class_names) {
+        s = nmz__fail(NMZ_ERR_NOMEM, "out of memory (%zu images)", n);
+        goto done;
+    }
+    for (i = 0; i < (size_t)ds->n_classes; i++) {
+        char name[8];
+        snprintf(name, sizeof name, "%u", (unsigned)i);
+        if (!(ds->class_names[i] = nmz__strdup(name))) {
+            s = nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+            goto done;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        if (fread(pixels, 1, pix, fi) != pix) {
+            s = nmz__fail(NMZ_ERR_FORMAT, "%s: truncated at image %zu", images_path, i);
+            goto done;
+        }
+        for (k = 0; k < pix; k++) ds->x[i * pix + k] = (float)pixels[k];
+        ds->y[i * (size_t)ds->n_outputs + labels[i]] = 1.0f;
+    }
+    s = NMZ_OK;
+done:
+    if (fi) fclose(fi);
+    if (fl) fclose(fl);
+    free(pixels);
+    free(labels);
+    if (s == NMZ_OK)
+        *out = ds;
+    else
+        nmz_dataset_free(ds);
+    return s;
+}

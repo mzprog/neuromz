@@ -334,6 +334,8 @@ typedef struct nmz_dataset {
     float *y;           /* n_samples × n_outputs, row-major */
     int n_classes;      /* > 0 when targets were one-hot encoded from labels */
     char **class_names; /* n_classes strings, or NULL      */
+    int sample_rank;    /* shape of one input sample, e.g. [1,28,28] for */
+    int sample_shape[NMZ_MAX_RANK]; /* images; 0 = flat (n_inputs) */
 } nmz_dataset;
 
 typedef struct nmz_csv_opts {
@@ -354,6 +356,14 @@ nmz_status nmz_dataset_load_csv(nmz_dataset **out, const char *path,
 nmz_status nmz_dataset_create(nmz_dataset **out, int n_samples, int n_inputs,
                               int n_outputs, const float *x, const float *y);
 void nmz_dataset_free(nmz_dataset *ds);
+/* MNIST-style IDX files (big-endian; images: unsigned bytes [n, rows, cols],
+ * labels: unsigned bytes [n]). Pixels are kept as raw 0..255 floats (use
+ * normalization); labels are one-hot with class names "0", "1", ...
+ * limit > 0 reads only the first `limit` samples. sample shape [1,rows,cols]. */
+nmz_status nmz_dataset_load_idx(nmz_dataset **out, const char *images_path, const char *labels_path,
+                                int limit);
+/* Keep only the first n samples (n >= 1). */
+nmz_status nmz_dataset_truncate(nmz_dataset *ds, int n);
 
 /* ---------------------------------------------------------------- training */
 

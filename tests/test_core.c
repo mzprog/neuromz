@@ -192,7 +192,83 @@ static void test_csv(void) {
     CHECK(ds == NULL);
 }
 
+static void put_be32(FILE *f, unsigned v) {
+    fputc((int)(v >> 24) & 255, f);
+    fputc((int)(v >> 16) & 255, f);
+    fputc((int)(v >> 8) & 255, f);
+    fputc((int)v & 255, f);
+}
+
+static void test_idx(void) {
+    const char *pi = test_path("t-images-idx3-ubyte"), *pl = test_path("t-labels-idx1-ubyte");
+    FILE *f = fopen(pi, "wb");
+    nmz_dataset *ds = NULL;
+    int i;
+    if (!f) return;
+    put_be32(f, 0x803);
+    put_be32(f, 3); /* 3 images of 2x3 */
+    put_be32(f, 2);
+    put_be32(f, 3);
+    for (i = 0; i < 18; i++) fputc(i * 10, f);
+    fclose(f);
+    f = fopen(pl, "wb");
+    if (!f) return;
+    put_be32(f, 0x801);
+    put_be32(f, 3);
+    fputc(2, f);
+    fputc(0, f);
+    fputc(4, f);
+    fclose(f);
+    CHECK_OK(nmz_dataset_load_idx(&ds, pi, pl, 0));
+    if (ds) {
+        CHECK(ds->n_samples == 3 && ds->n_inputs == 6 && ds->n_outputs == 5 && ds->n_classes == 5);
+        CHECK(ds->sample_rank == 3 && ds->sample_shape[0] == 1 && ds->sample_shape[1] == 2 && ds->sample_shape[2] == 3);
+        CHECK(ds->x[0] == 0.0f && ds->x[7] == 70.0f && ds->x[17] == 170.0f); /* raw 0..255 */
+        CHECK(ds->y[2] == 1.0f && ds->y[5] == 1.0f && ds->y[14] == 1.0f && ds->y[0] == 0.0f);
+        CHECK(!strcmp(ds->class_names[4], "4"));
+        CHECK_OK(nmz_dataset_truncate(ds, 2));
+        CHECK(ds->n_samples == 2);
+        nmz_dataset_free(ds);
+        ds = NULL;
+    }
+    CHECK_OK(nmz_dataset_load_idx(&ds, pi, pl, 2));
+    CHECK(ds && ds->n_samples == 2);
+    nmz_dataset_free(ds);
+    ds = NULL;
+    /* wrong kinds, truncation, count mismatch */
+    CHECK_STATUS(nmz_dataset_load_idx(&ds, pl, pi, 0), NMZ_ERR_FORMAT);
+    CHECK(strstr(nmz_last_error(), "magic") != NULL);
+    f = fopen(pl, "wb");
+    if (f) {
+        put_be32(f, 0x801);
+        put_be32(f, 4);
+        fclose(f);
+    }
+    CHECK_STATUS(nmz_dataset_load_idx(&ds, pi, pl, 0), NMZ_ERR_FORMAT);
+    f = fopen(pi, "wb");
+    if (f) {
+        put_be32(f, 0x803);
+        put_be32(f, 4);
+        put_be32(f, 2);
+        put_be32(f, 2);
+        fputc(1, f);
+        fclose(f);
+    }
+    f = fopen(pl, "wb");
+    if (f) {
+        put_be32(f, 0x801);
+        put_be32(f, 4);
+        fputs("abcd", f);
+        fclose(f);
+    }
+    CHECK_STATUS(nmz_dataset_load_idx(&ds, pi, pl, 0), NMZ_ERR_FORMAT);
+    CHECK(strstr(nmz_last_error(), "truncated") != NULL);
+    CHECK_STATUS(nmz_dataset_load_idx(&ds, test_path("nope"), pl, 0), NMZ_ERR_IO);
+    CHECK(ds == NULL);
+}
+
 const test_case core_tests[] = {
+    {"core/idx_loader", test_idx},
     {"core/tensor", test_tensor},
     {"core/rng_pcg32", test_rng},
     {"core/names", test_names},
