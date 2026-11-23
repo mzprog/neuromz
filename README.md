@@ -11,8 +11,11 @@ sum, and which max-pool input "won".
 * `neuromz`: a command-line program with a beginner path and an advanced path
 * Dense, Conv2D, MaxPool2D, Flatten, Dropout layers; SGD+momentum and Adam;
   learning-rate schedules; input normalization stored with the model
+* Embedding and RNN layers (backpropagation through time inside the layer,
+  truncated BPTT with a carried hidden state, gradient clipping)
 * Trains a small CNN on MNIST to 98.8% test accuracy in about 2 minutes on a 2017
-  laptop CPU (single thread)
+  laptop CPU (single thread), and character RNNs that invent English and
+  Arabic names or write Alice-in-Wonderland-flavoured text
 * Every derivative is verified against numerical gradients; everything runs clean
   under AddressSanitizer and UndefinedBehaviorSanitizer.
 
@@ -30,7 +33,8 @@ make test       # unit tests, gradient checks, convergence tests (~1 s)
 make sanitize   # the same tests + a CLI smoke test under ASan + UBSan
 make examples   # trains XOR, XOR+AND and Iris
 make data       # downloads MNIST (~11 MB) into data/ and verifies checksums
-make bench      # slow: seed sweeps + full MNIST runs + conv benchmark
+make data-text  # downloads "Alice's Adventures in Wonderland" (151 KB) into data/
+make bench      # slow: seed sweeps, full MNIST runs, conv benchmark, character RNNs
 ```
 
 Requirements: a C11 compiler and `make` (plus `curl` or `wget` and `gunzip`
@@ -199,6 +203,140 @@ $ ./build/neuromz -m cnn.nmz show filters
   ...
 ```
 
+## Text: a character RNN
+
+A character model reads text one Unicode character at a time and learns to
+predict the next one. Names work best as one item per line: the newline is
+the "end of name" token, so the model can be asked for whole new names.
+
+```
+$ ./build/neuromz new --preset names -o names.nmz          # vocabulary from examples/names_en.txt
+Preset names: character RNN that invents names (one name per line)
+  embed 53 chars->16                       [preset]  each of the V characters gets a learned 16-number vector ...
+  rnn Tx16->Tx128          tanh            [preset]  128 hidden units carry what was written so far: h_t = tanh(x_t W_xh + h_{t-1} W_hh + b)
+  output Tx128->Tx53       softmax         [preset]  at every step: probabilities for the next character (incl. end of name)
+  ...
+  vocabulary               53 chars        [data]    from examples/names_en.txt: 36123 characters; stored in the model, ...
+  sequence length          16              [preset]  16 steps cover two or three names: enough context for one name, cheap to train
+  validation               10%             [preset]  the last part of the text is held out: train and validation loss are reported every epoch
+  clip norm                5               [preset]  if the gradient's global L2 norm exceeds this, scale it down (exploding gradients)
+  patience                 3               [preset]  stop when the validation loss has not improved for this many epochs; keep the best
+
+$ ./build/neuromz -m names.nmz train examples/names_en.txt -o names.nmz
+  epoch      1   loss 2.4637     (ppl  11.75)  val 2.4816    (ppl  11.96) *  accuracy  26.0%   lr 0.003       3.4s
+  ...
+  epoch     12   loss 1.9542     (ppl   7.06)  val 2.1124    (ppl   8.27) *  accuracy  32.6%   lr 0.003      31.2s
+  ...
+Early stop after 15 epoch(s): kept the weights of epoch 12 (best validation loss), loss 1.95418, ...
+  validation (last 10% of the data): loss 2.1124, perplexity 8.268, accuracy 32.6%
+
+$ ./build/neuromz -m names.nmz generate --count 10 --data examples/names_en.txt
+   1. Dauri
+   2. Corlerte
+   3. Shanniea
+   ...
+   9. Tamika   (in the training data)
+  10. Danyly
+```
+
+`*` marks a new best validation loss; with `--patience` training stops when
+it has not improved for that many epochs and keeps the best weights.
+`generate` options: `--prime TEXT`, `--length N`, `--temperature X` (below 1
+safer, above 1 wilder), `--top-k K`, `--seed N` (same seed, same text),
+`--count N` (distinct items), `--data FILE --new-only` (skip names that are
+already in the training data). `show vocab` lists the characters with their
+counts. The perplexity e^loss reads as "as unsure as a uniform choice among
+that many characters".
+
+**Arabic** works the same way, because tokens are code points, not bytes
+(each Arabic letter is 2 bytes of UTF-8; invalid UTF-8 is read as U+FFFD and
+reported):
+
+```
+$ ./build/neuromz new --preset names --data examples/names_ar.txt -o ar.nmz
+$ ./build/neuromz -m ar.nmz train examples/names_ar.txt -o ar.nmz
+$ ./build/neuromz -m ar.nmz generate --count 10
+```
+
+> Terminals differ in how they display right-to-left text: some shape and
+> order Arabic correctly, others show isolated letters or reverse the order.
+> NeuroMZ prints the characters in logical order as UTF-8; where the trace
+> prints one character per column you see the isolated letter forms the
+> model actually works with. `--ascii` prints code points (`U+0645`) instead.
+
+**Running text** uses the hidden state across batches (truncated
+backpropagation through time):
+
+```
+$ make data-text
+$ ./build/neuromz new --preset char-rnn -o alice.nmz         # embed:32 rnn:128 vocab, 64-step windows, state carried
+$ ./build/neuromz -m alice.nmz train data/alice.txt -o alice.nmz
+$ ./build/neuromz -m alice.nmz generate --prime "Alice " --length 300 --temperature 0.7
+```
+
+Advanced text models use the same spec style: `new text embed:32 rnn:256
+vocab --data FILE --seq-len 100 --carry --clip 1 --patience 5 --val 0.05`.
+
+### Trace a sequence: recurrence and BPTT, step by step
+
+`trace --text TEXT` (or `--sample N --data FILE`) runs one sequence through
+the net and prints it unrolled through time — for one hidden unit
+(`--unit J`; by default the one that changes most) every term of
+h_t = tanh(x_t·W_xh + h_{t−1}·W_hh + b), and the next-character
+probabilities:
+
+```
+$ ./build/neuromz -m names.nmz trace --text "Christopher"
+RNN UNROLLED THROUGH TIME   the same weights at every step; h carries the past forward
+  h_t = tanh(x_t·W_xh + h_{t-1}·W_hh + b)      shown for hidden unit j = 72 of 128 (the unit that changes most here; ...)
+  x_t = e_t (from the embedding), h_{-1} = 0
+
+  t=0   input C    h_t[72] = tanh(1.3162 + 0.0000 + 0.1901) = tanh(1.5063) = 0.9063
+         x_t·W_xh[:,j]   h_{t-1}·W_hh[:,j]   b[j]
+        next: a     32.6% ██████████
+              h     18.9% ██████   <- target
+              l     17.1% █████
+              o     13.5% ████
+              e      4.4% █
+        target h: p = 0.1892, loss -log p = 1.6649
+
+  t=1   input h    h_t[72] = tanh(0.9507 + 0.4411 + 0.1901) = tanh(1.5819) = 0.9189
+  ...
+HIDDEN STATE OVER TIME   rows = hidden units, columns = time steps
+  ' ' = -1 ... '+' = 0 ... '@' = +1   (tanh range)
+         Christophe
+      1 %@@@@@@@@@
+      2 -@@@%%+:#*
+      3 %@@@@@@%%@
+  ...
+```
+
+The backward part shows backpropagation through time — how the gradient for
+h_t is assembled from the output at t and from step t+1, shrunk by tanh′, and
+passed back — and then the key picture: the gradient of the **last**
+character's loss alone, followed back through time:
+
+```
+VANISHING / EXPLODING GRADIENTS   the loss of the LAST character only, followed back in time
+  t=9    e         0.1557           ████████████████████████████████████
+  t=8    h         0.1597   x1.026  ████████████████████████████████████
+  t=7    p         0.1374   x0.860  ██████████████████████████████████
+  t=6    o         0.1107   x0.806  ██████████████████████████████
+  ...
+  t=1    h         0.0368   x0.874  █████████████
+  t=0    C         0.0264   x0.718  ████████
+
+  bars: log scale over 1.0 decade(s). On average each step back multiplies the gradient by 0.821;
+  after 9 steps only 0.17 of it is left: a VANISHING gradient. A vanilla RNN therefore learns
+  short-range patterns easily and long-range ones hardly at all - the problem LSTMs fix
+  with an additive cell state.
+```
+
+On a 64-character window of Alice the same view ends with "after 47 steps
+only 0.00018 of it is left". The trace then shows the gradient clipping
+decision (`global gradient norm 4.53 <= clip 5 -> unchanged`) and the Adam
+update for every weight. `step` applies it.
+
 ## The advanced path
 
 Every layer is one argument, every training knob is an option. What you set
@@ -223,7 +361,10 @@ is marked `[yours]`; the rest is still explained.
 | optimizer | `--optimizer sgd` (`--momentum`) or `adam` (`--beta1 --beta2 --eps`), `--lr` |
 | schedule | `--schedule constant\|step\|cosine`, `--step-size N --gamma X`, `--min-lr X` |
 | data | `--normalize none\|minmax\|zscore` (fitted at the first `train`, saved) |
+| text | input `text` with `--data FILE` (vocabulary), `embed:D`, `rnn:H`, `vocab[:ACT]` (one output per character); `--items`/`--no-items` |
 | training | `--batch`, `--epochs`, `--target-loss`, `--no-shuffle`, `--seed` |
+| validation, stopping | `--val FRACTION` (the last part of the data is held out), `--patience N` (early stopping, keeps the best weights) |
+| recurrent | `--seq-len N` (BPTT window), `--carry`/`--no-carry` (hidden state carried between batches), `--clip NORM` |
 
 * `train DATA [options]` overrides the stored settings for one run;
   `set --optimizer adam --lr 0.001 ...` changes the settings saved with the model.
@@ -399,6 +540,41 @@ products; the default). Both pass the same gradient checks and agree to
 With `-O2` instead of `-O3` im2col was only ~1.1× faster: GCC 12's `-O2` does
 not vectorise the inner loops, so `-O3` is now the default (DESIGN decision 46).
 
+**Character RNNs** (`sh examples/benchmark_text.sh`): the presets, seed 42,
+same machine; the validation split is the last 10 % of each text, early
+stopping with patience 3.
+
+| model | data | parameters | stopped / best epoch | validation loss (nats/char) | perplexity | next-char accuracy | training time |
+|---|---|---|---|---|---|---|---|
+| `--preset names` (embed 16, rnn 128) | 5163 English names, 36 k chars | 26 245 | 15 / 12 | 2.112 | 8.27 | 32.6% | 31 s |
+| `--preset names --data examples/names_ar.txt` | 504 Arabic names, 2.7 k chars | 23 925 | 18 / 15 | 2.655 | 14.22 | 28.9% | 3 s |
+| `--preset char-rnn` (embed 32, rnn 128, carried state) | Alice, 145 k chars | 32 683 | 16 / 13 | 1.634 | 5.12 | 53.9% | 155 s |
+
+Generated with `--seed 1` (unedited):
+
+* **English names**: Dauri, Corlerte, Shanniea, Rananda, Elexie, Kathalle,
+  Sasely, Irbin, Tamika *(in the training data)*, Danyly.
+* **Arabic names**: رامى، حهيد، نسدة، ماسة، سححير، طالح، ناوب، ششام، نؤة، راريءف
+* **Alice** (`--prime "Alice " --length 300 --temperature 0.7`):
+
+  > Alice said to Alice, as she had not quite all the ever, and said this was
+  > the Queen’s be a throat for a serpeation and said, “Soupan. “Fithouted the
+  > other she went on, “treat is again, so she had see in a trying and more
+  > that she said would be in say?” the Hatter upoomester.
+
+Honest assessment: the **English names** are pronounceable and mostly look
+like plausible names (Shanniea, Rananda, Elexie, Kathalle); a few are odd
+(Corlerte). The **Arabic names** are mixed: ماسة is a real given name and رامى
+a common spelling variant of رامي; نسدة and ناوب follow Arabic letter
+patterns but are not names; طالح is a real word but not a name (it is the opposite of the name
+صالح, which the model has seen); حهيد, ششام, راريءف break Arabic spelling
+habits. That is about what 504 training names allow — the model starts to
+overfit after ~15 epochs. The **Alice** text has the book's
+style — real words, quotes, punctuation, "said the Hatter", line breaks — but
+no grammar or meaning beyond a few words: what a 128-unit vanilla RNN
+trained for 2.5 minutes on 145 k characters can do. The vanishing gradient
+shown above is the main limit; an LSTM is the next step.
+
 **Small datasets** (`sh examples/benchmark.sh ./build/neuromz 20`, seeds 1–20,
 defaults unless shown). Iris: 120 training rows, accuracy on the 30 held-out
 rows of `examples/iris_test.csv`.
@@ -420,7 +596,7 @@ MSE, 0.07 for cross-entropy) before 5000 epochs.
 
 ## Tests
 
-`make test` runs 42 tests (~105 000 checks) in about a second:
+`make test` runs 57 tests (~105 000 checks) in a few seconds:
 
 * **numerical gradient checks** for Dense, every activation (incl. the softmax
   Jacobian), MSE, fused softmax+cross-entropy, a deep mixed network, batch
@@ -436,11 +612,25 @@ MSE, 0.07 for cross-entropy) before 5000 epochs.
   detection, seeded dropout masks;
 * model files: round trip, little-endian layout, checksum/truncation, **a real
   format-2 file from phase 1 still loads**, unknown sections are skipped;
+* **sequences**: gradient checks for the RNN over 5 steps (incl. input
+  gradients), embed → rnn → per-step dense → softmax/CE, a loss on the last
+  step only (so earlier gradients can only arrive through h_{t−1}), and the
+  RNN with a carried state h₀ ≠ 0; the RNN against hand-computed BPTT; the
+  sparse embedding gradient with exact (dense) Adam; gradient clipping;
+  learning a repeating text with and without carried state; validation
+  splits for text and tabular data; early stopping restores the best epoch;
+* **text**: UTF-8 with Arabic and 4-byte characters and every class of
+  invalid sequence, vocabulary order/counts, line-per-item normalisation,
+  the vocabulary round trip through save/load, deterministic generation
+  (seed, greedy top-1, temperature), an Arabic model generating valid UTF-8,
+  and **a format-3 file from phase 2 (without the new sections) still loads**;
 * CSV and IDX parsing errors; every API entry point with `NULL`/bad input.
 
-`make sanitize` runs all of that plus `tests/cli_smoke.sh` (102 CLI cases,
-including image layers on a generated dataset, no-network commands, malformed
-input, a 300 KB line and random binary input, and MNIST when present) under
+`make sanitize` runs all of that plus `tests/cli_smoke.sh` (130 CLI cases,
+including image layers on a generated dataset, English and Arabic name
+models, generation determinism, traces in UTF-8 and ASCII, invalid UTF-8,
+no-network commands, malformed input, a 300 KB line and random binary input,
+and MNIST and Alice when present) under
 ASan + UBSan with leak detection. The slow benchmarks are in `make bench`.
 
 ## Layout
@@ -449,18 +639,21 @@ ASan + UBSan with leak detection. The slow benchmarks are in `make bench`.
 include/neuromz.h        public API          src/        libneuromz (portable C11)
 include/neuromz_layer.h  layer-author API    cli/        the neuromz program
 docs/DESIGN.md           design + decisions  tests/      test suite + CLI smoke test
-examples/                data, C demo, benchmarks        scripts/    MNIST download
-legacy/                  v1 (2017–2020)      data/       MNIST (downloaded, gitignored)
+examples/                data, C demo, benchmarks        scripts/    MNIST / text download
+legacy/                  v1 (2017–2020)      data/       MNIST, Alice (downloaded, gitignored)
 ```
 
+Dataset sources and licenses: [`examples/DATASETS.md`](examples/DATASETS.md).
+
 Model files (`.nmz`) use a portable little-endian format with a magic number,
-version, optional sections (normalization, optimizer state) and CRC-32 (see
-DESIGN §7).
+version, optional sections (normalization, optimizer state, vocabulary,
+text-training settings) and CRC-32 (see DESIGN §7).
 
 ## Roadmap
 
 Done: dense networks (phase 1); convolution, pooling, dropout, Adam,
-schedules, normalization and MNIST (phase 2). The data model is shaped for
-what comes next (DESIGN §3): a character-level RNN and LSTM (backpropagation
-through time inside the layer), embeddings, and a tiny Transformer trained on
-text; then a GUI that consumes the trace events.
+schedules, normalization and MNIST (phase 2); text, embeddings, a vanilla RNN
+with truncated BPTT, clipping, validation/early stopping and generation
+(phase 3). Next: an LSTM layer — DESIGN §3.1 describes how it plugs in with no
+engine change — then a tiny Transformer trained on text, and a GUI that
+consumes the trace events.
