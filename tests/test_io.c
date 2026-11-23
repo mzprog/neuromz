@@ -116,7 +116,7 @@ static void test_byte_layout(void) {
     CHECK(b != NULL && n > 40);
     if (b) {
         CHECK(memcmp(b, magic, 8) == 0);
-        CHECK(b[8] == 2 && b[9] == 0 && b[10] == 0 && b[11] == 0); /* version 2, little-endian */
+        CHECK(b[8] == 3 && b[9] == 0 && b[10] == 0 && b[11] == 0); /* version 3, little-endian */
         CHECK(b[16] == 1 && b[20] == 4);                            /* input rank 1, size 4    */
         free(b);
     }
@@ -165,7 +165,7 @@ static void test_corruption(void) {
     spit(q, (const unsigned char *)"hello world, not a model", 24);
     CHECK_STATUS(nmz_net_load(&b, q), NMZ_ERR_FORMAT);
     /* future version */
-    buf[8] = 3;
+    buf[8] = 99;
     spit(q, buf, n);
     CHECK_STATUS(nmz_net_load(&b, q), NMZ_ERR_FORMAT);
     CHECK(strstr(nmz_last_error(), "version") != NULL);

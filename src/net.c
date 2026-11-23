@@ -82,6 +82,14 @@ nmz_train_opts nmz_train_defaults(void) {
     o.momentum = 0.9f;
     o.shuffle = 1;
     o.target_loss = 1e-3;
+    o.optimizer = NMZ_OPT_SGD;
+    o.beta1 = 0.9f;
+    o.beta2 = 0.999f;
+    o.epsilon = 1e-8f;
+    o.schedule = NMZ_SCHED_CONSTANT;
+    o.step_size = 10;
+    o.gamma = 0.5f;
+    o.min_lr = 0.0f;
     return o;
 }
 
@@ -101,6 +109,7 @@ nmz_status nmz_net_create(nmz_net **out, int input_rank, const int *input_shape,
     for (i = 0; i < input_rank; i++) net->in_shape[i] = input_shape[i];
     net->loss = NMZ_LOSS_MSE;
     net->train = nmz_train_defaults();
+    net->opt_kind = -1;
     nmz_rng_seed(&net->rng, seed, 0x4e4d5aULL /* "NMZ" stream */);
     *out = net;
     return NMZ_OK;
@@ -112,13 +121,16 @@ static void free_buffers(nmz_net *net) {
         for (i = 0; i <= net->n_layers; i++) nmz_tensor_free(&net->acts[i]);
     if (net->dacts)
         for (i = 0; i <= net->n_layers; i++) nmz_tensor_free(&net->dacts[i]);
-    if (net->velocity)
-        for (i = 0; i < net->n_params; i++) nmz_tensor_free(&net->velocity[i]);
+    for (i = 0; i < net->n_params; i++) {
+        if (net->opt_m) nmz_tensor_free(&net->opt_m[i]);
+        if (net->opt_v) nmz_tensor_free(&net->opt_v[i]);
+    }
     free(net->acts);
     free(net->dacts);
-    free(net->velocity);
+    free(net->opt_m);
+    free(net->opt_v);
     free(net->param_refs);
-    net->acts = net->dacts = net->velocity = NULL;
+    net->acts = net->dacts = net->opt_m = net->opt_v = NULL;
     net->param_refs = NULL;
     net->n_params = 0;
 }
@@ -131,7 +143,8 @@ void nmz_net_free(nmz_net *net) {
     free(net->layers);
     for (i = 0; i < net->n_classes; i++) free(net->class_names[i]);
     free(net->class_names);
-    nmz_tensor_free(&net->scratch);
+    for (i = 0; i < 6; i++) nmz_tensor_free(&net->scratch[i]);
+    nmz__norm_free(net);
     nmz_tensor_free(&net->in1);
     nmz_tensor_free(&net->out1);
     free(net);
@@ -218,8 +231,9 @@ nmz_status nmz__net_finish_build(nmz_net *net) {
     for (i = 0; i < net->n_layers; i++) net->n_params += nmz_layer_param_count(net->layers[i]);
     if (net->n_params > 0) {
         net->param_refs = calloc((size_t)net->n_params, sizeof *net->param_refs);
-        net->velocity = calloc((size_t)net->n_params, sizeof *net->velocity);
-        if (!net->param_refs || !net->velocity) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+        net->opt_m = calloc((size_t)net->n_params, sizeof *net->opt_m);
+        net->opt_v = calloc((size_t)net->n_params, sizeof *net->opt_v);
+        if (!net->param_refs || !net->opt_m || !net->opt_v) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
     }
     for (i = 0, k = 0; i < net->n_layers; i++) {
         int np = nmz_layer_param_count(net->layers[i]);
@@ -227,7 +241,8 @@ nmz_status nmz__net_finish_build(nmz_net *net) {
             nmz_tensor *v = nmz_layer_param_value(net->layers[i], j);
             net->param_refs[k].layer = i;
             net->param_refs[k].index = j;
-            if ((s = nmz_tensor_init(&net->velocity[k], v->rank, v->shape)) != NMZ_OK) return s;
+            if ((s = nmz_tensor_init(&net->opt_m[k], v->rank, v->shape)) != NMZ_OK) return s;
+            if ((s = nmz_tensor_init(&net->opt_v[k], v->rank, v->shape)) != NMZ_OK) return s;
         }
     }
     net->built = 1;
@@ -242,7 +257,12 @@ static nmz_status init_all_params(nmz_net *net) {
         nmz_status s = net->layers[i]->ops->init_params(net->layers[i], &net->rng, next);
         if (s != NMZ_OK) return s;
     }
-    for (i = 0; i < net->n_params; i++) nmz_tensor_zero(&net->velocity[i]);
+    for (i = 0; i < net->n_params; i++) {
+        nmz_tensor_zero(&net->opt_m[i]);
+        nmz_tensor_zero(&net->opt_v[i]);
+    }
+    net->opt_kind = -1;
+    net->opt_t = 0;
     return NMZ_OK;
 }
 
@@ -393,6 +413,27 @@ nmz_status nmz__net_forward(nmz_net *net, const nmz_tensor *x, int training,
                          nmz_net_input_size(net), x->rank >= 1 ? (int)(x->size / (size_t)x->shape[0]) : 0);
     net->have_forward = net->have_grads = 0;
     if ((s = nmz_tensor_copy(&net->acts[0], x)) != NMZ_OK) return s;
+    if (net->norm != NMZ_NORM_NONE) {
+        if (!net->norm_fitted)
+            return nmz__fail(NMZ_ERR_STATE, "input normalization (%s) is not fitted yet: train the network first "
+                                            "(or call nmz_net_fit_normalization)", nmz_norm_name(net->norm));
+        nmz__norm_apply(net, &net->acts[0]);
+        if (net->trace) {
+            nmz_ctx ctx = make_ctx_step(net, -1, training, net->step + 1);
+            nmz_tensor off, sc;
+            memset(&off, 0, sizeof off);
+            off.rank = 1;
+            off.shape[0] = net->norm_groups;
+            off.size = off.capacity = (size_t)net->norm_groups;
+            sc = off;
+            off.data = net->norm_offset; /* views, never freed */
+            sc.data = net->norm_scale;
+            {
+                nmz_trace_item it[4] = {{"x", x}, {"offset", &off}, {"scale", &sc}, {"x_norm", &net->acts[0]}};
+                nmz_trace_emit(&ctx, NMZ_TRACE_FORWARD, "normalize", nmz_norm_name(net->norm), 0, NULL, 4, it);
+            }
+        }
+    }
     for (i = 0; i < net->n_layers; i++) {
         nmz_layer *l = net->layers[i];
         nmz_ctx ctx = make_ctx_step(net, i, training, net->step + 1);
@@ -495,59 +536,172 @@ nmz_status nmz_net_backward(nmz_net *net, const nmz_tensor *t, double *loss) {
         s = l->ops->backward(l, &net->acts[i], &net->acts[i + 1], &net->dacts[i + 1], &net->dacts[i], &ctx);
         if (s != NMZ_OK) return s;
     }
+    nmz__norm_scale_grad(net, &net->dacts[0]); /* ∂L/∂(raw input) */
     net->have_grads = 1;
     if (loss) *loss = L;
     if (!isfinite(L)) return nmz__fail(NMZ_ERR_NUMERIC, "loss became %g (try a smaller learning rate)", L);
     return NMZ_OK;
 }
 
-/* v ← μ·v − η·g ; w ← w + v. With apply == 0 only the trace events are
- * produced (delta computed into scratch; nothing is modified). */
-static nmz_status update_impl(nmz_net *net, float learning_rate, float momentum, int apply) {
-    int k;
-    size_t e;
+/* --------------------------------------------------------------- optimizers
+ *
+ * SGD + momentum:  v ← μ·v − η·g ;  w ← w + v
+ * Adam:            t ← t + 1
+ *                  m ← β1·m + (1−β1)·g        v ← β2·v + (1−β2)·g²
+ *                  m̂ = m/(1−β1^t)             v̂ = v/(1−β2^t)      (bias correction)
+ *                  w ← w − η·m̂/(√v̂ + ε)
+ * With apply == 0 ("preview") the same numbers are computed into scratch
+ * tensors and traced; weights and optimizer state stay untouched. */
+
+/* fresh: treat the stored state as zero (preview after an optimizer switch) */
+static nmz_status sgd_param(nmz_net *net, int k, float lr, float mu, int apply, int fresh) {
+    nmz_layer *l = net->layers[net->param_refs[k].layer];
+    int pi = net->param_refs[k].index;
+    nmz_tensor *w = nmz_layer_param_value(l, pi), *g = nmz_layer_param_grad(l, pi);
+    nmz_tensor *v = &net->opt_m[k], *v_new = v;
+    const nmz_tensor *v_prev = v;
     nmz_status s;
-    if (!net) return nmz__fail(NMZ_ERR_ARG, "net is NULL");
-    if (!net->built) return nmz__fail(NMZ_ERR_STATE, "network is not built");
-    if (!(learning_rate > 0.0f) || !isfinite(learning_rate))
-        return nmz__fail(NMZ_ERR_ARG, "learning rate must be > 0");
-    if (!(momentum >= 0.0f && momentum < 1.0f)) return nmz__fail(NMZ_ERR_ARG, "momentum must be in [0, 1)");
-    if (!apply && !net->trace) return NMZ_OK;
-    for (k = 0; k < net->n_params; k++) {
-        nmz_layer *l = net->layers[net->param_refs[k].layer];
-        int pi = net->param_refs[k].index;
-        nmz_tensor *w = nmz_layer_param_value(l, pi), *g = nmz_layer_param_grad(l, pi);
-        nmz_tensor *v = &net->velocity[k], *v_new = v;
-        const nmz_tensor *v_prev = v;
-        if (!w || !g) return nmz__fail(NMZ_ERR_STATE, "layer %d returned no parameter %d", net->param_refs[k].layer, pi);
-        if (net->trace) {
-            /* keep a copy of the old velocity (apply) or compute the new one aside (preview) */
-            if ((s = nmz_tensor_copy(&net->scratch, v)) != NMZ_OK) return s;
-            if (apply)
-                v_prev = &net->scratch;
-            else
-                v_new = &net->scratch;
-        }
-        for (e = 0; e < w->size; e++) v_new->data[e] = momentum * v_prev->data[e] - learning_rate * g->data[e];
-        if (net->trace) {
-            nmz_ctx ctx = make_ctx(net, net->param_refs[k].layer, 1);
-            nmz_trace_scalar sc[2] = {{"lr", learning_rate}, {"momentum", momentum}};
-            nmz_trace_item it[4] = {{"value", w}, {"grad", g}, {"velocity_prev", v_prev}, {"delta", v_new}};
-            nmz_trace_emit(&ctx, NMZ_TRACE_UPDATE, nmz_layer_type(l), nmz_layer_param_name(l, pi), 2, sc, 4, it);
-        }
+    size_t e;
+    if (!w || !g) return nmz__fail(NMZ_ERR_STATE, "layer %d returned no parameter %d", net->param_refs[k].layer, pi);
+    if (net->trace) {
+        /* keep a copy of the old velocity (apply) or compute the new one aside (preview) */
+        if ((s = nmz_tensor_copy(&net->scratch[0], v)) != NMZ_OK) return s;
+        if (fresh) nmz_tensor_zero(&net->scratch[0]);
         if (apply)
-            for (e = 0; e < w->size; e++) w->data[e] += v->data[e];
+            v_prev = &net->scratch[0];
+        else
+            v_new = &net->scratch[0];
     }
-    if (apply) net->have_forward = 0; /* cached activations no longer match the weights */
+    for (e = 0; e < w->size; e++) v_new->data[e] = (fresh ? 0.0f : mu * v_prev->data[e]) - lr * g->data[e];
+    if (net->trace) {
+        nmz_ctx ctx = make_ctx(net, net->param_refs[k].layer, 1);
+        nmz_trace_scalar sc[2] = {{"lr", lr}, {"momentum", mu}};
+        nmz_trace_item it[4] = {{"value", w}, {"grad", g}, {"velocity_prev", v_prev}, {"delta", v_new}};
+        nmz_trace_emit(&ctx, NMZ_TRACE_UPDATE, nmz_layer_type(l), nmz_layer_param_name(l, pi), 2, sc, 4, it);
+    }
+    if (apply)
+        for (e = 0; e < w->size; e++) w->data[e] += v->data[e];
     return NMZ_OK;
 }
 
+static nmz_status adam_param(nmz_net *net, int k, const nmz_train_opts *o, float lr, long t, int apply,
+                             int fresh) {
+    nmz_layer *l = net->layers[net->param_refs[k].layer];
+    int pi = net->param_refs[k].index, j;
+    nmz_tensor *w = nmz_layer_param_value(l, pi), *g = nmz_layer_param_grad(l, pi);
+    nmz_tensor *m = &net->opt_m[k], *v = &net->opt_v[k];
+    const double b1 = o->beta1, b2 = o->beta2, eps = o->epsilon;
+    const double bc1 = 1.0 - pow(b1, (double)t), bc2 = 1.0 - pow(b2, (double)t);
+    nmz_status s;
+    size_t e;
+    if (!w || !g) return nmz__fail(NMZ_ERR_STATE, "layer %d returned no parameter %d", net->param_refs[k].layer, pi);
+    if (!net->trace) {
+        if (!apply) return NMZ_OK;
+        for (e = 0; e < w->size; e++) { /* fast path: in place */
+            double gi = g->data[e];
+            double mi = b1 * m->data[e] + (1.0 - b1) * gi, vi = b2 * v->data[e] + (1.0 - b2) * gi * gi;
+            m->data[e] = (float)mi;
+            v->data[e] = (float)vi;
+            w->data[e] += (float)(-lr * (mi / bc1) / (sqrt(vi / bc2) + eps));
+        }
+        return NMZ_OK;
+    }
+    /* traced (or preview): compute m, v, m̂, v̂, Δ aside, emit, then apply */
+    for (j = 0; j < 5; j++)
+        if ((s = nmz_tensor_reshape(&net->scratch[j], w->rank, w->shape)) != NMZ_OK) return s;
+    for (e = 0; e < w->size; e++) {
+        double gi = g->data[e], m0 = fresh ? 0.0 : m->data[e], v0 = fresh ? 0.0 : v->data[e];
+        double mi = b1 * m0 + (1.0 - b1) * gi, vi = b2 * v0 + (1.0 - b2) * gi * gi;
+        double mhat = mi / bc1, vhat = vi / bc2;
+        net->scratch[0].data[e] = (float)mi;
+        net->scratch[1].data[e] = (float)vi;
+        net->scratch[2].data[e] = (float)mhat;
+        net->scratch[3].data[e] = (float)vhat;
+        net->scratch[4].data[e] = (float)(-lr * mhat / (sqrt(vhat) + eps));
+    }
+    {
+        nmz_ctx ctx = make_ctx(net, net->param_refs[k].layer, 1);
+        nmz_trace_scalar sc[5] = {{"lr", lr}, {"beta1", b1}, {"beta2", b2}, {"epsilon", eps}, {"t", (double)t}};
+        nmz_trace_item it[7] = {{"value", w},         {"grad", g},           {"m", &net->scratch[0]},
+                                {"v", &net->scratch[1]}, {"m_hat", &net->scratch[2]}, {"v_hat", &net->scratch[3]},
+                                {"delta", &net->scratch[4]}};
+        nmz_trace_emit(&ctx, NMZ_TRACE_UPDATE, nmz_layer_type(l), nmz_layer_param_name(l, pi), 5, sc, 7, it);
+    }
+    if (apply)
+        for (e = 0; e < w->size; e++) {
+            m->data[e] = net->scratch[0].data[e];
+            v->data[e] = net->scratch[1].data[e];
+            w->data[e] += net->scratch[4].data[e];
+        }
+    return NMZ_OK;
+}
+
+static nmz_status optimize(nmz_net *net, const nmz_train_opts *o, float lr, int apply) {
+    int k, fresh;
+    long t;
+    nmz_status s;
+    if (!net || !o) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
+    if (!net->built) return nmz__fail(NMZ_ERR_STATE, "network is not built");
+    if (!(lr > 0.0f) || !isfinite(lr)) return nmz__fail(NMZ_ERR_ARG, "learning rate must be > 0");
+    if ((int)o->optimizer < 0 || o->optimizer >= NMZ_OPT_COUNT) return nmz__fail(NMZ_ERR_ARG, "invalid optimizer");
+    if (o->optimizer == NMZ_OPT_SGD && !(o->momentum >= 0.0f && o->momentum < 1.0f))
+        return nmz__fail(NMZ_ERR_ARG, "momentum must be in [0, 1)");
+    if (o->optimizer == NMZ_OPT_ADAM && !(o->beta1 >= 0.0f && o->beta1 < 1.0f && o->beta2 >= 0.0f &&
+                                          o->beta2 < 1.0f && o->epsilon > 0.0f))
+        return nmz__fail(NMZ_ERR_ARG, "Adam needs 0 <= beta1, beta2 < 1 and epsilon > 0");
+    if (!apply && !net->trace) return NMZ_OK;
+    fresh = net->opt_kind != (int)o->optimizer;
+    if (fresh && apply) {
+        /* the stored state belongs to another optimizer (or none): start over */
+        for (k = 0; k < net->n_params; k++) {
+            nmz_tensor_zero(&net->opt_m[k]);
+            nmz_tensor_zero(&net->opt_v[k]);
+        }
+        net->opt_t = 0;
+        net->opt_kind = (int)o->optimizer;
+        fresh = 0; /* the state is now genuinely zero */
+    }
+    t = (fresh ? 0 : net->opt_t) + 1;
+    for (k = 0; k < net->n_params; k++) {
+        s = o->optimizer == NMZ_OPT_ADAM ? adam_param(net, k, o, lr, t, apply, fresh)
+                                         : sgd_param(net, k, lr, o->momentum, apply, fresh);
+        if (s != NMZ_OK) return s;
+    }
+    if (apply) {
+        if (o->optimizer == NMZ_OPT_ADAM) net->opt_t = t;
+        net->have_forward = 0; /* cached activations no longer match the weights */
+    }
+    return NMZ_OK;
+}
+
+nmz_status nmz_net_optimizer_step(nmz_net *net, const nmz_train_opts *o, float learning_rate) {
+    return optimize(net, o, learning_rate, 1);
+}
+
+nmz_status nmz_net_optimizer_preview(nmz_net *net, const nmz_train_opts *o, float learning_rate) {
+    return optimize(net, o, learning_rate, 0);
+}
+
+static nmz_train_opts sgd_opts(float momentum) {
+    nmz_train_opts o = nmz_train_defaults();
+    o.optimizer = NMZ_OPT_SGD;
+    o.momentum = momentum;
+    return o;
+}
+
 nmz_status nmz_net_update(nmz_net *net, float learning_rate, float momentum) {
-    return update_impl(net, learning_rate, momentum, 1);
+    nmz_train_opts o = sgd_opts(momentum);
+    return optimize(net, &o, learning_rate, 1);
 }
 
 nmz_status nmz_net_preview_update(nmz_net *net, float learning_rate, float momentum) {
-    return update_impl(net, learning_rate, momentum, 0);
+    nmz_train_opts o = sgd_opts(momentum);
+    return optimize(net, &o, learning_rate, 0);
+}
+
+int nmz_net_optimizer_state(const nmz_net *net, long *t) {
+    if (t) *t = net ? net->opt_t : 0;
+    return net ? net->opt_kind : -1;
 }
 
 /* -------------------------------------------------------------- summary */

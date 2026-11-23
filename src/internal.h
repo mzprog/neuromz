@@ -77,8 +77,18 @@ struct nmz_net {
 
     int n_params; /* parameter tensors (not scalars) */
     nmz__param_ref *param_refs;
-    nmz_tensor *velocity; /* one per parameter tensor */
-    nmz_tensor scratch;   /* trace copies (velocity_prev) */
+    /* optimizer state, one pair per parameter tensor:
+     * SGD: opt_m = velocity ; Adam: opt_m = first moment, opt_v = second */
+    nmz_tensor *opt_m, *opt_v;
+    int opt_kind; /* nmz_optimizer the state belongs to, -1 = none yet */
+    long opt_t;   /* Adam step counter */
+    nmz_tensor scratch[6]; /* trace-only temporaries */
+
+    /* input normalization (DESIGN decision 34) */
+    nmz_norm norm;
+    int norm_fitted;
+    int norm_groups;
+    float *norm_offset, *norm_scale;
     nmz_tensor in1, out1; /* predict() single-sample buffers */
 
     nmz_loss loss;
@@ -104,9 +114,20 @@ int nmz__net_fused_ce_possible(const nmz_net *net);
 /* Forward with explicit training flag. */
 nmz_status nmz__net_forward(nmz_net *net, const nmz_tensor *x, int training,
                             const nmz_tensor **y);
-/* Allocate velocity etc. after layers exist and params are allocated. */
+/* Allocate optimizer state etc. after layers exist and params are allocated. */
 nmz_status nmz__net_finish_build(nmz_net *net);
 nmz_status nmz__net_check_dataset(const nmz_net *net, const nmz_dataset *ds);
 nmz_status nmz__train_opts_validate(const nmz_train_opts *o);
+
+/* normalize.c */
+int nmz__norm_group_count(const nmz_net *net);
+/* group of element e (0-based within one sample) */
+int nmz__norm_group_of(const nmz_net *net, size_t e);
+/* x' = (x − offset)·scale over a batch tensor (in place) */
+void nmz__norm_apply(const nmz_net *net, nmz_tensor *t);
+/* g_raw = g_norm · scale (in place), for ∂L/∂input */
+void nmz__norm_scale_grad(const nmz_net *net, nmz_tensor *g);
+nmz_status nmz__norm_alloc(nmz_net *net, int groups);
+void nmz__norm_free(nmz_net *net);
 
 #endif

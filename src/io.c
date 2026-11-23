@@ -13,7 +13,8 @@
 typedef char nmz_static_assert_float[(sizeof(float) == 4 && FLT_MANT_DIG == 24) ? 1 : -1];
 typedef char nmz_static_assert_double[(sizeof(double) == 8 && DBL_MANT_DIG == 53) ? 1 : -1];
 
-#define NMZ_FORMAT_VERSION 2u
+#define NMZ_FORMAT_VERSION 3u  /* written; 2 and 3 are read */
+#define NMZ_MAX_SECTIONS 64u
 #define NMZ_MAX_STRING 4096u
 #define NMZ_MAX_LAYERS 100000u
 #define NMZ_MAX_CLASSES 100000u
@@ -176,7 +177,43 @@ const nmz_layer_ops *nmz_layer_ops_find(const char *type) {
 
 /* ------------------------------------------------------------------- save */
 
-static nmz_status save_body(nmz_net *net, nmz_writer *w) {
+/* ------------------------------------------------- optional sections (format 3)
+ * u32 count, then per section: string tag, u32 byte length, bytes.
+ * Readers skip tags they do not know, so new sections never break old files. */
+
+static void sec_normalize(nmz_net *net, nmz_writer *w) {
+    int g;
+    nmz_write_u32(w, (uint32_t)net->norm);
+    nmz_write_u32(w, (uint32_t)net->norm_fitted);
+    nmz_write_u32(w, (uint32_t)(net->norm_fitted ? net->norm_groups : 0));
+    for (g = 0; net->norm_fitted && g < net->norm_groups; g++) nmz_write_f32(w, net->norm_offset[g]);
+    for (g = 0; net->norm_fitted && g < net->norm_groups; g++) nmz_write_f32(w, net->norm_scale[g]);
+}
+
+static void sec_optimizer(nmz_net *net, nmz_writer *w) {
+    int k;
+    size_t e;
+    nmz_write_u32(w, (uint32_t)net->opt_kind);
+    write_u64(w, (uint64_t)net->opt_t);
+    nmz_write_u32(w, (uint32_t)net->n_params);
+    for (k = 0; k < net->n_params; k++) {
+        nmz_write_u32(w, (uint32_t)net->opt_m[k].size);
+        for (e = 0; e < net->opt_m[k].size; e++) nmz_write_f32(w, net->opt_m[k].data[e]);
+        if (net->opt_kind == NMZ_OPT_ADAM)
+            for (e = 0; e < net->opt_v[k].size; e++) nmz_write_f32(w, net->opt_v[k].data[e]);
+    }
+}
+
+static void write_section(nmz_net *net, nmz_writer *w, const char *tag, void (*fn)(nmz_net *, nmz_writer *)) {
+    writer_ext counter;
+    memset(&counter, 0, sizeof counter);
+    fn(net, &counter.w); /* measure */
+    write_str(w, tag);
+    nmz_write_u32(w, (uint32_t)counter.count);
+    fn(net, w);
+}
+
+static nmz_status save_body(nmz_net *net, nmz_writer *w, unsigned flags) {
     int i, j, d;
     size_t e;
     const nmz_train_opts *o = &net->train;
@@ -195,6 +232,15 @@ static nmz_status save_body(nmz_net *net, nmz_writer *w) {
     nmz_write_f32(w, o->momentum);
     nmz_write_u32(w, (uint32_t)(o->shuffle != 0));
     nmz_write_f64(w, o->target_loss);
+    /* format 3: optimizer and schedule */
+    nmz_write_u32(w, (uint32_t)o->optimizer);
+    nmz_write_f32(w, o->beta1);
+    nmz_write_f32(w, o->beta2);
+    nmz_write_f32(w, o->epsilon);
+    nmz_write_u32(w, (uint32_t)o->schedule);
+    nmz_write_u32(w, (uint32_t)o->step_size);
+    nmz_write_f32(w, o->gamma);
+    nmz_write_f32(w, o->min_lr);
     nmz_write_u32(w, (uint32_t)net->n_classes);
     for (i = 0; i < net->n_classes; i++) write_str(w, net->class_names[i]);
     nmz_write_u32(w, (uint32_t)net->n_layers);
@@ -217,10 +263,19 @@ static nmz_status save_body(nmz_net *net, nmz_writer *w) {
             for (e = 0; e < v->size; e++) nmz_write_f32(w, v->data[e]);
         }
     }
+    {
+        int with_norm = net->norm != NMZ_NORM_NONE;
+        int with_opt = net->opt_kind >= 0 && !(flags & NMZ_SAVE_NO_OPTIMIZER);
+        nmz_write_u32(w, (uint32_t)(with_norm + with_opt));
+        if (with_norm) write_section(net, w, "normalize", sec_normalize);
+        if (with_opt) write_section(net, w, "optimizer", sec_optimizer);
+    }
     return nmz_write_u32(w, w->crc); /* footer: CRC of everything above */
 }
 
-nmz_status nmz_net_save(nmz_net *net, const char *path) {
+nmz_status nmz_net_save(nmz_net *net, const char *path) { return nmz_net_save_ex(net, path, 0); }
+
+nmz_status nmz_net_save_ex(nmz_net *net, const char *path, unsigned flags) {
     writer_ext x;
     char *tmp;
     size_t n;
@@ -239,7 +294,7 @@ nmz_status nmz_net_save(nmz_net *net, const char *path) {
         free(tmp);
         return s;
     }
-    s = save_body(net, &x.w);
+    s = save_body(net, &x.w, flags);
     if (fclose(x.w.f) != 0 && s == NMZ_OK) s = nmz__fail(NMZ_ERR_IO, "write failed: %s", strerror(errno));
     /* write to a temp file, then rename: a failed save never destroys a good model */
     if (s == NMZ_OK && rename(tmp, path) != 0) {
@@ -252,6 +307,82 @@ nmz_status nmz_net_save(nmz_net *net, const char *path) {
 }
 
 /* ------------------------------------------------------------------- load */
+
+static nmz_status read_normalize(nmz_reader *r, nmz_net *net) {
+    uint32_t kind = 0, fitted = 0, groups = 0, g;
+    nmz_read_u32(r, &kind);
+    nmz_read_u32(r, &fitted);
+    if (nmz_read_u32(r, &groups) != NMZ_OK) return r->err;
+    if (kind >= NMZ_NORM_COUNT || fitted > 1 || (fitted && (int)groups != nmz__norm_group_count(net)) ||
+        (!fitted && groups != 0))
+        return r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt normalize section");
+    net->norm = (nmz_norm)kind;
+    if (fitted) {
+        if ((r->err = nmz__norm_alloc(net, (int)groups)) != NMZ_OK) return r->err;
+        for (g = 0; g < groups; g++) nmz_read_f32(r, &net->norm_offset[g]);
+        for (g = 0; g < groups; g++) nmz_read_f32(r, &net->norm_scale[g]);
+        net->norm_fitted = 1;
+    }
+    return r->err;
+}
+
+static nmz_status read_optimizer(nmz_reader *r, nmz_net *net) {
+    uint32_t kind = 0, n = 0, count = 0;
+    uint64_t t = 0;
+    int k;
+    size_t e;
+    nmz_read_u32(r, &kind);
+    read_u64(r, &t);
+    if (nmz_read_u32(r, &n) != NMZ_OK) return r->err;
+    if (kind >= NMZ_OPT_COUNT || (int)n != net->n_params || t > 0x7fffffffu)
+        return r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt optimizer section");
+    for (k = 0; k < net->n_params; k++) {
+        if (nmz_read_u32(r, &count) != NMZ_OK) return r->err;
+        if (count != net->opt_m[k].size) return r->err = nmz__fail(NMZ_ERR_FORMAT, "optimizer state does not match the layers");
+        for (e = 0; e < count; e++) nmz_read_f32(r, &net->opt_m[k].data[e]);
+        if (kind == NMZ_OPT_ADAM)
+            for (e = 0; e < count; e++) nmz_read_f32(r, &net->opt_v[k].data[e]);
+    }
+    if (r->err == NMZ_OK) {
+        net->opt_kind = (int)kind;
+        net->opt_t = (long)t;
+    }
+    return r->err;
+}
+
+static nmz_status read_sections(nmz_reader *r, nmz_net *net) {
+    uint32_t n = 0, i, len = 0;
+    if (nmz_read_u32(r, &n) != NMZ_OK) return r->err;
+    if (n > NMZ_MAX_SECTIONS) return r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt section count %u", n);
+    for (i = 0; i < n; i++) {
+        char *tag = NULL;
+        size_t before;
+        if (read_str(r, &tag) != NMZ_OK) return r->err;
+        if (nmz_read_u32(r, &len) != NMZ_OK) {
+            free(tag);
+            return r->err;
+        }
+        before = ((reader_ext *)r)->count;
+        if (!strcmp(tag, "normalize"))
+            read_normalize(r, net);
+        else if (!strcmp(tag, "optimizer"))
+            read_optimizer(r, net);
+        else { /* unknown: skip (written by a newer NeuroMZ) */
+            unsigned char buf[256];
+            uint32_t left = len;
+            while (left > 0 && r->err == NMZ_OK) {
+                uint32_t chunk = left < sizeof buf ? left : (uint32_t)sizeof buf;
+                get_bytes(r, buf, chunk);
+                left -= chunk;
+            }
+        }
+        if (r->err == NMZ_OK && ((reader_ext *)r)->count - before != len)
+            r->err = nmz__fail(NMZ_ERR_FORMAT, "section '%s' has the wrong length", tag);
+        free(tag);
+        if (r->err != NMZ_OK) return r->err;
+    }
+    return NMZ_OK;
+}
 
 static nmz_status load_body(nmz_reader *r, nmz_net **out) {
     unsigned char magic[8] = {0};
@@ -272,8 +403,8 @@ static nmz_status load_body(nmz_reader *r, nmz_net **out) {
     nmz_read_u32(r, &version);
     nmz_read_u32(r, &flags);
     if (r->err) return r->err;
-    if (version != NMZ_FORMAT_VERSION)
-        return nmz__fail(NMZ_ERR_FORMAT, "unsupported format version %u (this build reads version %u)",
+    if (version < 2 || version > NMZ_FORMAT_VERSION)
+        return nmz__fail(NMZ_ERR_FORMAT, "unsupported format version %u (this build reads versions 2 to %u)",
                          version, NMZ_FORMAT_VERSION);
     if (flags != 0) return nmz__fail(NMZ_ERR_FORMAT, "unsupported format flags 0x%x", flags);
     if (nmz_read_u32(r, &in_rank) != NMZ_OK) return r->err;
@@ -287,7 +418,7 @@ static nmz_status load_body(nmz_reader *r, nmz_net **out) {
     read_u64(r, &st);
     read_u64(r, &inc);
     read_u64(r, &step);
-    memset(&o, 0, sizeof o);
+    o = nmz_train_defaults(); /* format 2 has no optimizer/schedule fields */
     nmz_read_u32(r, &u);
     o.max_epochs = (int)u;
     nmz_read_u32(r, &u);
@@ -297,12 +428,31 @@ static nmz_status load_body(nmz_reader *r, nmz_net **out) {
     nmz_read_u32(r, &u);
     o.shuffle = u != 0;
     nmz_read_f64(r, &o.target_loss);
+    if (version >= 3) {
+        uint32_t opt = 0, sched = 0, step_sz = 0;
+        nmz_read_u32(r, &opt);
+        nmz_read_f32(r, &o.beta1);
+        nmz_read_f32(r, &o.beta2);
+        nmz_read_f32(r, &o.epsilon);
+        nmz_read_u32(r, &sched);
+        nmz_read_u32(r, &step_sz);
+        nmz_read_f32(r, &o.gamma);
+        nmz_read_f32(r, &o.min_lr);
+        if (opt >= NMZ_OPT_COUNT || sched >= NMZ_SCHED_COUNT || step_sz > 0x7fffffffu)
+            return nmz__fail(NMZ_ERR_FORMAT, "corrupt training configuration");
+        o.optimizer = (nmz_optimizer)opt;
+        o.schedule = (nmz_schedule)sched;
+        o.step_size = (int)step_sz;
+    }
     if (r->err) return r->err;
     if (loss >= NMZ_LOSS_COUNT) return nmz__fail(NMZ_ERR_FORMAT, "corrupt loss id %u", loss);
     if ((inc & 1u) == 0 || u > 1 || o.max_epochs < 0 || o.batch_size < 0 || step > (uint64_t)0x7fffffff)
         return nmz__fail(NMZ_ERR_FORMAT, "corrupt header");
-    if (nmz__train_opts_validate(&o) != NMZ_OK)
-        return nmz__fail(NMZ_ERR_FORMAT, "corrupt training configuration: %s", nmz_last_error());
+    if (nmz__train_opts_validate(&o) != NMZ_OK) {
+        char why[256];
+        snprintf(why, sizeof why, "%s", nmz_last_error()); /* never format the buffer into itself */
+        return nmz__fail(NMZ_ERR_FORMAT, "corrupt training configuration: %s", why);
+    }
 
     if ((s = nmz_net_create(&net, (int)in_rank, in_shape, 0)) != NMZ_OK) return s;
     net->rng.state = st;
@@ -391,6 +541,11 @@ static nmz_status load_body(nmz_reader *r, nmz_net **out) {
                 if (nmz_read_f32(r, &v->data[e]) != NMZ_OK) goto fail;
         }
     }
+    if ((s = nmz__net_finish_build(net)) != NMZ_OK) {
+        r->err = s;
+        goto fail;
+    }
+    if (version >= 3 && read_sections(r, net) != NMZ_OK) goto fail;
     {
         uint32_t expect = r->crc, stored = 0;
         unsigned char b[4];
@@ -407,10 +562,6 @@ static nmz_status load_body(nmz_reader *r, nmz_net **out) {
             nmz__fail(NMZ_ERR_FORMAT, "unexpected data after the end of the model");
             goto fail;
         }
-    }
-    if ((s = nmz__net_finish_build(net)) != NMZ_OK) {
-        nmz_net_free(net);
-        return s;
     }
     *out = net;
     return NMZ_OK;

@@ -171,26 +171,57 @@ int nmz_layer_input_size(const nmz_layer *l);
 /* --------------------------------------------------------------- the net */
 
 typedef struct nmz_net nmz_net;
+typedef struct nmz_dataset nmz_dataset; /* defined below */
 
 /* Training configuration (also stored inside each model). */
 typedef struct nmz_epoch_info {
-    int epoch;       /* 1-based                                  */
-    double loss;     /* loss over the whole training set          */
-    double accuracy; /* NaN when not meaningful (see DESIGN §10.23) */
+    int epoch;           /* 1-based                                  */
+    double loss;         /* loss over the whole training set          */
+    double accuracy;     /* NaN when not meaningful (see DESIGN §10.23) */
+    float learning_rate; /* η used in this epoch (after the schedule) */
 } nmz_epoch_info;
 
-/* Return non-zero from the callback to stop training early. */
+typedef struct nmz_batch_info {
+    int epoch;     /* 1-based                               */
+    int batch;     /* 1-based index within the epoch        */
+    int n_batches; /* mini-batches per epoch                */
+    double loss;   /* loss of this mini-batch (before update) */
+} nmz_batch_info;
+
+/* Return non-zero from a callback to stop training early. */
 typedef int (*nmz_epoch_fn)(const nmz_epoch_info *info, void *user);
+typedef int (*nmz_batch_fn)(const nmz_batch_info *info, void *user);
+
+typedef enum nmz_optimizer {
+    NMZ_OPT_SGD = 0, /* v ← μ·v − η·g ; w ← w + v                                 */
+    NMZ_OPT_ADAM,    /* m ← β1·m + (1−β1)·g ; v ← β2·v + (1−β2)·g²
+                        w ← w − η·m̂/(√v̂ + ε), m̂ = m/(1−β1^t), v̂ = v/(1−β2^t)      */
+    NMZ_OPT_COUNT
+} nmz_optimizer;
+
+typedef enum nmz_schedule {
+    NMZ_SCHED_CONSTANT = 0, /* η_e = η                                               */
+    NMZ_SCHED_STEP,         /* η_e = η · γ^floor((e−1)/step_size)                     */
+    NMZ_SCHED_COSINE,       /* η_e = η_min + ½(η − η_min)(1 + cos(π·(e−1)/max_epochs)) */
+    NMZ_SCHED_COUNT
+} nmz_schedule;
 
 typedef struct nmz_train_opts {
     int max_epochs;      /* hard limit                                  */
     int batch_size;      /* 1 = online SGD, >= n = full batch           */
-    float learning_rate; /* η                                           */
-    float momentum;      /* μ in [0, 1); 0 = plain SGD                  */
+    float learning_rate; /* η (initial value when a schedule is used)   */
+    float momentum;      /* μ in [0, 1); 0 = plain SGD (SGD only)       */
     int shuffle;         /* reshuffle samples every epoch (1/0)         */
     double target_loss;  /* stop when whole-set loss <= this            */
+    nmz_optimizer optimizer;
+    float beta1, beta2, epsilon; /* Adam (defaults 0.9, 0.999, 1e-8)    */
+    nmz_schedule schedule;
+    int step_size;       /* NMZ_SCHED_STEP: epochs between decays       */
+    float gamma;         /* NMZ_SCHED_STEP: decay factor                */
+    float min_lr;        /* NMZ_SCHED_COSINE: final learning rate       */
     nmz_epoch_fn on_epoch;
-    void *user;
+    nmz_batch_fn on_batch;
+    void *user;          /* passed to both callbacks                    */
 } nmz_train_opts;
 
 typedef struct nmz_train_result {
@@ -203,6 +234,22 @@ typedef struct nmz_train_result {
 
 /* Library defaults (not tuned for any dataset). */
 nmz_train_opts nmz_train_defaults(void);
+/* Learning rate for epoch e (1-based) under o's schedule. */
+float nmz_schedule_lr(const nmz_train_opts *o, int epoch);
+const char *nmz_optimizer_name(nmz_optimizer o);
+const char *nmz_schedule_name(nmz_schedule s);
+nmz_status nmz_optimizer_parse(const char *s, nmz_optimizer *out);
+nmz_status nmz_schedule_parse(const char *s, nmz_schedule *out);
+
+/* Input normalization, fitted on training data and stored with the model:
+ * x' = (x − offset_g) · scale_g, one (offset, scale) per group g: per
+ * channel for [C,H,W] inputs, per feature otherwise.
+ *   min-max: offset = min, scale = 1/(max − min)   → values in [0, 1]
+ *   z-score: offset = mean, scale = 1/std          → mean 0, std 1
+ * (scale = 1 when max = min or std = 0). */
+typedef enum nmz_norm { NMZ_NORM_NONE = 0, NMZ_NORM_MINMAX, NMZ_NORM_ZSCORE, NMZ_NORM_COUNT } nmz_norm;
+const char *nmz_norm_name(nmz_norm n);
+nmz_status nmz_norm_parse(const char *s, nmz_norm *out);
 
 /* Create an empty network for samples of the given per-sample shape. */
 nmz_status nmz_net_create(nmz_net **out, int input_rank, const int *input_shape,
@@ -233,6 +280,15 @@ long nmz_net_step(const nmz_net *net); /* number of backward passes so far */
  * valid net. Callbacks in it are not saved. */
 nmz_train_opts *nmz_net_train_config(nmz_net *net);
 
+/* Request a normalization; it is fitted by the next nmz_net_train (or
+ * explicitly with nmz_net_fit_normalization) and then frozen. Forward and
+ * predict apply it automatically. NMZ_NORM_NONE removes it. */
+nmz_status nmz_net_set_normalization(nmz_net *net, nmz_norm kind);
+nmz_status nmz_net_fit_normalization(nmz_net *net, const nmz_dataset *ds);
+/* Kind, whether fitted, and the per-group parameters (NULL if not fitted). */
+nmz_norm nmz_net_normalization(const nmz_net *net, int *fitted, int *groups, const float **offset,
+                               const float **scale);
+
 /* Class names for classification outputs (copied). */
 nmz_status nmz_net_set_class_names(nmz_net *net, int n, const char *const *names);
 int nmz_net_class_count(const nmz_net *net);
@@ -256,6 +312,13 @@ nmz_status nmz_net_update(nmz_net *net, float learning_rate, float momentum);
 /* Emit the UPDATE trace events nmz_net_update would emit, without changing
  * any weight or velocity (for "what would this step do?" teaching views). */
 nmz_status nmz_net_preview_update(nmz_net *net, float learning_rate, float momentum);
+/* One optimizer step with o's optimizer (SGD+momentum or Adam) at the given
+ * learning rate. Optimizer state (velocity or Adam moments and step t) is
+ * kept in the net; switching optimizer resets it. */
+nmz_status nmz_net_optimizer_step(nmz_net *net, const nmz_train_opts *o, float learning_rate);
+nmz_status nmz_net_optimizer_preview(nmz_net *net, const nmz_train_opts *o, float learning_rate);
+/* Which optimizer the stored state belongs to (-1: none yet) and Adam's t. */
+int nmz_net_optimizer_state(const nmz_net *net, long *t);
 /* ∂L/∂input of the last backward pass ([B, input_shape...]). */
 const nmz_tensor *nmz_net_input_grad(const nmz_net *net);
 /* Output of layer i from the last forward (i = -1: the input copy). */
@@ -335,8 +398,13 @@ nmz_status nmz_net_create_quick(nmz_net **out, int n_sizes, const int *sizes,
 
 /* ---------------------------------------------------------------- file I/O */
 
-/* Portable .nmz format (DESIGN §7). Builds the net if needed. */
+/* Portable .nmz format (DESIGN §7). Builds the net if needed. Writes
+ * format 3; optimizer state (velocity / Adam moments) is included when the
+ * net has been trained, unless NMZ_SAVE_NO_OPTIMIZER is given. Files of
+ * format 2 and 3 can be loaded. */
+#define NMZ_SAVE_NO_OPTIMIZER 1u
 nmz_status nmz_net_save(nmz_net *net, const char *path);
+nmz_status nmz_net_save_ex(nmz_net *net, const char *path, unsigned flags);
 nmz_status nmz_net_load(nmz_net **out, const char *path);
 
 /* ------------------------------------------------------------------- trace */

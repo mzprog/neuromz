@@ -18,6 +18,15 @@ nmz_status nmz__train_opts_validate(const nmz_train_opts *o) {
         return nmz__fail(NMZ_ERR_ARG, "momentum must be in [0, 1)");
     if (!(o->target_loss >= 0.0) || !isfinite(o->target_loss))
         return nmz__fail(NMZ_ERR_ARG, "target loss must be >= 0");
+    if ((int)o->optimizer < 0 || o->optimizer >= NMZ_OPT_COUNT) return nmz__fail(NMZ_ERR_ARG, "invalid optimizer");
+    if (!(o->beta1 >= 0.0f && o->beta1 < 1.0f && o->beta2 >= 0.0f && o->beta2 < 1.0f))
+        return nmz__fail(NMZ_ERR_ARG, "Adam betas must be in [0, 1)");
+    if (!(o->epsilon > 0.0f) || !isfinite(o->epsilon)) return nmz__fail(NMZ_ERR_ARG, "epsilon must be > 0");
+    if ((int)o->schedule < 0 || o->schedule >= NMZ_SCHED_COUNT) return nmz__fail(NMZ_ERR_ARG, "invalid schedule");
+    if (o->schedule == NMZ_SCHED_STEP && (o->step_size < 1 || !(o->gamma > 0.0f && o->gamma <= 1.0f)))
+        return nmz__fail(NMZ_ERR_ARG, "step schedule needs step size >= 1 and 0 < gamma <= 1");
+    if (o->schedule == NMZ_SCHED_COSINE && !(o->min_lr >= 0.0f && o->min_lr <= o->learning_rate))
+        return nmz__fail(NMZ_ERR_ARG, "cosine schedule needs 0 <= min lr <= lr");
     return NMZ_OK;
 }
 
@@ -122,12 +131,15 @@ nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_op
     nmz_train_result res;
     nmz_tensor xb = NMZ_TENSOR_EMPTY, tb = NMZ_TENSOR_EMPTY;
     int *perm = NULL, epoch, i, bs, n;
+    double bl = 0.0;
     nmz_status s;
     if (!net) return nmz__fail(NMZ_ERR_ARG, "net is NULL");
     o = opts ? *opts : net->train;
     if ((s = nmz__train_opts_validate(&o)) != NMZ_OK) return s;
     if ((s = nmz_net_build(net)) != NMZ_OK) return s;
     if ((s = nmz__net_check_dataset(net, ds)) != NMZ_OK) return s;
+    if (net->norm != NMZ_NORM_NONE && !net->norm_fitted) /* fitted once, on the first training data */
+        if ((s = nmz_net_fit_normalization(net, ds)) != NMZ_OK) return s;
     if (ds->n_classes == ds->n_outputs && ds->n_classes > 0 && net->n_classes == 0)
         if ((s = nmz_net_set_class_names(net, ds->n_classes, (const char *const *)ds->class_names)) != NMZ_OK)
             return s;
@@ -141,8 +153,12 @@ nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_op
     for (i = 0; i < n; i++) perm[i] = i;
 
     for (epoch = 1; epoch <= o.max_epochs; epoch++) {
-        int start;
+        int start, batch = 0, n_batches = (n + bs - 1) / bs;
+        float lr = nmz_schedule_lr(&o, epoch);
         nmz_epoch_info info;
+        /* each epoch's order depends only on the PRNG state, so training for
+         * 5 + 5 epochs (even across save/load) equals training for 10 */
+        for (i = 0; i < n; i++) perm[i] = i;
         if (o.shuffle)
             for (i = n - 1; i > 0; i--) { /* Fisher–Yates */
                 int j = (int)nmz_rng_below(&net->rng, (uint32_t)i + 1u), t = perm[i];
@@ -155,13 +171,25 @@ nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_op
             if ((s = batch_shapes(net, b, &xb, &tb)) != NMZ_OK) goto done;
             gather(ds, perm, start, b, &xb, &tb);
             if ((s = nmz__net_forward(net, &xb, 1, NULL)) != NMZ_OK) goto done;
-            if ((s = nmz_net_backward(net, &tb, NULL)) != NMZ_OK) {
+            if ((s = nmz_net_backward(net, &tb, &bl)) != NMZ_OK) {
                 if (s == NMZ_ERR_NUMERIC)
                     nmz__fail(s, "loss became NaN/Inf in epoch %d — the learning rate (%g) is probably too high",
                               epoch, (double)o.learning_rate);
                 goto done;
             }
-            if ((s = nmz_net_update(net, o.learning_rate, o.momentum)) != NMZ_OK) goto done;
+            if ((s = nmz_net_optimizer_step(net, &o, lr)) != NMZ_OK) goto done;
+            if (o.on_batch) {
+                nmz_batch_info bi;
+                bi.epoch = epoch;
+                bi.batch = ++batch;
+                bi.n_batches = n_batches;
+                bi.loss = bl;
+                if (o.on_batch(&bi, o.user)) {
+                    res.stopped = 1;
+                    s = NMZ_OK;
+                    goto done;
+                }
+            }
         }
         net->training = 0;
         if ((s = nmz_net_evaluate(net, ds, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
@@ -172,6 +200,7 @@ nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_op
             goto done;
         }
         info.epoch = epoch;
+        info.learning_rate = lr;
         info.loss = res.loss;
         info.accuracy = res.accuracy;
         if (res.loss <= o.target_loss) res.converged = 1;
