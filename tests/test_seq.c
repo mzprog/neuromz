@@ -57,12 +57,15 @@ static void test_gradcheck_rnn(void) {
     nmz_net_free(net);
 }
 
+/* The phase-3 character net. Its RNN keeps the phase-3 init (Glorot, now
+ * the explicit `xavier` option; AUTO became orthogonal in phase 4), so the
+ * exact generated strings below remain a regression test of phase 3. */
 static nmz_net *char_net(int V, int D, int H, uint64_t seed) {
     nmz_net *net = NULL;
     int in = NMZ_ANY_LENGTH;
     if (nmz_net_create(&net, 1, &in, seed) != NMZ_OK) return NULL;
     nmz_net_add(net, nmz_layer_embedding(V, D, NMZ_INIT_AUTO));
-    nmz_net_add(net, nmz_layer_rnn(H, NMZ_INIT_AUTO));
+    nmz_net_add(net, nmz_layer_rnn(H, NMZ_INIT_XAVIER));
     nmz_net_add_dense(net, V, NMZ_ACT_SOFTMAX, NMZ_INIT_AUTO);
     nmz_net_set_loss(net, NMZ_LOSS_CROSS_ENTROPY);
     if (nmz_net_build(net) != NMZ_OK) {

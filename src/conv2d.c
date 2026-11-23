@@ -391,8 +391,8 @@ nmz_layer *nmz_layer_conv2d(int filters, int kh, int kw, int stride, int pad, nm
         nmz__fail(NMZ_ERR_ARG, "conv2d needs filters > 0, kernel > 0, stride > 0 and pad >= 0 (or same)");
         return NULL;
     }
-    if ((int)init < 0 || init >= NMZ_INIT_COUNT) {
-        nmz__fail(NMZ_ERR_ARG, "invalid init %d", (int)init);
+    if ((int)init < 0 || init >= NMZ_INIT_COUNT || init == NMZ_INIT_ORTHOGONAL) {
+        nmz__fail(NMZ_ERR_ARG, "invalid init %d for conv2d (orthogonal is for recurrent layers)", (int)init);
         return NULL;
     }
     c = calloc(1, sizeof *c);

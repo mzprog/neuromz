@@ -28,7 +28,7 @@ extern "C" {
  * sequence nets are created with input shape [NMZ_ANY_LENGTH] and accept
  * [B, T] batches for any T (64 in training, 1 when generating). */
 #define NMZ_ANY_LENGTH 0
-#define NMZ_TRACE_MAX_ITEMS 8
+#define NMZ_TRACE_MAX_ITEMS 12
 
 /* ------------------------------------------------------------------ errors */
 
@@ -108,6 +108,9 @@ typedef enum nmz_init {
     NMZ_INIT_AUTO = 0, /* He before relu/leaky_relu, Xavier otherwise */
     NMZ_INIT_XAVIER,   /* Glorot uniform: ±sqrt(6/(fan_in+fan_out))  */
     NMZ_INIT_HE,       /* He uniform:     ±sqrt(6/fan_in)            */
+    NMZ_INIT_ORTHOGONAL, /* recurrent layers only: the recurrent matrix
+                            (each gate's block) is a random orthogonal
+                            matrix, the input matrix Glorot              */
     NMZ_INIT_COUNT
 } nmz_init;
 
@@ -164,8 +167,28 @@ nmz_layer *nmz_layer_embedding(int vocab, int dim, nmz_init init);
 /* Vanilla RNN over [steps, features] → [steps, units]:
  * h_t = tanh(x_t·W_xh + h_{t−1}·W_hh + b); BPTT inside the layer. With
  * carry on (nmz_net_set_carry / train opts carry_state) h_{−1} is the last
- * hidden state of the previous forward pass, else zeros. AUTO = Glorot. */
+ * hidden state of the previous forward pass, else zeros. AUTO = orthogonal
+ * (W_hh orthogonal, W_xh Glorot); XAVIER = Glorot for both (phase 3). */
 nmz_layer *nmz_layer_rnn(int units, nmz_init init);
+/* LSTM over [steps, features] → [steps, units]. Gates side by side in
+ * W_x [D, 4H], W_h [H, 4H], b [4H], in the order i, f, g, o:
+ *   i, f, o = σ(·)   g = tanh(·)   of  x_t·W_x + h_{t−1}·W_h + b
+ *   c_t = f ⊙ c_{t−1} + i ⊙ g      h_t = o ⊙ tanh(c_t)
+ * The forget-gate bias starts at `forget_bias` (1 is the usual choice: the
+ * cell remembers by default). The carried state holds h and c ([B, 2H]).
+ * AUTO = orthogonal. */
+#define NMZ_LSTM_FORGET_BIAS 1.0f
+nmz_layer *nmz_layer_lstm(int units, nmz_init init, float forget_bias);
+/* GRU (Cho et al. 2014, reset gate applied to h_{t−1} before the product),
+ * gates z, r, n side by side in W_x [D, 3H], W_h [H, 3H], b [3H]:
+ *   z = σ(x_t·W_xz + h_{t−1}·W_hz + b_z)      update gate
+ *   r = σ(x_t·W_xr + h_{t−1}·W_hr + b_r)      reset gate
+ *   ĥ = tanh(x_t·W_xn + (r ⊙ h_{t−1})·W_hn + b_n)   candidate
+ *   h_t = z ⊙ h_{t−1} + (1 − z) ⊙ ĥ
+ * AUTO = orthogonal. */
+nmz_layer *nmz_layer_gru(int units, nmz_init init);
+/* 1 for rnn/lstm/gru layers. */
+int nmz_layer_is_recurrent(const nmz_layer *l);
 /* Free a layer that was NOT added to a net. */
 void nmz_layer_free(nmz_layer *l);
 

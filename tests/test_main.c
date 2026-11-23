@@ -30,7 +30,7 @@ void test_note(const char *fmt, ...) {
 }
 
 int main(int argc, char **argv) {
-    const test_case *tables[] = {core_tests, text_tests, math_tests, layer_tests, seq_tests, optim_tests, train_tests, io_tests};
+    const test_case *tables[] = {core_tests, text_tests, math_tests, layer_tests, seq_tests, gated_tests, optim_tests, train_tests, io_tests};
     const char *filter = argc > 1 ? argv[1] : NULL;
     int t, run = 0, failed_tests = 0;
     for (t = 0; t < (int)(sizeof tables / sizeof tables[0]); t++) {

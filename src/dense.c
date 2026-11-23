@@ -197,7 +197,7 @@ int nmz_layer_dense_init(const nmz_layer *l) {
 
 int nmz_layer_init_used(const nmz_layer *l) {
     if (l && l->ops == &nmz__conv2d_ops) return nmz__conv2d_init_used(l);
-    if (l && (l->ops == &nmz__embedding_ops || l->ops == &nmz__rnn_ops)) return nmz__recurrent_init_used(l);
+    if (l && (l->ops == &nmz__embedding_ops || nmz_layer_is_recurrent(l))) return nmz__recurrent_init_used(l);
     return nmz_layer_dense_init(l);
 }
 
@@ -210,6 +210,10 @@ nmz_layer *nmz_layer_dense(int units, nmz_init init) {
     }
     if ((int)init < 0 || init >= NMZ_INIT_COUNT) {
         nmz__fail(NMZ_ERR_ARG, "invalid init %d", (int)init);
+        return NULL;
+    }
+    if (init == NMZ_INIT_ORTHOGONAL) {
+        nmz__fail(NMZ_ERR_ARG, "orthogonal init is for recurrent layers (rnn, lstm, gru), not dense");
         return NULL;
     }
     d = calloc(1, sizeof *d);

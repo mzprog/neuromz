@@ -7,7 +7,7 @@
 #   make sanitize   build everything with ASan + UBSan, run tests + CLI smoke test
 #   make examples   train the bundled examples (XOR, XOR+AND, Iris)
 #   make data       download MNIST into data/ and verify checksums
-#   make data-text  download a public-domain book (Alice) into data/, checksum-verified
+#   make data-text  download the texts (Alice; Kalila wa-Dimna in Arabic) into data/, checksum-verified
 #   make bench      slow benchmarks (seeds sweep + MNIST); not part of `make test`
 #   make clean
 
@@ -23,11 +23,11 @@ BUILD   ?= build
 LIB_SRC := src/error.c src/tensor.c src/rng.c src/activation.c src/dense.c src/loss.c \
            src/net.c src/train.c src/trace.c src/gradcheck.c src/io.c src/dataset.c \
            src/defaults.c src/conv2d.c src/shape_layers.c src/normalize.c \
-           src/text.c src/recurrent.c src/generate.c
+           src/text.c src/recurrent.c src/lstm.c src/gru.c src/generate.c
 CLI_SRC := cli/main.c cli/commands.c cli/cmd_new.c cli/util.c cli/print.c cli/print_conv.c cli/print_seq.c cli/line.c
 TEST_SRC := tests/test_main.c tests/test_core.c tests/test_math.c tests/test_train.c \
             tests/test_io.c tests/test_layers.c tests/test_optim.c \
-            tests/test_text.c tests/test_seq.c
+            tests/test_text.c tests/test_seq.c tests/test_gated.c
 
 LIB_OBJ  := $(LIB_SRC:%.c=$(BUILD)/%.o)
 CLI_OBJ  := $(CLI_SRC:%.c=$(BUILD)/%.o)

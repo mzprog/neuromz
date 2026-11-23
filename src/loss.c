@@ -12,7 +12,7 @@
 #include <string.h>
 
 static const char *const k_loss_names[NMZ_LOSS_COUNT] = {"mse", "cross_entropy"};
-static const char *const k_init_names[NMZ_INIT_COUNT] = {"auto", "xavier", "he"};
+static const char *const k_init_names[NMZ_INIT_COUNT] = {"auto", "xavier", "he", "orthogonal"};
 
 const char *nmz_loss_name(nmz_loss l) {
     if ((int)l < 0 || l >= NMZ_LOSS_COUNT) return "?";
@@ -39,7 +39,8 @@ nmz_status nmz_init_parse(const char *s, nmz_init *out) {
     if (!strcmp(s, "auto")) { *out = NMZ_INIT_AUTO; return NMZ_OK; }
     if (!strcmp(s, "xavier") || !strcmp(s, "glorot")) { *out = NMZ_INIT_XAVIER; return NMZ_OK; }
     if (!strcmp(s, "he") || !strcmp(s, "kaiming")) { *out = NMZ_INIT_HE; return NMZ_OK; }
-    return nmz__fail(NMZ_ERR_ARG, "unknown init '%s' (expected auto, xavier or he)", s);
+    if (!strcmp(s, "orthogonal") || !strcmp(s, "orth")) { *out = NMZ_INIT_ORTHOGONAL; return NMZ_OK; }
+    return nmz__fail(NMZ_ERR_ARG, "unknown init '%s' (expected auto, xavier, he or orthogonal)", s);
 }
 
 static nmz_status check_pair(const nmz_tensor *y, const nmz_tensor *t) {

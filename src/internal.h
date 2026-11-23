@@ -46,7 +46,20 @@ extern const nmz_layer_ops nmz__flatten_ops;
 extern const nmz_layer_ops nmz__dropout_ops;
 extern const nmz_layer_ops nmz__embedding_ops;
 extern const nmz_layer_ops nmz__rnn_ops;
+extern const nmz_layer_ops nmz__lstm_ops;
+extern const nmz_layer_ops nmz__gru_ops;
 int nmz__recurrent_init_used(const nmz_layer *l);
+int nmz__gated_init_used(const nmz_layer *l); /* lstm or gru */
+int nmz__lstm_init_used(const nmz_layer *l);
+float nmz__lstm_forget_bias(const nmz_layer *l);
+/* recurrent.c helpers shared by rnn/lstm/gru */
+nmz_status nmz__orthogonal_block(float *W, int n, int ld, int col0, nmz_rng *rng);
+nmz_status nmz__recurrent_init(nmz_init init, nmz_init *resolved, nmz_tensor *Wx, nmz_tensor *Wh, int D, int H,
+                               int gates, nmz_rng *rng);
+/* copy step t of a [B, T, F] tensor into a [B, F] tensor; _tc: only the
+ * columns col0 … col0+n−1, into [B, n] */
+nmz_status nmz__slice_t(const nmz_tensor *src, int t, nmz_tensor *dst);
+nmz_status nmz__slice_tc(const nmz_tensor *src, int t, int col0, int n, nmz_tensor *dst);
 int nmz__conv2d_init_used(const nmz_layer *l);
 const nmz_tensor *nmz__maxpool_argmax(const nmz_layer *l);
 

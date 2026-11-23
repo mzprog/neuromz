@@ -16,7 +16,10 @@
  *             The gradient that would flow into the carried state h_{−1} is
  *             dropped: that is the truncation. The time loop and BPTT live
  *             entirely inside this layer (DESIGN §3); the engine sees one
- *             forward and one backward call. */
+ *             forward and one backward call.
+ *
+ * Also the helpers shared with lstm.c and gru.c: orthogonal initialisation,
+ * slicing one time step out of [B, T, F], and the recurrent init rules. */
 #include "internal.h"
 
 #include <math.h>
@@ -163,8 +166,10 @@ const nmz_layer_ops nmz__embedding_ops = {"embedding",  embed_setup,       embed
 nmz_layer *nmz_layer_embedding(int vocab, int dim, nmz_init init) {
     embed_layer *e;
     nmz_layer *l;
-    if (vocab < 1 || vocab > NMZ_MAX_VOCAB || dim < 1 || dim > 100000 || (int)init < 0 || init >= NMZ_INIT_COUNT) {
-        nmz__fail(NMZ_ERR_ARG, "embedding needs a vocabulary size 1..%d and a dimension >= 1", NMZ_MAX_VOCAB);
+    if (vocab < 1 || vocab > NMZ_MAX_VOCAB || dim < 1 || dim > 100000 || (int)init < 0 || init >= NMZ_INIT_COUNT ||
+        init == NMZ_INIT_ORTHOGONAL) {
+        nmz__fail(NMZ_ERR_ARG, "embedding needs a vocabulary size 1..%d, a dimension >= 1 and init auto, xavier or he",
+                  NMZ_MAX_VOCAB);
         return NULL;
     }
     e = calloc(1, sizeof *e);
@@ -218,38 +223,93 @@ static nmz_status rnn_setup(nmz_layer *l, int in_rank, const int *in_shape, int 
     return NMZ_OK;
 }
 
-/* Glorot for both matrices: W_hh entries then have variance 1/H, so its
- * spectral radius is ≈ 1 — the gradient neither explodes nor vanishes
- * immediately through the recurrent matrix alone. */
-static nmz_status rnn_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
-    rnn_layer *r = l->self;
-    double lx, lh;
-    size_t i;
-    (void)next;
-    r->resolved = r->init == NMZ_INIT_AUTO ? NMZ_INIT_XAVIER : r->init;
-    if (r->resolved == NMZ_INIT_HE) {
-        lx = sqrt(6.0 / r->D);
-        lh = sqrt(6.0 / r->units);
-    } else {
-        lx = sqrt(6.0 / (r->D + r->units));
-        lh = sqrt(6.0 / (2.0 * r->units));
+/* Orthogonal n×n block: columns col0 … col0+n−1 of a row-major [n, ld]
+ * matrix. A Gaussian matrix is orthonormalised column by column (modified
+ * Gram–Schmidt in double, two passes for float accuracy): that is the Q of
+ * its QR decomposition with a positive diagonal R, a uniformly random
+ * (Haar) orthogonal matrix. All its singular values are 1, so repeated
+ * multiplication by it neither shrinks nor grows a vector. */
+nmz_status nmz__orthogonal_block(float *W, int n, int ld, int col0, nmz_rng *rng) {
+    double *q = malloc((size_t)n * (size_t)n * sizeof *q); /* q[c·n + r] = column c */
+    int c, k, r, pass;
+    if (!q) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+    for (c = 0; c < n; c++)
+        for (r = 0; r < n; r++) q[(size_t)c * n + r] = nmz_rng_normal(rng);
+    for (c = 0; c < n; c++) {
+        double *qc = q + (size_t)c * n, len;
+        for (pass = 0; pass < 2; pass++)
+            for (k = 0; k < c; k++) {
+                const double *qk = q + (size_t)k * n;
+                double dot = 0;
+                for (r = 0; r < n; r++) dot += qk[r] * qc[r];
+                for (r = 0; r < n; r++) qc[r] -= dot * qk[r];
+            }
+        len = 0;
+        for (r = 0; r < n; r++) len += qc[r] * qc[r];
+        len = sqrt(len);
+        if (len < 1e-12) { /* (probability 0) a dependent column: draw it again */
+            for (r = 0; r < n; r++) qc[r] = nmz_rng_normal(rng);
+            c--;
+            continue;
+        }
+        for (r = 0; r < n; r++) qc[r] /= len;
     }
-    for (i = 0; i < r->Wxh.size; i++) r->Wxh.data[i] = (float)((2.0 * nmz_rng_uniform(rng) - 1.0) * lx);
-    for (i = 0; i < r->Whh.size; i++) r->Whh.data[i] = (float)((2.0 * nmz_rng_uniform(rng) - 1.0) * lh);
-    nmz_tensor_zero(&r->b);
+    for (r = 0; r < n; r++)
+        for (c = 0; c < n; c++) W[(size_t)r * ld + col0 + c] = (float)q[(size_t)c * n + r];
+    free(q);
     return NMZ_OK;
 }
 
-/* copy step t of a [B, T, F] tensor into a [B, F] tensor */
-static nmz_status slice_t(const nmz_tensor *src, int t, nmz_tensor *dst) {
+/* Recurrent weights: input matrix Wx [D, G·H] and recurrent matrix Wh
+ * [H, G·H] for G gates (1 for the RNN). AUTO/ORTHOGONAL: Wx Glorot (fan
+ * D + H per gate), each H×H gate block of Wh orthogonal. XAVIER: Glorot for
+ * both (Wh entries with variance 1/H: spectral radius ≈ 1, but singular
+ * values spread from ≈0 to ≈2). HE: ±sqrt(6/fan_in). */
+nmz_status nmz__recurrent_init(nmz_init init, nmz_init *resolved, nmz_tensor *Wx, nmz_tensor *Wh, int D, int H,
+                               int gates, nmz_rng *rng) {
+    double lx, lh;
+    size_t i;
+    int g;
+    nmz_status s;
+    *resolved = init == NMZ_INIT_AUTO ? NMZ_INIT_ORTHOGONAL : init;
+    if (*resolved == NMZ_INIT_HE) {
+        lx = sqrt(6.0 / D);
+        lh = sqrt(6.0 / H);
+    } else {
+        lx = sqrt(6.0 / (D + H));
+        lh = sqrt(6.0 / (2.0 * H));
+    }
+    for (i = 0; i < Wx->size; i++) Wx->data[i] = (float)((2.0 * nmz_rng_uniform(rng) - 1.0) * lx);
+    if (*resolved == NMZ_INIT_ORTHOGONAL) {
+        for (g = 0; g < gates; g++)
+            if ((s = nmz__orthogonal_block(Wh->data, H, gates * H, g * H, rng)) != NMZ_OK) return s;
+    } else {
+        for (i = 0; i < Wh->size; i++) Wh->data[i] = (float)((2.0 * nmz_rng_uniform(rng) - 1.0) * lh);
+    }
+    return NMZ_OK;
+}
+
+static nmz_status rnn_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
+    rnn_layer *r = l->self;
+    (void)next;
+    nmz_tensor_zero(&r->b);
+    return nmz__recurrent_init(r->init, &r->resolved, &r->Wxh, &r->Whh, r->D, r->units, 1, rng);
+}
+
+nmz_status nmz__slice_tc(const nmz_tensor *src, int t, int col0, int n, nmz_tensor *dst) {
     int B = src->shape[0], T = src->shape[1], F = src->shape[2], bi, shape[2];
     nmz_status s;
     shape[0] = B;
-    shape[1] = F;
+    shape[1] = n;
     if ((s = nmz_tensor_reshape(dst, 2, shape)) != NMZ_OK) return s;
     for (bi = 0; bi < B; bi++)
-        memcpy(dst->data + (size_t)bi * F, src->data + ((size_t)bi * T + (size_t)t) * F, (size_t)F * sizeof(float));
+        memcpy(dst->data + (size_t)bi * n, src->data + ((size_t)bi * T + (size_t)t) * F + col0,
+               (size_t)n * sizeof(float));
     return NMZ_OK;
+}
+
+nmz_status nmz__slice_t(const nmz_tensor *src, int t, nmz_tensor *dst) {
+    return nmz__slice_tc(src, t, 0, src->shape[2], dst);
 }
 
 static nmz_status rnn_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, const nmz_ctx *ctx) {
@@ -301,12 +361,12 @@ static nmz_status rnn_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, 
         nmz_trace_emit(ctx, NMZ_TRACE_FORWARD, "rnn", "tanh", 1, sc, 6, all);
         for (t = 0; t < T; t++) { /* one event per time step: the unrolled network */
             nmz_tensor *xt = &r->tmp[0], *hp = &r->tmp[1], *zt = &r->tmp[2], *ht = &r->tmp[3];
-            if ((s = slice_t(x, t, xt)) != NMZ_OK || (s = slice_t(&r->z, t, zt)) != NMZ_OK ||
-                (s = slice_t(y, t, ht)) != NMZ_OK)
+            if ((s = nmz__slice_t(x, t, xt)) != NMZ_OK || (s = nmz__slice_t(&r->z, t, zt)) != NMZ_OK ||
+                (s = nmz__slice_t(y, t, ht)) != NMZ_OK)
                 return s;
             if (t == 0) {
                 if ((s = nmz_tensor_copy(hp, &r->h0)) != NMZ_OK) return s;
-            } else if ((s = slice_t(y, t - 1, hp)) != NMZ_OK) {
+            } else if ((s = nmz__slice_t(y, t - 1, hp)) != NMZ_OK) {
                 return s;
             }
             {
@@ -495,5 +555,10 @@ nmz_layer *nmz_layer_rnn(int units, nmz_init init) {
 int nmz__recurrent_init_used(const nmz_layer *l) {
     if (l->ops == &nmz__embedding_ops) return (int)((const embed_layer *)l->self)->resolved;
     if (l->ops == &nmz__rnn_ops) return (int)((const rnn_layer *)l->self)->resolved;
+    if (l->ops == &nmz__lstm_ops || l->ops == &nmz__gru_ops) return nmz__gated_init_used(l);
     return -1;
+}
+
+int nmz_layer_is_recurrent(const nmz_layer *l) {
+    return l && (l->ops == &nmz__rnn_ops || l->ops == &nmz__lstm_ops || l->ops == &nmz__gru_ops);
 }
