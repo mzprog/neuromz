@@ -365,7 +365,7 @@ static void dense_backward(const nmz_trace_event *ev, const print_opts *o) {
 
 /* ---------------------------------------------------------------- update */
 
-static void update_event(const nmz_trace_event *ev, const print_opts *o) {
+void print_sgd_update(const nmz_trace_event *ev, const print_opts *o) {
     const nmz_tensor *w = nmz_trace_find(ev, "value"), *g = nmz_trace_find(ev, "grad"),
                      *v0 = nmz_trace_find(ev, "velocity_prev"), *dl = nmz_trace_find(ev, "delta");
     int n = (int)w->size, e;
@@ -453,7 +453,14 @@ void print_trace_all(const nmz_trace_recorder *rec, const print_opts *o, int app
             break;
         case NMZ_TRACE_UPDATE:
             if (nmz_trace_find(ev, "m")) pr_adam_update(ev, o);
-            else update_event(ev, o);
+            else if (!strcmp(ev->layer_type, "clip")) {
+                double gn = 0, mx = 0, sc = 1;
+                nmz_trace_scalar_get(ev, "norm", &gn);
+                nmz_trace_scalar_get(ev, "max_norm", &mx);
+                nmz_trace_scalar_get(ev, "scale", &sc);
+                printf("\n[clip] global gradient norm %s %s %s  ->  %s\n", num(gn), sc < 1 ? ">" : "<=", num(mx),
+                       sc < 1 ? "every gradient scaled down" : "unchanged");
+            } else print_sgd_update(ev, o);
             break;
         }
     }

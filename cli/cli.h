@@ -111,6 +111,13 @@ void pr_act_map_forward(const nmz_trace_event *ev, const print_opts *o);
 void pr_act_map_backward(const nmz_trace_event *ev, const print_opts *o);
 void pr_adam_header(const nmz_trace_event *ev);
 void pr_adam_update(const nmz_trace_event *ev, const print_opts *o);
+void print_sgd_update(const nmz_trace_event *ev, const print_opts *o);
+
+/* print_seq.c: the unrolled view of a character RNN. unit < 0 = automatic;
+ * last_norms[t] = |dL_last/dh_t| from a backward pass with only the last
+ * step's loss (may be NULL). */
+void print_seq_trace(const nmz_trace_recorder *rec, const nmz_vocab *v, const print_opts *o, int applied, int unit,
+                     const double *last_norms, int n_last);
 void print_rule(void);
 
 #endif

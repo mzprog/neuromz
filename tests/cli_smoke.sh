@@ -107,6 +107,43 @@ check 1 "make data" env NEUROMZ_DATA="$T/none" "$B" -m "$T/img.nmz" test mnist
 check 1 "unknown optimizer" "$B" new 2 4 1 --optimizer rmsprop
 check 1 "unknown normalization" "$B" new 2 4 1 --normalize max
 
+# --- text models: character RNN, Arabic, generation, unrolled trace
+check 0 "\[preset\]" "$B" new --preset names --epochs 3 -o "$T/n.nmz"
+check 0 "validation" "$B" -m "$T/n.nmz" train examples/names_en.txt --limit 300 -o "$T/n.nmz"
+check 0 " 5\. " "$B" -m "$T/n.nmz" generate --count 5 --data examples/names_en.txt
+"$B" -m "$T/n.nmz" generate --seed 7 --count 3 >"$T/g1" 2>&1
+"$B" -m "$T/n.nmz" generate --seed 7 --count 3 >"$T/g2" 2>&1
+check 0 "" cmp "$T/g1" "$T/g2"                     # same seed, same names
+check 0 "Mar" "$B" -m "$T/n.nmz" generate --prime Mar --count 2 --temperature 0.5 --top-k 3
+check 0 "U+000A" "$B" -m "$T/n.nmz" show vocab
+check 0 "perplexity" "$B" -m "$T/n.nmz" test examples/names_en.txt --limit 50
+check 0 "UNROLLED" "$B" -m "$T/n.nmz" trace --text "Anna"
+check 0 "VANISHING" "$B" -m "$T/n.nmz" trace --text "Christopher" --unit 3
+check 0 "Weights updated" "$B" -m "$T/n.nmz" step --sample 2 --data examples/names_en.txt
+check 0 "PASS" "$B" -m "$T/n.nmz" gradcheck --text "Eve"
+check 0 "\[preset\]" "$B" new --preset names --data examples/names_ar.txt --epochs 2 -o "$T/ar.nmz"
+check 0 "validation" "$B" -m "$T/ar.nmz" train examples/names_ar.txt -o "$T/ar.nmz"
+check 0 " 3\. " "$B" -m "$T/ar.nmz" generate --count 3
+check 0 "م ح م" "$B" -m "$T/ar.nmz" trace --text "محمد"
+check 0 "U+0645" "$B" --ascii -m "$T/ar.nmz" trace --text "محمد"
+check 0 "rnn Tx4->Tx6" "$B" new text embed:4 rnn:6 vocab --data examples/names_en.txt --seq-len 8 --no-carry
+check 1 "not in the model's vocabulary" "$B" -m "$T/ar.nmz" trace --text "abc"
+check 1 "not in the model's vocabulary" "$B" -m "$T/ar.nmz" train examples/names_en.txt
+check 1 "at least 2 characters" "$B" -m "$T/n.nmz" trace --text "A"
+check 1 "needs --data" "$B" new text embed:8 rnn:8 vocab
+check 1 "starts with an embedding" "$B" new text rnn:8 vocab --data examples/names_en.txt
+check 1 "need the .text. input" "$B" new 4 rnn:8 3
+check 1 "text model" "$B" -m "$T/xor.nmz" generate
+printf 'ab\377cd\nabce\nabcf\n' >"$T/bad.txt"
+check 0 "U+FFFD" sh -c "\"$B\" new text embed:2 rnn:3 vocab --data \"$T/bad.txt\" --seq-len 2 -o \"$T/b.nmz\" && \"$B\" -m \"$T/b.nmz\" show vocab"
+if [ -f data/alice.txt ]; then
+    check 0 "\[preset\]" "$B" new --preset char-rnn --epochs 1 -o "$T/c.nmz"
+    check 0 "validation" "$B" -m "$T/c.nmz" train data/alice.txt --limit 60 -o "$T/c.nmz"
+    check 0 "" "$B" -m "$T/c.nmz" generate --length 40 --prime "Alice"
+else
+    echo "skip char-rnn checks (run make data-text)"
+fi
+
 # --- MNIST (only when `make data` has been run)
 if [ -f data/train-images-idx3-ubyte ] && [ -f data/t10k-labels-idx1-ubyte ]; then
     check 0 "\[preset\]" "$B" new --preset mnist-cnn --epochs 1 -o "$T/m.nmz"

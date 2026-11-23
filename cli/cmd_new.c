@@ -680,6 +680,8 @@ int cmd_new(cli_state *st, int argc, char **argv) {
             case LS_DENSE:
                 snprintf(what, sizeof what, "%s %s->%s", is_out ? "output" : "dense", in, outs);
                 snprintf(val, sizeof val, "%s", nmz_act_name(sp->act));
+                if (!why && is_out && is_text && sp->act == NMZ_ACT_SOFTMAX)
+                    why = "applied at every time step: probabilities for the next character";
                 if (!why) why = sp->act_set ? cli_act_reason(sp->act)
                                             : (is_out ? q.why_output_act
                                                       : (has_conv ? "relu, like the conv layers (He init)" : q.why_hidden_act));
@@ -749,12 +751,17 @@ int cmd_new(cli_state *st, int argc, char **argv) {
     explain("optimizer", nmz_optimizer_name(o.optimizer), tag_of(mask & CLI_SET_OPTIMIZER, pre != NULL),
             pre && !(mask & CLI_SET_OPTIMIZER) ? pre->why_opt
             : o.optimizer == NMZ_OPT_ADAM
-                ? (has_conv ? "Adam: per-weight step sizes, robust for conv nets" : "Adam: per-weight step sizes from running gradient averages")
+                ? (has_conv ? "Adam: per-weight step sizes, robust for conv nets"
+                   : is_text ? "Adam: per-weight step sizes; robust for embedding + recurrent weights"
+                             : "Adam: per-weight step sizes from running gradient averages")
                 : "gradient descent with momentum: the textbook method");
     snprintf(buf, sizeof buf, "%g", (double)o.learning_rate);
     explain("learning rate", buf, tag_of(mask & CLI_SET_LR, pre != NULL),
             pre && !(mask & CLI_SET_LR) ? pre->why_lr
-            : o.optimizer == NMZ_OPT_ADAM ? "0.001 is Adam's standard step size" : qt.why_learning_rate);
+            : o.optimizer == NMZ_OPT_ADAM
+                ? (is_text && o.learning_rate > 0.0015f ? "a bit above Adam's usual 0.001: fine for a small RNN with clipping"
+                                                       : "0.001 is Adam's standard step size")
+                : qt.why_learning_rate);
     if (o.optimizer == NMZ_OPT_SGD) {
         snprintf(buf, sizeof buf, "%g", (double)o.momentum);
         explain("momentum", buf, tag_of(mask & CLI_SET_MOMENTUM, 0), qt.why_momentum);
@@ -775,10 +782,14 @@ int cmd_new(cli_state *st, int argc, char **argv) {
     snprintf(buf, sizeof buf, "%d", o.max_epochs);
     explain("max epochs", buf, tag_of(mask & CLI_SET_EPOCHS, pre != NULL),
             pre && !(mask & CLI_SET_EPOCHS) ? pre->why_epochs
-            : has_conv ? "at most 10 passes; use --limit while experimenting" : qt.why_epochs);
+            : has_conv ? "at most 10 passes; use --limit while experimenting"
+            : is_text  ? "at most 30 passes; early stopping usually ends sooner"
+                       : qt.why_epochs);
     snprintf(buf, sizeof buf, "%g", o.target_loss);
     explain("target loss", buf, tag_of(mask & CLI_SET_TARGET, pre != NULL),
-            pre && !(mask & CLI_SET_TARGET) ? pre->why_target : qt.why_target_loss);
+            pre && !(mask & CLI_SET_TARGET) ? pre->why_target
+            : is_text && !(mask & CLI_SET_TARGET) ? "0 = no loss target; the validation loss decides (patience)"
+                                                  : qt.why_target_loss);
     explain("shuffle", o.shuffle ? "on" : "off", tag_of(mask & CLI_SET_SHUFFLE, 0),
             "visit samples in a new random order every epoch");
     if (is_text) {

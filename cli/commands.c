@@ -799,6 +799,195 @@ static int sample_tensors(cli_state *st, const sample_args *a, nmz_tensor *x, nm
     return 0;
 }
 
+/* ------------------------------------------------------ trace on a sequence */
+
+typedef struct seq_args {
+    int *ids, *tgt, T, unit, full;
+    long sample;
+    const char *data, *json, *text;
+    print_opts po;
+    nmz_train_opts o;
+    unsigned mask;
+} seq_args;
+
+static int parse_seq_args(cli_state *st, int argc, char **argv, seq_args *a) {
+    const nmz_vocab *v = nmz_net_vocab(st->net);
+    int i;
+    long n;
+    memset(a, 0, sizeof *a);
+    a->o = *nmz_net_train_config(st->net);
+    a->unit = -1;
+    for (i = 1; i < argc; i++) {
+        const char *s = argv[i], *val;
+        if (!strcmp(s, "--full")) {
+            a->full = 1;
+            continue;
+        }
+        if (!strcmp(s, "--text") || !strcmp(s, "--sample") || !strcmp(s, "--data") || !strcmp(s, "--json") ||
+            !strcmp(s, "--unit")) {
+            if (!(val = cli_opt_value(argc, argv, &i))) return 1;
+            if (!strcmp(s, "--text")) a->text = val;
+            else if (!strcmp(s, "--data")) a->data = val;
+            else if (!strcmp(s, "--json")) a->json = val;
+            else if (!strcmp(s, "--sample")) {
+                if (!cli_parse_int(val, 1, 1000000000L, &a->sample)) return fail("--sample needs a positive integer, got '%s'", val);
+            } else {
+                if (!cli_parse_int(val, 1, 100000, &n)) return fail("--unit needs a positive integer (1-based), got '%s'", val);
+                a->unit = (int)n - 1;
+            }
+            continue;
+        }
+        if (cli_is_option(s)) {
+            int r = cli_train_option(argc, argv, &i, &a->o, &a->mask);
+            if (r < 0) return 1;
+            if (r) continue;
+        }
+        return fail("unexpected '%s' (for a text model: trace --text \"some text\" or --sample N --data FILE)", s);
+    }
+    if (a->text) {
+        uint32_t *cp = NULL;
+        size_t m = 0, bad = 0, k;
+        if (nmz_utf8_decode(a->text, strlen(a->text), &cp, &m, &bad) != NMZ_OK) return lib_fail("--text");
+        if (m < 2 || m > 10000) {
+            free(cp);
+            return fail("--text needs at least 2 characters (the net predicts each next one)%s", NULL);
+        }
+        a->T = (int)m - 1;
+        a->ids = malloc(m * sizeof *a->ids);
+        a->tgt = malloc(m * sizeof *a->tgt);
+        if (!a->ids || !a->tgt) {
+            free(cp);
+            return fail("out of memory%s", NULL);
+        }
+        for (k = 0; k < m; k++) {
+            int id = nmz_vocab_index(v, cp[k]);
+            if (id < 0) {
+                char lbl[24];
+                fprintf(stderr, "error: '%s' (U+%04X) is not in the model's vocabulary (`show vocab` lists it)\n",
+                        cli_char_label(cp[k], lbl, sizeof lbl), (unsigned)cp[k]);
+                free(cp);
+                return 1;
+            }
+            if (k + 1 < m) a->ids[k] = id;
+            if (k > 0) a->tgt[k - 1] = id;
+        }
+        free(cp);
+    } else if (a->sample) {
+        nmz_dataset *ds = NULL;
+        int t;
+        if (!a->data) return fail("--sample N needs --data FILE (the text to take sequence N from)%s", NULL);
+        if (cli_load_data(st, a->data, 0, (int)a->sample, -1, a->o.seq_len, &ds)) return 1;
+        if (a->sample > ds->n_samples) {
+            fprintf(stderr, "error: sequence %ld is out of range (1..%d)\n", a->sample, ds->n_samples);
+            nmz_dataset_free(ds);
+            return 1;
+        }
+        a->T = ds->time_steps;
+        a->ids = malloc((size_t)a->T * sizeof *a->ids);
+        a->tgt = malloc((size_t)a->T * sizeof *a->tgt);
+        if (!a->ids || !a->tgt) {
+            nmz_dataset_free(ds);
+            return fail("out of memory%s", NULL);
+        }
+        for (t = 0; t < a->T; t++) {
+            a->ids[t] = (int)ds->x[(size_t)(a->sample - 1) * a->T + t];
+            a->tgt[t] = (int)ds->y[(size_t)(a->sample - 1) * a->T + t];
+        }
+        nmz_dataset_free(ds);
+    } else {
+        return fail("give a sequence: trace --text \"some text\" (or --sample N --data FILE)%s", NULL);
+    }
+    a->po.full = a->full;
+    a->po.max_rows = a->full ? 0 : 24;
+    a->po.max_terms = a->full ? 0 : 6;
+    a->po.at_set = a->unit >= 0;
+    return 0;
+}
+
+static int seq_tensors(const seq_args *a, int V, int last_only, nmz_tensor *x, nmz_tensor *t) {
+    int xs[2], ts[3], k;
+    xs[0] = ts[0] = 1;
+    xs[1] = ts[1] = a->T;
+    ts[2] = V;
+    if (nmz_tensor_reshape(x, 2, xs) != NMZ_OK || nmz_tensor_reshape(t, 3, ts) != NMZ_OK) return 1;
+    nmz_tensor_zero(t);
+    for (k = 0; k < a->T; k++) {
+        x->data[k] = (float)a->ids[k];
+        if (!last_only || k == a->T - 1) t->data[(size_t)k * V + a->tgt[k]] = 1.0f;
+    }
+    return 0;
+}
+
+static int run_trace_seq(cli_state *st, int argc, char **argv, int apply) {
+    seq_args a;
+    nmz_trace_recorder *rec = NULL;
+    nmz_tensor x = NMZ_TENSOR_EMPTY, t = NMZ_TENSOR_EMPTY;
+    const nmz_vocab *v = nmz_net_vocab(st->net);
+    double *last = NULL, L = 0;
+    int rc = 1, V = nmz_net_output_size(st->net), k;
+    if (parse_seq_args(st, argc, argv, &a)) goto out;
+    if (!v || v->size != V) {
+        fail("this sequence model has no matching vocabulary%s", NULL);
+        goto out;
+    }
+    if (nmz_trace_recorder_create(&rec) != NMZ_OK) goto lib;
+    /* 1. the loss of the last step alone, followed back through time */
+    last = calloc((size_t)a.T, sizeof *last);
+    if (!last || seq_tensors(&a, V, 1, &x, &t)) goto lib;
+    nmz_net_set_trace(st->net, nmz_trace_recorder_fn, rec);
+    if (nmz_net_forward_mode(st->net, &x, 0, NULL) != NMZ_OK || nmz_net_backward(st->net, &t, NULL) != NMZ_OK) goto lib;
+    for (k = 0; k < (int)nmz_trace_recorder_count(rec); k++) {
+        const nmz_trace_event *ev = nmz_trace_recorder_get(rec, (size_t)k);
+        if (ev->phase == NMZ_TRACE_BACKWARD && !strcmp(ev->layer_type, "rnn") && ev->time_step >= 0 &&
+            ev->time_step < a.T) {
+            const nmz_tensor *g = nmz_trace_find(ev, "dL/dh");
+            double s2 = 0;
+            size_t e;
+            for (e = 0; g && e < g->size; e++) s2 += (double)g->data[e] * g->data[e];
+            last[ev->time_step] = sqrt(s2);
+        }
+    }
+    nmz_trace_recorder_clear(rec);
+    /* 2. the real pass: every step's loss */
+    if (seq_tensors(&a, V, 0, &x, &t)) goto lib;
+    if (nmz_net_forward_mode(st->net, &x, apply, NULL) != NMZ_OK || nmz_net_backward(st->net, &t, &L) != NMZ_OK) goto lib;
+    if (a.o.clip_norm > 0 && nmz_net_clip_gradients(st->net, a.o.clip_norm, NULL, NULL) != NMZ_OK) goto lib;
+    if (apply ? nmz_net_optimizer_step(st->net, &a.o, a.o.learning_rate) != NMZ_OK
+              : nmz_net_optimizer_preview(st->net, &a.o, a.o.learning_rate) != NMZ_OK)
+        goto lib;
+    nmz_net_set_trace(st->net, NULL, NULL);
+    if (nmz_trace_recorder_status(rec) != NMZ_OK) {
+        fail("out of memory while recording the trace%s", NULL);
+        goto out;
+    }
+    printf("%s of one sequence (%d steps): every value of the forward and backward pass, unrolled through time\n",
+           apply ? "STEP" : "TRACE", a.T);
+    print_seq_trace(rec, v, &a.po, apply, a.unit, last, a.T);
+    printf("\n");
+    print_rule();
+    if (apply) {
+        printf("Weights updated (training step %ld). Loss before the step: %.6g\n", nmz_net_step(st->net), L);
+        st->dirty = 1;
+    } else {
+        printf("Loss %.6g (perplexity %.3f). Nothing was changed; `step` with the same arguments applies the update.\n", L,
+               exp(L));
+    }
+    if (a.json && write_json(rec, a.json)) goto out;
+    rc = 0;
+    goto out;
+lib:
+    nmz_net_set_trace(st->net, NULL, NULL);
+    lib_fail(apply ? "step" : "trace");
+out:
+    nmz_trace_recorder_free(rec);
+    nmz_tensor_free(&x);
+    nmz_tensor_free(&t);
+    free(last);
+    free(a.ids);
+    free(a.tgt);
+    return rc;
+}
+
 static int run_trace(cli_state *st, int argc, char **argv, int apply) {
     sample_args a;
     nmz_trace_recorder *rec = NULL;
@@ -807,6 +996,7 @@ static int run_trace(cli_state *st, int argc, char **argv, int apply) {
     double L;
     if (!need_net(st)) return 1;
     if (nmz_net_layer_count(st->net) == 0) return fail("the network has no layers%s", NULL);
+    if (nmz_net_is_sequence(st->net)) return run_trace_seq(st, argc, argv, apply);
     if (parse_sample(st, argc, argv, &a, 1, 1)) goto out;
     if (sample_tensors(st, &a, &x, &t)) goto lib;
     if (nmz_trace_recorder_create(&rec) != NMZ_OK) goto lib;
@@ -814,6 +1004,7 @@ static int run_trace(cli_state *st, int argc, char **argv, int apply) {
     /* trace = evaluation-mode pass + preview (changes nothing); step = a real training step */
     if (nmz_net_forward_mode(st->net, &x, apply, NULL) != NMZ_OK || nmz_net_backward(st->net, &t, &L) != NMZ_OK)
         goto lib;
+    if (a.o.clip_norm > 0 && nmz_net_clip_gradients(st->net, a.o.clip_norm, NULL, NULL) != NMZ_OK) goto lib;
     if (apply ? nmz_net_optimizer_step(st->net, &a.o, a.o.learning_rate) != NMZ_OK
               : nmz_net_optimizer_preview(st->net, &a.o, a.o.learning_rate) != NMZ_OK)
         goto lib;
@@ -857,8 +1048,17 @@ static int cmd_gradcheck(cli_state *st, int argc, char **argv) {
     nmz_gradcheck_result r;
     int rc = 1;
     if (!need_net(st)) return 1;
-    if (parse_sample(st, argc, argv, &a, 0, 1)) goto out;
-    if (sample_tensors(st, &a, &x, &t)) goto out;
+    memset(&a, 0, sizeof a);
+    if (nmz_net_is_sequence(st->net)) {
+        seq_args sa;
+        int ok = !parse_seq_args(st, argc, argv, &sa) && !seq_tensors(&sa, nmz_net_output_size(st->net), 0, &x, &t);
+        free(sa.ids);
+        free(sa.tgt);
+        if (!ok) goto out;
+    } else {
+        if (parse_sample(st, argc, argv, &a, 0, 1)) goto out;
+        if (sample_tensors(st, &a, &x, &t)) goto out;
+    }
     if (nmz_net_gradcheck_mode(st->net, &x, &t, 1e-3, 0, 0, 0, &r) != NMZ_OK) {
         lib_fail("gradcheck");
         goto out;
@@ -1013,12 +1213,15 @@ static const cmd k_cmds[] = {
      "Loss and accuracy on a dataset (`mnist` = the 10 000 test images), with a confusion matrix."},
     {"predict", cmd_predict, "predict X1 ... Xn  |  predict --sample N [--data SPEC]",
      "Run one sample forward and print the outputs."},
-    {"trace", cmd_trace_fwd, "trace (X1 ... Xn --target T... | --sample N [--data SPEC]) [--at F,Y,X] [--json FILE] [--full]",
+    {"trace", cmd_trace_fwd, "trace (X1 ... Xn --target T... | --sample N [--data SPEC] | --text TEXT) [--at F,Y,X] [--unit J] [--json FILE] [--full]",
      "Run ONE sample forward and backward and print every value with its formula; conv layers show\n"
      "  the receptive-field patch, the kernel, the products and the sum at one output position\n"
      "  (--at FILTER,ROW,COL, 1-based; default: filter 1 at the centre), max-pool shows the window and\n"
      "  its winner. Nothing is changed (evaluation mode; the update is only previewed).\n"
-     "  --target may be a class name; with --sample the dataset label is the target."},
+     "  --target may be a class name; with --sample the dataset label is the target.\n"
+     "  Text models: trace --text \"Alice was\" (or --sample N --data FILE) shows the RNN unrolled through\n"
+     "  time (h_t = tanh(...) for hidden unit --unit J, top-5 next characters), a heatmap of the hidden\n"
+     "  state, backpropagation through time and how the gradient vanishes or explodes."},
     {"step", cmd_step_fwd, "step (same arguments as trace) [--lr X] [--optimizer ...]",
      "Like trace, but in training mode and the weight update is applied: one step you can follow."},
     {"generate", cmd_generate,
@@ -1028,7 +1231,7 @@ static const cmd k_cmds[] = {
      "  file are marked, --new-only skips them. Running-text models print --length characters (300).\n"
      "  --temperature < 1 is safer/more repetitive, > 1 wilder; --top-k K samples among the K most\n"
      "  likely characters only; the same --seed gives the same text."},
-    {"gradcheck", cmd_gradcheck, "gradcheck (X1 ... Xn --target T... | --sample N [--data SPEC])",
+    {"gradcheck", cmd_gradcheck, "gradcheck (X1 ... Xn --target T... | --sample N [--data SPEC] | --text TEXT)",
      "Compare every backprop gradient with a numerical derivative (L(w+e)-L(w-e))/2e."},
     {"save", cmd_save, "save [FILE] [--no-optimizer]",
      "Save (portable .nmz). Optimizer state is included so training can resume; --no-optimizer omits it."},

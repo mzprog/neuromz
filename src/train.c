@@ -112,8 +112,11 @@ static int accuracy_mode(const nmz_net *net, const nmz_dataset *ds) {
     return 2;
 }
 
-/* loss/accuracy over samples [first, first+count); stateless (carry off) */
-static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, int first, int count, double *loss,
+/* loss/accuracy over samples [first, first+count). Stateless (every sample
+ * from a zero state) unless `carry`: then the samples are read in order as
+ * one stream, one at a time, with the recurrent state carried — the way a
+ * model trained with carry_state is meant to run. */
+static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, int first, int count, int carry, double *loss,
                                  double *accuracy) {
     nmz_tensor xb = NMZ_TENSOR_EMPTY, tb = NMZ_TENSOR_EMPTY;
     nmz_trace_fn saved_fn = net->trace;
@@ -122,9 +125,10 @@ static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, int first,
     double total = 0.0;
     long correct = 0;
     int start, mode = accuracy_mode(net, ds), T = steps_of(ds);
-    const int chunk = ds->time_steps > 0 ? 64 : 256;
+    const int chunk = carry ? 1 : ds->time_steps > 0 ? 64 : 256;
     net->trace = NULL; /* evaluation is not part of the traced math */
-    net->carry = 0;    /* every sequence starts from a zero state */
+    net->carry = carry != 0;
+    nmz_net_reset_state(net);
     for (start = first; start < first + count; start += chunk) {
         int b = first + count - start < chunk ? first + count - start : chunk, r, k;
         const nmz_tensor *y;
@@ -147,6 +151,7 @@ static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, int first,
     }
     net->trace = saved_fn;
     net->carry = saved_carry;
+    nmz_net_reset_state(net);
     nmz_tensor_free(&xb);
     nmz_tensor_free(&tb);
     if (s != NMZ_OK) return s;
@@ -160,7 +165,7 @@ nmz_status nmz_net_evaluate(nmz_net *net, const nmz_dataset *ds, double *loss, d
     if (!net) return nmz__fail(NMZ_ERR_ARG, "net is NULL");
     if ((s = nmz_net_build(net)) != NMZ_OK) return s;
     if ((s = nmz__net_check_dataset(net, ds)) != NMZ_OK) return s;
-    return evaluate_range(net, ds, 0, ds->n_samples, loss, accuracy);
+    return evaluate_range(net, ds, 0, ds->n_samples, net->train.carry_state && ds->time_steps > 0, loss, accuracy);
 }
 
 /* copy all parameters to/from one flat buffer (early stopping) */
@@ -281,8 +286,8 @@ nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_op
         net->training = 0;
         net->carry = 0;
         nmz_net_reset_state(net);
-        if ((s = evaluate_range(net, ds, 0, n, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
-        if (n_val && (s = evaluate_range(net, ds, n, n_val, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
+        if ((s = evaluate_range(net, ds, 0, n, o.carry_state, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
+        if (n_val && (s = evaluate_range(net, ds, n, n_val, o.carry_state, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
         res.epochs = epoch;
         if (!isfinite(res.loss)) {
             s = nmz__fail(NMZ_ERR_NUMERIC, "loss became NaN/Inf in epoch %d — the learning rate (%g) is probably too high",
@@ -310,8 +315,8 @@ nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_op
     if (best && best_epoch > 0 && best_epoch != res.epochs) { /* go back to the best weights */
         params_copy(net, best, 0);
         res.best_epoch = best_epoch;
-        if ((s = evaluate_range(net, ds, 0, n, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
-        if ((s = evaluate_range(net, ds, n, n_val, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
+        if ((s = evaluate_range(net, ds, 0, n, o.carry_state, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
+        if ((s = evaluate_range(net, ds, n, n_val, o.carry_state, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
     } else if (best) {
         res.best_epoch = best_epoch;
     }
