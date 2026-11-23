@@ -379,7 +379,7 @@ static nmz_status idx_open(const char *path, uint32_t magic, int ndims, uint32_t
 
 nmz_status nmz_dataset_load_idx(nmz_dataset **out, const char *images_path, const char *labels_path, int limit) {
     FILE *fi = NULL, *fl = NULL;
-    uint32_t di[3], dl[1];
+    uint32_t di[3] = {0, 0, 0}, dl[1] = {0};
     nmz_dataset *ds = NULL;
     unsigned char *pixels = NULL, *labels = NULL;
     size_t pix, n, i, k;

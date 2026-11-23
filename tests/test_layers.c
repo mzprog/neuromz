@@ -95,14 +95,19 @@ static void test_gradcheck_conv(void) {
         {"conv 1->1, 5x5, s3 p2, 7x7", 1, 7, 7, 1, 5, 5, 3, 2},
     };
     size_t i;
-    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        nmz_net *net = net3(cases[i].c, cases[i].h, cases[i].w, 100 + i);
-        CHECK_OK(nmz_net_add(net, nmz_layer_conv2d(cases[i].filters, cases[i].kh, cases[i].kw, cases[i].stride,
-                                                   cases[i].pad, NMZ_INIT_AUTO)));
-        head(net, 3);
-        check(cases[i].label, net, 2, 0, 0, 1, 200 + i);
-        nmz_net_free(net);
-    }
+    int algo;
+    for (algo = 0; algo < 2; algo++)
+        for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char label[96];
+            nmz_net *net = net3(cases[i].c, cases[i].h, cases[i].w, 100 + i);
+            CHECK_OK(nmz_net_add(net, nmz_layer_conv2d(cases[i].filters, cases[i].kh, cases[i].kw, cases[i].stride,
+                                                       cases[i].pad, NMZ_INIT_AUTO)));
+            CHECK_OK(nmz_layer_conv2d_set_algo(nmz_net_layer(net, 0), (nmz_conv_algo)algo));
+            head(net, 3);
+            snprintf(label, sizeof label, "%s [%s]", cases[i].label, algo ? "naive" : "im2col");
+            check(label, net, 2, 0, 0, 1, 200 + i);
+            nmz_net_free(net);
+        }
     {
         /* activation between conv and head, softmax + CE output */
         nmz_net *net = net3(2, 6, 6, 7);
@@ -349,7 +354,53 @@ static void test_gradcheck_kink(void) {
     nmz_net_free(net);
 }
 
+/* im2col and the naive loops compute the same thing */
+static void test_conv_algos_agree(void) {
+    nmz_net *a = net3(3, 9, 8, 1), *b = net3(3, 9, 8, 1);
+    nmz_tensor x = NMZ_TENSOR_EMPTY, t = NMZ_TENSOR_EMPTY;
+    const nmz_tensor *ya, *yb;
+    nmz_rng r;
+    int xs[4] = {2, 3, 9, 8}, ts[2], i, j;
+    size_t e;
+    double worst = 0;
+    nmz_rng_seed(&r, 3, 3);
+    CHECK_OK(nmz_net_add(a, nmz_layer_conv2d(4, 3, 2, 2, 1, NMZ_INIT_AUTO)));
+    CHECK_OK(nmz_net_add(b, nmz_layer_conv2d(4, 3, 2, 2, 1, NMZ_INIT_AUTO)));
+    CHECK_OK(nmz_layer_conv2d_set_algo(nmz_net_layer(b, 0), NMZ_CONV_NAIVE));
+    CHECK(nmz_layer_conv2d_set_algo(NULL, NMZ_CONV_NAIVE) == NMZ_ERR_ARG);
+    head(a, 2);
+    head(b, 2);
+    CHECK_OK(nmz_net_build(a));
+    CHECK_OK(nmz_net_build(b)); /* same seed → same weights */
+    CHECK_OK(nmz_tensor_init(&x, 4, xs));
+    fill(&x, &r, -1, 1);
+    CHECK_OK(nmz_net_forward(a, &x, &ya));
+    CHECK_OK(nmz_net_forward(b, &x, &yb));
+    for (e = 0; e < ya->size; e++) CHECK_NEAR(ya->data[e], yb->data[e], 1e-5);
+    ts[0] = 2;
+    ts[1] = 2;
+    CHECK_OK(nmz_tensor_init(&t, 2, ts));
+    fill(&t, &r, 0, 1);
+    CHECK_OK(nmz_net_backward(a, &t, NULL));
+    CHECK_OK(nmz_net_backward(b, &t, NULL));
+    for (i = 0; i < nmz_net_layer_count(a); i++)
+        for (j = 0; j < nmz_layer_param_count(nmz_net_layer(a, i)); j++) {
+            const nmz_tensor *ga = nmz_layer_param_grad(nmz_net_layer(a, i), j), *gb = nmz_layer_param_grad(nmz_net_layer(b, i), j);
+            for (e = 0; e < ga->size; e++)
+                if (fabs(ga->data[e] - gb->data[e]) > worst) worst = fabs(ga->data[e] - gb->data[e]);
+        }
+    for (e = 0; e < x.size; e++)
+        if (fabs(nmz_net_input_grad(a)->data[e] - nmz_net_input_grad(b)->data[e]) > worst)
+            worst = fabs(nmz_net_input_grad(a)->data[e] - nmz_net_input_grad(b)->data[e]);
+    CHECK_MSG(worst < 1e-5, "largest gradient difference %g", worst);
+    nmz_tensor_free(&x);
+    nmz_tensor_free(&t);
+    nmz_net_free(a);
+    nmz_net_free(b);
+}
+
 const test_case layer_tests[] = {
+    {"layers/conv_im2col_equals_naive", test_conv_algos_agree},
     {"layers/gradcheck_skips_kinks", test_gradcheck_kink},
     {"layers/gradcheck_conv2d", test_gradcheck_conv},
     {"layers/gradcheck_pool_flatten_cnn", test_gradcheck_pool_flatten},

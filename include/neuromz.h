@@ -140,6 +140,11 @@ nmz_layer *nmz_layer_activation(nmz_act act, float alpha);
  * activation follows. Output [filters, OH, OW], OH = (H + 2·pad − kh)/stride + 1. */
 #define NMZ_PAD_SAME (-1)
 nmz_layer *nmz_layer_conv2d(int filters, int kh, int kw, int stride, int pad, nmz_init init);
+/* How conv2d computes (same results up to float rounding): im2col (default;
+ * receptive fields copied into a matrix, then matrix products) or the naive
+ * nested loops that mirror the formula. Not saved in model files. */
+typedef enum nmz_conv_algo { NMZ_CONV_IM2COL = 0, NMZ_CONV_NAIVE } nmz_conv_algo;
+nmz_status nmz_layer_conv2d_set_algo(nmz_layer *l, nmz_conv_algo algo);
 /* Max pooling over size × size windows (stride 0 = size), no padding. */
 nmz_layer *nmz_layer_maxpool2d(int size, int stride);
 /* [d1, d2, ...] → [d1·d2·...] (needed between conv/pool and dense layers). */

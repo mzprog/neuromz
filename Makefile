@@ -13,7 +13,7 @@
 CC      ?= cc
 AR      ?= ar
 WARN    := -Wall -Wextra -Werror -pedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes
-CFLAGS  ?= -O2 -g
+CFLAGS  ?= -O3 -g
 ALL_CFLAGS := -std=c11 $(WARN) $(CFLAGS) -Iinclude
 LDLIBS  := -lm
 
@@ -73,7 +73,10 @@ examples: $(CLI) $(BUILD)/api_xor
 data:
 	sh scripts/get_mnist.sh data
 
-bench: $(CLI)
+$(BUILD)/bench_conv: examples/bench_conv.c $(LIB)
+	$(CC) $(ALL_CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+bench: $(CLI) $(BUILD)/bench_conv
 	sh examples/benchmark.sh ./$(CLI)
 	sh examples/benchmark_mnist.sh ./$(CLI)
 

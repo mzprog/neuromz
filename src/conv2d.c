@@ -18,12 +18,15 @@
 #include <string.h>
 
 typedef struct conv_layer {
+    nmz_conv_algo algo;
     int filters, kh, kw, stride, pad;
     int same; /* pad was requested as "same" */
     nmz_init init, resolved;
     int C, H, W, OH, OW;
     nmz_tensor Wt, b, dW, db;
     double *acc; /* dW accumulator (one batch), same size as W */
+    float *col;  /* im2col: [C·KH·KW, OH·OW] for one sample */
+    float *dcol; /* gradient of col */
 } conv_layer;
 
 static nmz_status conv_setup(nmz_layer *l, int in_rank, const int *in_shape, int *out_rank,
@@ -59,6 +62,15 @@ static nmz_status conv_setup(nmz_layer *l, int in_rank, const int *in_shape, int
     free(c->acc);
     c->acc = malloc(c->Wt.size * sizeof *c->acc);
     if (!c->acc) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+    {
+        size_t K = (size_t)c->C * c->kh * c->kw;
+        size_t P = (size_t)((c->H + 2 * c->pad - c->kh) / c->stride + 1) * (size_t)((c->W + 2 * c->pad - c->kw) / c->stride + 1);
+        free(c->col);
+        free(c->dcol);
+        c->col = malloc(K * P * sizeof *c->col);
+        c->dcol = malloc(K * P * sizeof *c->dcol);
+        if (!c->col || !c->dcol) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+    }
     *out_rank = 3;
     out_shape[0] = c->filters;
     out_shape[1] = c->OH;
@@ -92,8 +104,113 @@ static void emit(const nmz_ctx *ctx, conv_layer *c, nmz_trace_phase ph, int n, c
     nmz_trace_emit(ctx, ph, "conv2d", "", 2, sc, n, it);
 }
 
+/* ------------------------------------------------------------- im2col
+ * The same math as the loops below, rearranged: every receptive field is
+ * copied into one column of `col` ([C·KH·KW rows, OH·OW columns]), so the
+ * convolution becomes a matrix product z[f,:] = b[f] + W[f,:]·col whose
+ * inner loop runs over contiguous memory. Backward: dW += dz·colᵀ,
+ * dcol = Wᵀ·dz, then dcol is scattered back ("col2im") into dx. */
+
+static void im2col(const conv_layer *c, const float *xs, float *col) {
+    int ch, ky, kx, oy, ox;
+    size_t P = (size_t)c->OH * c->OW, k = 0;
+    for (ch = 0; ch < c->C; ch++)
+        for (ky = 0; ky < c->kh; ky++)
+            for (kx = 0; kx < c->kw; kx++, k++) {
+                float *row = col + k * P;
+                const float *xc = xs + (size_t)ch * c->H * c->W;
+                for (oy = 0; oy < c->OH; oy++) {
+                    int iy = oy * c->stride + ky - c->pad;
+                    for (ox = 0; ox < c->OW; ox++) {
+                        int ix = ox * c->stride + kx - c->pad;
+                        row[oy * c->OW + ox] = (iy < 0 || iy >= c->H || ix < 0 || ix >= c->W) ? 0.0f : xc[iy * c->W + ix];
+                    }
+                }
+            }
+}
+
+static void col2im_add(const conv_layer *c, const float *dcol, float *dxs) {
+    int ch, ky, kx, oy, ox;
+    size_t P = (size_t)c->OH * c->OW, k = 0;
+    for (ch = 0; ch < c->C; ch++)
+        for (ky = 0; ky < c->kh; ky++)
+            for (kx = 0; kx < c->kw; kx++, k++) {
+                const float *row = dcol + k * P;
+                float *dxc = dxs + (size_t)ch * c->H * c->W;
+                for (oy = 0; oy < c->OH; oy++) {
+                    int iy = oy * c->stride + ky - c->pad;
+                    if (iy < 0 || iy >= c->H) continue;
+                    for (ox = 0; ox < c->OW; ox++) {
+                        int ix = ox * c->stride + kx - c->pad;
+                        if (ix >= 0 && ix < c->W) dxc[iy * c->W + ix] += row[oy * c->OW + ox];
+                    }
+                }
+            }
+}
+
+static void forward_im2col(conv_layer *c, const nmz_tensor *x, nmz_tensor *y) {
+    int B = x->shape[0], bi, f;
+    size_t K = (size_t)c->C * c->kh * c->kw, P = (size_t)c->OH * c->OW, k, p;
+    size_t in_sample = (size_t)c->C * c->H * c->W;
+    for (bi = 0; bi < B; bi++) {
+        im2col(c, x->data + bi * in_sample, c->col);
+        for (f = 0; f < c->filters; f++) {
+            const float *wf = c->Wt.data + (size_t)f * K;
+            float *yf = y->data + ((size_t)bi * c->filters + (size_t)f) * P;
+            for (p = 0; p < P; p++) yf[p] = c->b.data[f];
+            for (k = 0; k < K; k++) {
+                const float w = wf[k], *ck = c->col + k * P;
+                for (p = 0; p < P; p++) yf[p] += w * ck[p];
+            }
+        }
+    }
+}
+
+static void backward_im2col(conv_layer *c, const nmz_tensor *x, const nmz_tensor *dy, nmz_tensor *dx) {
+    int B = x->shape[0], bi, f;
+    size_t K = (size_t)c->C * c->kh * c->kw, P = (size_t)c->OH * c->OW, k, p;
+    size_t in_sample = (size_t)c->C * c->H * c->W;
+    for (bi = 0; bi < B; bi++) {
+        const float *gs = dy->data + (size_t)bi * c->filters * P;
+        im2col(c, x->data + bi * in_sample, c->col);
+        if (dx) memset(c->dcol, 0, K * P * sizeof *c->dcol);
+        for (f = 0; f < c->filters; f++) {
+            const float *gf = gs + (size_t)f * P, *wf = c->Wt.data + (size_t)f * K;
+            double bsum = 0.0;
+            for (p = 0; p < P; p++) bsum += gf[p];
+            c->db.data[f] += (float)bsum;
+            for (k = 0; k < K; k++) {
+                const float *ck = c->col + k * P;
+                float part[8] = {0, 0, 0, 0, 0, 0, 0, 0}, s;
+                int j;
+                /* 8 independent partial sums: a dot product the compiler can vectorise
+                 * without reordering a single running sum */
+                for (p = 0; p + 8 <= P; p += 8)
+                    for (j = 0; j < 8; j++) part[j] += gf[p + (size_t)j] * ck[p + (size_t)j];
+                s = ((part[0] + part[1]) + (part[2] + part[3])) + ((part[4] + part[5]) + (part[6] + part[7]));
+                for (; p < P; p++) s += gf[p] * ck[p];
+                c->acc[(size_t)f * K + k] += s; /* per-sample sums are short; the batch total is double */
+                if (dx) {
+                    float w = wf[k], *dk = c->dcol + k * P;
+                    for (p = 0; p < P; p++) dk[p] += w * gf[p];
+                }
+            }
+        }
+        if (dx) col2im_add(c, c->dcol, dx->data + bi * in_sample);
+    }
+}
+
 static nmz_status conv_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, const nmz_ctx *ctx) {
     conv_layer *c = l->self;
+    if (c->algo == NMZ_CONV_IM2COL) {
+        forward_im2col(c, x, y);
+        if (NMZ_TRACING(ctx)) {
+            nmz_trace_item it[4] = {{"x", x}, {"W", &c->Wt}, {"b", &c->b}, {"z", y}};
+            emit(ctx, c, NMZ_TRACE_FORWARD, 4, it);
+        }
+        return NMZ_OK;
+    }
+    {
     int B = x->shape[0], bi, f, oy, ox, ch, ky, kx;
     const size_t in_plane = (size_t)c->H * c->W, in_sample = in_plane * c->C;
     const size_t out_plane = (size_t)c->OH * c->OW, out_sample = out_plane * c->filters;
@@ -128,6 +245,7 @@ static nmz_status conv_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y,
         emit(ctx, c, NMZ_TRACE_FORWARD, 4, it);
     }
     return NMZ_OK;
+    }
 }
 
 static nmz_status conv_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tensor *y, const nmz_tensor *dy,
@@ -141,6 +259,10 @@ static nmz_status conv_backward(nmz_layer *l, const nmz_tensor *x, const nmz_ten
     (void)y;
     memset(c->acc, 0, c->Wt.size * sizeof *c->acc);
     if (dx) nmz_tensor_zero(dx);
+    if (c->algo == NMZ_CONV_IM2COL) {
+        backward_im2col(c, x, dy, dx);
+        B = 0; /* skip the naive loop below */
+    }
     for (bi = 0; bi < B; bi++) {
         const float *xs = x->data + bi * in_sample;
         const float *gs = dy->data + bi * out_sample;
@@ -243,12 +365,21 @@ static void conv_destroy(nmz_layer *l) {
     nmz_tensor_free(&c->dW);
     nmz_tensor_free(&c->db);
     free(c->acc);
+    free(c->col);
+    free(c->dcol);
     free(c);
 }
 
 const nmz_layer_ops nmz__conv2d_ops = {"conv2d",        conv_setup,   conv_init,     conv_forward,
                                        conv_backward,   conv_param_count, conv_param, conv_save,
                                        conv_load,       conv_describe, conv_destroy};
+
+nmz_status nmz_layer_conv2d_set_algo(nmz_layer *l, nmz_conv_algo algo) {
+    if (!l || l->ops != &nmz__conv2d_ops) return nmz__fail(NMZ_ERR_ARG, "not a conv2d layer");
+    if ((int)algo < 0 || algo > NMZ_CONV_NAIVE) return nmz__fail(NMZ_ERR_ARG, "invalid conv algorithm");
+    ((conv_layer *)l->self)->algo = algo;
+    return NMZ_OK;
+}
 
 int nmz__conv2d_init_used(const nmz_layer *l) { return (int)((const conv_layer *)l->self)->resolved; }
 
