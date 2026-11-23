@@ -425,19 +425,10 @@ static nmz_status rnn_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tens
             }
             if (dx) {
                 float *dxt = dx->data + ((size_t)bi * T + (size_t)t) * D;
-                for (i = 0; i < D; i++) {
-                    const float *w = r->Wxh.data + (size_t)i * H;
-                    double acc = 0.0;
-                    for (j = 0; j < H; j++) acc += (double)w[j] * dz[j];
-                    dxt[i] = (float)acc;
-                }
+                for (i = 0; i < D; i++) dxt[i] = (float)nmz__dot(r->Wxh.data + (size_t)i * H, dz, H);
             }
-            for (i = 0; i < H; i++) { /* ∂L/∂h_{t−1} = δ_t·W_hhᵀ, overwrites gnext */
-                const float *w = r->Whh.data + (size_t)i * H;
-                double acc = 0.0;
-                for (j = 0; j < H; j++) acc += (double)w[j] * dz[j];
-                r->acc[i] = acc;
-            }
+            for (i = 0; i < H; i++) /* ∂L/∂h_{t−1} = δ_t·W_hhᵀ, overwrites gnext */
+                r->acc[i] = nmz__dot(r->Whh.data + (size_t)i * H, dz, H);
             for (i = 0; i < H; i++) {
                 gnext[i] = (float)r->acc[i];
                 if (tracing) r->tmp[4].data[(size_t)bi * H + i] = gnext[i];

@@ -12,7 +12,9 @@
  * (one forward pass per step for all of them). Row r draws from its own
  * PCG32 seeded with seed + r, and every layer computes each row on its own,
  * so row r is exactly what nmz_net_generate with seed + r produces — the
- * output does not depend on the batch size. */
+ * output does not depend on the batch size. A row that has finished (end
+ * of item, or length reached) leaves the batch: its row of every layer's
+ * carried state is removed, so no work is spent on padding. */
 #include "internal.h"
 
 #include <math.h>
@@ -79,6 +81,26 @@ int nmz__sample_next(const float *z, int V, double temperature, int top_k, nmz_r
     return k; /* rounding: the last character with non-zero probability */
 }
 
+/* Keep only the streams keep[0..n) (old row numbers, ascending) in every
+ * layer's carried state. A state tensor holds one row per stream ([B, ...],
+ * DESIGN §3), so this works for any recurrent layer without knowing it. */
+static void compact_states(nmz_net *net, int B, const int *keep, int n) {
+    int i, k;
+    for (i = 0; i < net->n_layers; i++) {
+        nmz_layer *l = net->layers[i];
+        nmz_tensor *st = l->ops->state ? l->ops->state(l) : NULL;
+        size_t per;
+        int shape[NMZ_MAX_RANK];
+        if (!st || st->size == 0 || st->rank < 1 || st->shape[0] != B) continue;
+        per = st->size / (size_t)B;
+        for (k = 0; k < n; k++)
+            if (keep[k] != k) memmove(st->data + (size_t)k * per, st->data + (size_t)keep[k] * per, per * sizeof(float));
+        memcpy(shape, st->shape, sizeof shape);
+        shape[0] = n;
+        nmz_tensor_reshape(st, st->rank, shape); /* smaller: keeps the data */
+    }
+}
+
 /* one growing UTF-8 output per row */
 typedef struct gen_row {
     char *buf;
@@ -109,8 +131,8 @@ nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int co
     nmz_tensor x = NMZ_TENSOR_EMPTY;
     nmz_trace_fn saved = NULL;
     uint32_t *pcp = NULL;
-    size_t np = 0, bad = 0, i, step;
-    int *ids = NULL, V, id, end_id, r, left;
+    size_t np = 0, bad = 0, i;
+    int *ids = NULL, *act = NULL, *keep = NULL, V, id, end_id, r, n_act, k;
     double *probs = NULL;
     gen_row *rows = NULL;
     nmz_status s;
@@ -146,7 +168,9 @@ nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int co
     ids = malloc(np * (size_t)count * sizeof *ids);
     probs = malloc((size_t)v->size * sizeof *probs);
     rows = calloc((size_t)count, sizeof *rows);
-    if (!ids || !probs || !rows) {
+    act = malloc((size_t)count * sizeof *act);
+    keep = malloc((size_t)count * sizeof *keep);
+    if (!ids || !probs || !rows || !act || !keep) {
         s = nmz__fail(NMZ_ERR_NOMEM, "out of memory");
         goto done;
     }
@@ -179,31 +203,36 @@ nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int co
         for (i = 0; i < np * (size_t)count; i++) x.data[i] = (float)ids[i];
         if ((s = nmz__net_forward(net, &x, 0, NULL)) != NMZ_OK) goto done;
     }
-    left = o.length > 0 ? count : 0;
-    for (step = 0; left > 0; step++) {
-        for (r = 0; r < count; r++) {
-            gen_row *g = &rows[r];
-            const float *z = last_logits(net, r, &V);
+    /* act[k] = the output row of batch row k; finished rows leave the batch */
+    n_act = o.length > 0 ? count : 0;
+    for (r = 0; r < n_act; r++) act[r] = r;
+    while (n_act > 0) {
+        int n_keep = 0;
+        for (k = 0; k < n_act; k++) {
+            gen_row *g = &rows[act[k]];
+            const float *z = last_logits(net, k, &V);
             if (V != v->size) {
                 s = nmz__fail(NMZ_ERR_STATE, "the model has %d outputs but the vocabulary has %d characters", V, v->size);
                 goto done;
-            }
-            if (g->done) { /* finished rows keep stepping (their outputs are ignored) */
-                x.data[r] = end_id >= 0 ? (float)end_id : 0.0f;
-                continue;
             }
             id = nmz__sample_next(z, V, o.temperature, o.top_k, &g->rng, probs);
             if ((s = row_append(g, v->codepoints[id])) != NMZ_OK) goto done;
             if (g->made >= (size_t)o.length || (o.stop_at_end && id == end_id)) {
                 g->done = 1;
-                left--;
+                continue;
             }
-            x.data[r] = (float)id;
+            keep[n_keep] = k;
+            x.data[n_keep++] = (float)id; /* the next input of this row (n_keep <= k: safe in place) */
         }
-        if (left == 0) break;
+        if (n_keep == 0) break;
+        if (n_keep < n_act) { /* drop finished rows: no wasted work on them */
+            compact_states(net, n_act, keep, n_keep);
+            for (k = 0; k < n_keep; k++) act[k] = act[keep[k]];
+        }
+        n_act = n_keep;
         {
             int shape[2];
-            shape[0] = count;
+            shape[0] = n_act;
             shape[1] = 1;
             if ((s = nmz_tensor_reshape(&x, 2, shape)) != NMZ_OK) goto done;
             if ((s = nmz__net_forward(net, &x, 0, NULL)) != NMZ_OK) goto done;
@@ -218,6 +247,8 @@ done:
     nmz_tensor_free(&x);
     free(pcp);
     free(ids);
+    free(act);
+    free(keep);
     free(probs);
     if (rows) {
         for (r = 0; r < count; r++) {

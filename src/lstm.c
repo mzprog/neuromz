@@ -237,18 +237,10 @@ static nmz_status lstm_backward(nmz_layer *l, const nmz_tensor *x, const nmz_ten
             }
             if (dx) {
                 float *dxt = dx->data + row * D;
-                for (i = 0; i < D; i++) {
-                    const float *w = m->Wx.data + (size_t)i * G;
-                    double acc = 0.0;
-                    for (j = 0; j < G; j++) acc += (double)w[j] * da[j];
-                    dxt[i] = (float)acc;
-                }
+                for (i = 0; i < D; i++) dxt[i] = (float)nmz__dot(m->Wx.data + (size_t)i * G, da, G);
             }
             for (i = 0; i < H; i++) { /* ∂L/∂h_{t−1} = ∂L/∂a·W_hᵀ, overwrites dh_next */
-                const float *w = m->Wh.data + (size_t)i * G;
-                double acc = 0.0;
-                for (j = 0; j < G; j++) acc += (double)w[j] * da[j];
-                dhn[i] = (float)acc;
+                dhn[i] = (float)nmz__dot(m->Wh.data + (size_t)i * G, da, G);
                 if (tracing) tp[6].data[rb + i] = dhn[i];
             }
         }

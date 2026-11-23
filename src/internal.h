@@ -56,6 +56,22 @@ float nmz__lstm_forget_bias(const nmz_layer *l);
 nmz_status nmz__orthogonal_block(float *W, int n, int ld, int col0, nmz_rng *rng);
 nmz_status nmz__recurrent_init(nmz_init init, nmz_init *resolved, nmz_tensor *Wx, nmz_tensor *Wh, int D, int H,
                                int gates, nmz_rng *rng);
+/* Σ a[j]·b[j] in double with four independent partial sums: the same
+ * precision as one double accumulator, but the additions do not wait for
+ * each other (the recurrent backward passes spend most of their time here). */
+static inline double nmz__dot(const float *a, const float *b, int n) {
+    double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    int j = 0;
+    for (; j + 4 <= n; j += 4) {
+        s0 += (double)a[j] * b[j];
+        s1 += (double)a[j + 1] * b[j + 1];
+        s2 += (double)a[j + 2] * b[j + 2];
+        s3 += (double)a[j + 3] * b[j + 3];
+    }
+    for (; j < n; j++) s0 += (double)a[j] * b[j];
+    return (s0 + s1) + (s2 + s3);
+}
+
 /* copy step t of a [B, T, F] tensor into a [B, F] tensor; _tc: only the
  * columns col0 … col0+n−1, into [B, n] */
 nmz_status nmz__slice_t(const nmz_tensor *src, int t, nmz_tensor *dst);

@@ -205,12 +205,8 @@ static nmz_status gru_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tens
                     tp[4].data[rb + j] = g->direct[j];
                 }
             }
-            for (i = 0; i < H; i++) { /* ∂L/∂(r⊙h_{t−1}) = ∂L/∂a_ĥ·W_hĥᵀ */
-                const float *w = g->Wh.data + (size_t)i * G + 2 * H;
-                double acc = 0.0;
-                for (j = 0; j < H; j++) acc += (double)w[j] * da[2 * H + j];
-                g->drh[i] = (float)acc;
-            }
+            for (i = 0; i < H; i++) /* ∂L/∂(r⊙h_{t−1}) = ∂L/∂a_ĥ·W_hĥᵀ */
+                g->drh[i] = (float)nmz__dot(g->Wh.data + (size_t)i * G + 2 * H, da + 2 * H, H);
             for (j = 0; j < H; j++) {
                 float r = gt[H + j];
                 da[H + j] = g->drh[j] * hp[j] * r * (1.0f - r); /* ∂L/∂a_r */
@@ -231,17 +227,11 @@ static nmz_status gru_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tens
             }
             if (dx) {
                 float *dxt = dx->data + row * D;
-                for (i = 0; i < D; i++) {
-                    const float *w = g->Wx.data + (size_t)i * G;
-                    double acc = 0.0;
-                    for (j = 0; j < G; j++) acc += (double)w[j] * da[j];
-                    dxt[i] = (float)acc;
-                }
+                for (i = 0; i < D; i++) dxt[i] = (float)nmz__dot(g->Wx.data + (size_t)i * G, da, G);
             }
             for (i = 0; i < H; i++) { /* ∂L/∂h_{t−1}: direct + through r⊙h + through the z, r products */
-                const float *w = g->Wh.data + (size_t)i * G;
                 double acc = (double)g->direct[i] + (double)g->drh[i] * gt[H + i];
-                for (j = 0; j < 2 * H; j++) acc += (double)w[j] * da[j];
+                acc += nmz__dot(g->Wh.data + (size_t)i * G, da, 2 * H);
                 dhn[i] = (float)acc;
                 if (tracing) tp[5].data[rb + i] = dhn[i];
             }

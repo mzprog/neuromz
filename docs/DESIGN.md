@@ -11,7 +11,9 @@ Status of this document: written before implementation, then corrected where
 the implementation taught us something (see the git history of this file).
 Phase 1 (dense networks) added decisions 27–33; phase 2 (CNN, Adam,
 normalization, MNIST) added decisions 34–50; phase 3 (text, Embedding,
-RNN, generation) added decisions 51–70.
+RNN, generation) added decisions 51–70; phase 4 (LSTM, GRU, orthogonal
+init, gate traces, gradient-survival comparison, Arabic prose) added
+decisions 71–90.
 
 ---
 
@@ -38,8 +40,12 @@ src/                   libneuromz — platform-independent C11, libc + libm only
   io.c                 portable .nmz save/load, CRC32, byte writer/reader
   dataset.c            dataset type, CSV loader, IDX (MNIST) loader
   text.c               UTF-8 decoding, code-point vocabularies, text datasets
-  recurrent.c          Embedding, RNN (time loop + BPTT inside the layer)
-  generate.c           sampling text: temperature, top-k, seeded PCG32
+  recurrent.c          Embedding, RNN (time loop + BPTT inside the layer),
+                       orthogonal init and helpers shared with lstm.c/gru.c
+  lstm.c               LSTM (gates i f g o, cell state c, BPTT along h and c)
+  gru.c                GRU (Cho et al. 2014: gates z r, candidate h~)
+  generate.c           sampling text: temperature, top-k, seeded PCG32,
+                       batches of rows (finished rows leave the batch)
   defaults.c           "quick mode" defaults and the reasons for them
   internal.h           private helpers shared by the library sources
 cli/                   the `neuromz` program (may use POSIX/terminal code)
@@ -50,15 +56,21 @@ cli/                   the `neuromz` program (may use POSIX/terminal code)
   util.c               option parsing, dataset resolution (CSV/IDX/mnist)
   print.c              formula printer for dense/activation/loss/SGD events
   print_conv.c         conv/pool/flatten/dropout/normalize/Adam printers, heatmaps
-  print_seq.c          a character RNN unrolled through time, BPTT, vanishing gradients
+  print_seq.c          a character rnn/lstm/gru unrolled through time: every gate,
+                       gate heatmaps, BPTT, vanishing gradients along h and c
+  cmd_seq.c            `compare` (gradient survival side by side), `show gates`
   line.c               dynamic line reader and tokenizer (no fixed buffers)
 tests/                 test_*.c (unit, gradient checks, convergence, I/O),
                        cli_smoke.sh (CLI abuse test); all run under sanitizers
 examples/              xor.csv, xor_and.csv, iris.csv (+ 120/30 train/test
-                       split), api_xor.c, run_examples.sh, benchmark.sh,
-                       benchmark_mnist.sh, bench_conv.c
+                       split), names_en.txt, names_ar.txt, DATASETS.md,
+                       api_xor.c, run_examples.sh, benchmark.sh,
+                       benchmark_mnist.sh,
+                       benchmark_gated.sh, bench_conv.c
 scripts/get_mnist.sh   downloads MNIST into data/ (gitignored), verifies MD5
-scripts/get_text.sh    downloads Alice (Gutenberg #11) into data/, verifies SHA-256
+scripts/get_text.sh    downloads Alice (Gutenberg #11) and Kalila wa-Dimna
+                       (Arabic Wikisource, fixed revisions) into data/,
+                       verifies SHA-256; strip_wikitext.awk removes markup
 docs/DESIGN.md         this file
 legacy/                v1 sources (2017–2020), unchanged, tag `v1-legacy`
 Makefile               lib, cli, test, sanitize, examples, data, bench, clean
@@ -202,27 +214,37 @@ What was planned before phase 3 held up; this is what exists now.
 * **Attention / residual connections** (still planned) stay composite
   layers inside the sequential stack.
 
-### 3.1 How LSTM slots in (next phase, no engine change)
+### 3.1 LSTM and GRU (implemented in phase 4, no engine change)
 
-An `lstm.c` file with an `nmz_layer_ops` table and one registry line:
+The plan written before phase 4 (an `lstm.c` with an ops table and one
+registry line) held; this is what exists.
 
-| piece | LSTM |
-|---|---|
-| shapes | `setup`: `[T, D]` → `[T, H]`, exactly like the RNN |
-| parameters | `W_x` `[D, 4H]`, `W_h` `[H, 4H]`, `b` `[4H]` (gates i, f, g, o side by side; forget-gate bias initialised to 1) |
-| forward | per step: `[i f g o] = x_t·W_x + h_{t−1}·W_h + b`, i/f/o = σ, g = tanh, `c_t = f⊙c_{t−1} + i⊙g`, `h_t = o⊙tanh(c_t)`; the gate values and c_t are cached in `self` |
-| backward | BPTT inside the layer carrying both dL/dh and dL/dc backwards; adds into the three gradients |
-| carried state | `state()` returns one `[B, 2H]` tensor holding h and c side by side — the engine, gradcheck, carry, reset and generation treat it as opaque, so they work unchanged |
-| trace | the same event pattern as the RNN plus items `i`, `f`, `g`, `o`, `c_t`, `dL/dc`; per-step backward keeps the names `dL/dh`, `dL/dh_prev`, so the BPTT table and the vanishing-gradient view work as they are (the LSTM's point — the gradient survives along c — becomes visible in that view) |
-| file | `save_config`: units, init; parameters are saved generically |
-| CLI | spec `lstm:H` beside `rnn:H`; `print_seq.c` gets a gate view for the unrolled section |
+| piece | LSTM (`lstm.c`) | GRU (`gru.c`) |
+|---|---|---|
+| shapes | `[T, D]` → `[T, H]`, like the RNN | same |
+| parameters | `W_x` `[D, 4H]`, `W_h` `[H, 4H]`, `b` `[4H]`, gates side by side in the order i, f, g, o | `W_x` `[D, 3H]`, `W_h` `[H, 3H]`, `b` `[3H]`, order z, r, h~ |
+| forward | `a = x_t·W_x + h_{t−1}·W_h + b`; i, f, o = σ, g = tanh; `c_t = f⊙c_{t−1} + i⊙g`; `h_t = o⊙tanh(c_t)`; the gates and c are cached | z, r = σ(…); `h~ = tanh(x_t·W_xh~ + (r⊙h_{t−1})·W_hh~ + b_h~)`; `h_t = z⊙h_{t−1} + (1−z)⊙h~` (decision 73) |
+| backward | BPTT inside the layer carrying ∂L/∂h and ∂L/∂c; `∂L/∂c_{t−1} = ∂L/∂c_t ⊙ f` | carrying ∂L/∂h; the direct part `∂L/∂h_t ⊙ z` is traced separately |
+| init | forget-gate bias = 1 (configurable); AUTO = each H×H gate block of `W_h` orthogonal, `W_x` Glorot | AUTO = orthogonal blocks, Glorot `W_x`, biases 0 |
+| carried state | one `[B, 2H]` tensor, h \| c side by side | `[B, H]` |
+| trace | per step `x_t h_prev c_prev i f g o c_t h_t`; summary `x h0 c0 W_x W_h b gates c h` | per step `x_t h_prev z r h~ h_t`; summary `x h0 W_x W_h b gates h` |
+| file | config: units, init, resolved init, f32 forget bias | units, init, resolved init |
 
-Everything engine-level — any-length time, carry/reset/state, discrete
-inputs, per-step trace events, clipping, validation, early stopping,
-vocabulary, generation — is layer-agnostic and was written against the
-vtable, not against the RNN.
+What did **not** change: `net.c`, `train.c` and `gradcheck.c`. Any-length
+time, carry/reset/state, gradcheck's snapshot of the carried state,
+clipping, validation, early stopping, the vocabulary and generation were
+written against the vtable in phase 3 and work for the new layers as they
+are. Stacking (`lstm:64 dropout:0.2 lstm:64`) needed nothing either: a
+recurrent layer's output `[T, H]` is a valid input for the next one, and
+Dropout is element-wise. Two things outside the layer files did change:
 
----
+* `NMZ_TRACE_MAX_ITEMS` went from 8 to 12 — one LSTM step has nine values
+  to show. It is a capacity constant of the event struct, not engine
+  logic.
+* Batched generation (decision 80) removes finished rows from every
+  layer's carried state. It relies on the contract that a state tensor has
+  one row per stream (`[B, …]`), which all three recurrent layers follow;
+  it does not need to know what the row contains.
 
 ## 4. Trace system
 
@@ -285,6 +307,10 @@ Item names are a fixed, documented vocabulary (tensors are `[B, …]`):
 | embedding | forward `ids`, `W` [V,D], `e`; backward `dL/de`, `ids`, `dL/dW` (only rows of occurring tokens non-zero) |
 | rnn (time_step −1) | forward `x`, `h0`, `W_xh`, `W_hh`, `b`, `h` (all steps); backward `dL/dW_xh`, `dL/dW_hh`, `dL/db`, `W_hh`, `dL/dx`; scalar `steps` |
 | rnn (time_step t) | forward `x_t`, `h_prev`, `z_t`, `h_t`; backward `dL/dh_out` (from the layer above at t), `dL/dh_next` (from step t+1), `dL/dh` (their sum), `dL/dz` (after tanh′), `dL/dh_prev` (sent to t−1) |
+| lstm (time_step −1) | forward `x`, `h0`, `c0`, `W_x`, `W_h`, `b`, `gates` ([B,T,4H] after σ/tanh, order i f g o), `c`, `h`; scalars `steps`, `forget_bias`; backward `dL/dW_x`, `dL/dW_h`, `dL/db`, `W_h`, `dL/dx` |
+| lstm (time_step t) | forward `x_t`, `h_prev`, `c_prev`, `i`, `f`, `g`, `o`, `c_t`, `h_t`; backward `dL/dh_out`, `dL/dh_next`, `dL/dh`, `dL/dc_next` (from step t+1, already × f_{t+1}), `dL/dc`, `dL/da` ([B,4H], the gate inputs), `dL/dh_prev`, `dL/dc_prev` (= dL/dc ⊙ f) |
+| gru (time_step −1) | forward `x`, `h0`, `W_x`, `W_h`, `b`, `gates` ([B,T,3H], order z r h~), `h`; backward as lstm |
+| gru (time_step t) | forward `x_t`, `h_prev`, `z`, `r`, `h~`, `h_t`; backward `dL/dh_out`, `dL/dh_next`, `dL/dh`, `dL/da` ([B,3H]), `dL/dh_direct` (= dL/dh ⊙ z, the direct path), `dL/dh_prev` |
 | clip (update phase, layer −1) | scalars `norm` (before), `max_norm`, `scale`; `detail` = clipped / unchanged |
 | dropout | forward `x`, `y`, `mask` (training only); backward `dL/dy`, `dL/dx`, `mask`; scalars `rate`, `training` |
 | update, SGD (per param) | `value` (before), `grad`, `velocity_prev`, `delta` (= new velocity); scalars `lr`, `momentum`; `detail` = param name |
@@ -310,6 +336,9 @@ All names use the `nmz_` / `NMZ_` prefix. The full header is
                   nmz_layer_conv2d(F, kh, kw, stride, pad|NMZ_PAD_SAME, init)
                   nmz_layer_maxpool2d(size, stride); nmz_layer_flatten();
                   nmz_layer_dropout(rate); nmz_layer_conv2d_set_algo(l, algo)
+                  nmz_layer_embedding(V, D, init); nmz_layer_rnn(H, init)
+                  nmz_layer_lstm(H, init, forget_bias); nmz_layer_gru(H, init)
+                  (NMZ_INIT_ORTHOGONAL: recurrent layers only; AUTO = it)
                   nmz_net_set_normalization(net, NMZ_NORM_ZSCORE|MINMAX|NONE)
                   nmz_net_add(net, layer)             /* takes ownership      */
                   nmz_net_add_dense(net, units, act, init) /* Dense+Activation */
@@ -327,11 +356,16 @@ All names use the `nmz_` / `NMZ_` prefix. The full header is
                   nmz_net_optimizer_preview(net, &opts, lr)
                   nmz_net_forward_mode(net, x, training, &y)
                   nmz_net_compute_loss(net, t, &loss)
+/* text */        nmz_utf8_decode/encode, nmz_vocab_*, nmz_text_normalize (flags
+                  NMZ_TEXT_STRIP_DIACRITICS | NMZ_TEXT_UNIFY_ALEF),
+                  nmz_dataset_load_text, nmz_net_set_vocab/vocab,
+                  nmz_net_generate, nmz_net_generate_batch (row r = seed + r)
 /* train */       nmz_train_opts (max_epochs, batch_size, learning_rate, momentum,
                   shuffle, target_loss, optimizer, beta1/beta2/epsilon,
                   schedule/step_size/gamma/min_lr, on_epoch/on_batch callbacks);
                   nmz_schedule_lr(&opts, epoch); nmz_net_fit_normalization
                   nmz_net_train(net, ds, &opts, &result);
+                  nmz_net_train_val(net, ds, val, &opts, &result) /* separate validation set */
                   nmz_net_evaluate(net, ds, &loss, &accuracy);
                   nmz_net_train_config(net)  /* defaults stored with the model */
 /* data */        nmz_dataset_load_csv(&ds, path, &csv_opts); nmz_dataset_create;
@@ -391,7 +425,8 @@ offset  field
         u32          class-name count C, then C × string
         u32          layer count N, then per layer:
                        string   type ("dense", "activation", "conv2d",
-                                "maxpool2d", "flatten", "dropout")
+                                "maxpool2d", "flatten", "dropout",
+                                "embedding", "rnn", "lstm", "gru")
                        u32      config byte length, then config bytes
                        u32      parameter count P, then per parameter:
                                 string name, u32 rank, rank × u32 dims,
@@ -407,6 +442,8 @@ offset  field
                                   point, u64 count), code points ascending
                      "train_ext": f32 val_fraction, f32 clip_norm,
                                   u32 carry_state, u32 seq_len, u32 patience
+                     "text_norm": u32 NMZ_TEXT_* flags (written only when
+                                  non-zero, after "vocab")
 end     u32          CRC-32 (IEEE, reflected 0xEDB88320) of every byte above
 ```
 
@@ -446,9 +483,15 @@ Datasets are named by file (CSV, IDX) or as `mnist` (`mnist:train`,
 
 Text models use the input `text` (with `--data FILE` to build the
 vocabulary at creation time, so layer sizes are known) and the specs
-`embed:D`, `rnn:H` and `vocab[:ACT]` (a dense output with one unit per
-character). `generate` samples from them; `trace --text TEXT` draws the RNN
-unrolled through time.
+`embed:D`, `rnn:H`, `lstm:H[:forget_bias=F]`, `gru:H` (inits auto =
+orthogonal, xavier, he) and `vocab[:ACT]` (a dense output with one unit per
+character); recurrent layers stack, with `dropout:R` between them.
+`--strip-diacritics` / `--unify-alef` set the Arabic normalisation of the
+vocabulary. `generate` samples from them; `trace --text TEXT [--layer N]`
+draws a recurrent layer unrolled through time with every gate;
+`show gates` summarises the gates over a text; `compare A.nmz B.nmz …`
+puts the gradient survival of several trained models side by side;
+`train --val-file FILE` validates on a separate set.
 
 ---
 
@@ -729,3 +772,102 @@ Added in phase 3 (text, Embedding, RNN, generation):
     left ordering are left to the terminal (many do it imperfectly). Where
     the trace puts one character per column the letters appear in their
     isolated forms, which is what a character model actually sees.
+
+Added in phase 4 (LSTM, GRU, gate traces, gradient survival, Arabic prose):
+
+71. **One matrix per gate group, gates side by side** (`W_x [D, 4H]`,
+    `W_h [H, 4H]`, order i f g o; GRU `[·, 3H]`, order z r h~): one
+    vector-matrix product per step computes every gate; the trace slices the
+    columns back into named gates. Four separate matrices would read more
+    like the textbook but quadruple the parameter list for no gain.
+72. **Forget-gate bias starts at 1** (Gers et al. 2000; Jozefowicz et al.
+    2015): with f ≈ σ(1) = 0.73 a new cell keeps most of its state and the
+    gradient along c survives from the first epoch. Configurable
+    (`lstm:H:forget_bias=F`, `nmz_layer_lstm(H, init, F)`), saved in the
+    layer config; `new` explains the resulting σ(F).
+73. **GRU variant: the original (Cho et al. 2014)**, reset gate applied to
+    h_{t−1} *before* the product with W_h, one bias per gate, and
+    h_t = z⊙h_{t−1} + (1−z)⊙h~ (z = 1 keeps the state, as in the paper and
+    PyTorch). PyTorch/cuDNN apply r after the product (r⊙(h·W + b_h), two
+    biases) because it fuses into one matrix product per step; that is a
+    speed choice, and the original reads more directly: "r decides how much
+    of the past the candidate may see". The trace and the hand-computed
+    test spell the formula out.
+74. **Orthogonal initialisation is the default for recurrent matrices**
+    (rnn, lstm, gru: AUTO = each H×H gate block of W_h orthogonal, W_x
+    Glorot). It is a Gaussian matrix orthonormalised by modified
+    Gram–Schmidt (two passes, in double) — the Q of a QR decomposition, so
+    no linear-algebra library is needed (decision 58 had deferred it for
+    that reason). All singular values are 1, so repeated multiplication by
+    W_h neither shrinks nor blows up h; Glorot W_hh has spectral radius ≈ 1
+    but singular values spread from ≈ 0 to ≈ 2. `xavier` keeps the phase-3
+    initialisation; dense, conv and embedding layers reject `orthogonal`
+    (their matrices are not applied repeatedly). Tested: WᵀW = I within 1e-7.
+75. **The engine did not change** (DESIGN §3.1). The only edits outside
+    the new layer files: `NMZ_TRACE_MAX_ITEMS` 8 → 12, the layer registry
+    lines, helpers moved into recurrent.c for sharing, and batch generation
+    (decision 80), which needed the "one state row per stream" contract to
+    be written down.
+76. **The LSTM's carried state is one `[B, 2H]` tensor, h | c.** The
+    engine and gradcheck treat it as opaque. The gradient through c_{t−1}
+    is tested directly: the trace's `dL/dc_prev` at t = 0 (the gradient
+    that truncation drops) is compared with central differences of the loss
+    in the carried c — the cell-state path checked numerically.
+77. **Trace names**: the LSTM/GRU per-step events keep the RNN's `dL/dh`,
+    `dL/dh_prev`, `dL/dh_out`, `dL/dh_next`, so the BPTT table works
+    unchanged, and add `dL/dc`, `dL/dc_next`, `dL/dc_prev` (LSTM) and
+    `dL/dh_direct` (GRU). The gradient of the gate inputs is `dL/da`, not
+    `dL/dz`, because z is the GRU's update gate.
+78. **Gradient survival is measured with a separate backward pass where
+    only the last step has a loss** (as in phase 3), reported relative to
+    the last step, so models whose gradients have different overall sizes
+    compare directly. For an LSTM it is reported along h and along c, plus
+    the mean over cells of Π f over the later steps — what the cell path
+    alone would pass back (Π z for the GRU's direct path). `compare` loads
+    up to six models, encodes the same text with each model's vocabulary
+    and normalisation, and shows a table, log-scale sparklines and a
+    summary (per-step factor, what is left after 10 and all steps, steps
+    until below 1 %).
+79. **`show gates` summarises gates over a text with the state carried**
+    (evaluation mode, 256-character chunks of one stream) through a trace
+    callback that accumulates instead of recording, so 20 000 characters
+    cost one forward pass and no copies. The "half-life" ln 0.5 / ln f̄ is an
+    intuition, not a measurement: how long a cell with that mean forget gate
+    would keep half its content if nothing were written.
+80. **Batch generation: row r uses seed + r** and is bit-identical to a
+    single run with that seed (every layer computes rows independently), so
+    `generate --count N` gives exactly the phase-3 output. Rows that finish
+    leave the batch: their row of every layer's carried state is removed.
+    Found by measuring: without that, a batch keeps stepping until its
+    longest item ends, and 500 names took 4× longer than one at a time.
+81. **Arabic normalisation is a vocabulary option**, off by default:
+    `NMZ_TEXT_STRIP_DIACRITICS` (harakat U+064B–U+0652, superscript alef
+    U+0670, tatweel U+0640) and `NMZ_TEXT_UNIFY_ALEF` (أ إ آ ٱ → ا). The
+    flags live in `nmz_vocab`, so they are applied wherever the model reads
+    text (training data, `--val-file`, prime, trace, compare), and are saved
+    as a `text_norm` section written only when non-zero, so models without
+    it are byte-identical to phase 3. Off by default because it changes
+    the task: the model no longer predicts the marks, and unified alef
+    loses the hamza spelling.
+82. **The Arabic prose comes from Wikisource at fixed page revisions**
+    (`oldid`): a revision never changes, so its SHA-256 is stable even when
+    the page is edited later, and no copy of the text has to be hosted.
+    The markup is removed by a 25-line awk script run with `LC_ALL=C`
+    (byte-wise, the same in gawk, mawk and busybox). Rejected sources:
+    Gutenberg (almost no Arabic), the Tanzil Qur'an text (no modification
+    allowed, and imitation scripture is inappropriate), OpenITI
+    (non-commercial licence).
+83. **`--val-file` = `nmz_net_train_val`**: validation on a separate data
+    set; then all of the training file trains and `val_fraction` is ignored.
+    It is a per-run option, not stored in the model.
+84. **Comparisons use the same parameter budget**: rnn:128 ≈ lstm:64 ≈
+    gru:75 (within ±3 % for every vocabulary used here). An LSTM cell has
+    four gates, so "the same number of units" would give it 4× the
+    weights; the presets `names-lstm` and `char-lstm` are the matched
+    versions of `names` and `char-rnn`.
+85. **The phase-3 regression tests pin the RNN to `xavier`**, so their
+    exact strings still check the phase-3 model, and a model file written by
+    the last phase-3 commit (b0047fc) is a fixture that must load and
+    generate the same names. Found when the new orthogonal default changed
+    one test's generated item: it came from a context (zero state + '\n')
+    that never occurs in that test's training text — the old pass was luck.

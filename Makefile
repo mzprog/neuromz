@@ -8,7 +8,7 @@
 #   make examples   train the bundled examples (XOR, XOR+AND, Iris)
 #   make data       download MNIST into data/ and verify checksums
 #   make data-text  download the texts (Alice; Kalila wa-Dimna in Arabic) into data/, checksum-verified
-#   make bench      slow benchmarks (seeds sweep + MNIST); not part of `make test`
+#   make bench      slow benchmarks (seeds sweep, MNIST, RNN vs LSTM vs GRU); not part of `make test`
 #   make clean
 
 CC      ?= cc
@@ -85,7 +85,7 @@ $(BUILD)/bench_conv: examples/bench_conv.c $(LIB)
 bench: $(CLI) $(BUILD)/bench_conv
 	sh examples/benchmark.sh ./$(CLI)
 	sh examples/benchmark_mnist.sh ./$(CLI)
-	sh examples/benchmark_text.sh ./$(CLI)
+	sh examples/benchmark_gated.sh ./$(CLI)
 
 clean:
 	rm -rf build
