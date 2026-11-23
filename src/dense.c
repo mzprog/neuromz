@@ -190,6 +190,11 @@ const nmz_layer_ops nmz__dense_ops = {
     "dense", dense_setup, dense_init, dense_forward, dense_backward, dense_param_count,
     dense_param, dense_save, dense_load, dense_describe, dense_destroy};
 
+int nmz_layer_dense_init(const nmz_layer *l) {
+    if (!l || l->ops != &nmz__dense_ops) return -1;
+    return (int)((const dense_layer *)l->self)->resolved;
+}
+
 nmz_layer *nmz_layer_dense(int units, nmz_init init) {
     dense_layer *d;
     nmz_layer *l;

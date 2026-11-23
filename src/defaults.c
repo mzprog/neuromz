@@ -34,21 +34,26 @@ nmz_status nmz_quick_defaults(int n_sizes, const int *sizes, nmz_quick *q) {
         q->why_loss = "cross-entropy fused with softmax has the simple, stable gradient p - t";
     }
 
+    return nmz_quick_train_defaults(q->loss, q);
+}
+
+nmz_status nmz_quick_train_defaults(nmz_loss loss, nmz_quick *q) {
+    if (!q || (int)loss < 0 || loss >= NMZ_LOSS_COUNT) return nmz__fail(NMZ_ERR_ARG, "invalid loss");
     q->train = nmz_train_defaults();
     q->train.momentum = 0.9f;
     q->why_momentum = "0.9 averages recent gradients: smoother steps and faster progress across plateaus";
     q->train.batch_size = 32;
     q->why_batch = "mini-batches of 32 (full batch when the dataset is smaller): stable gradients, several updates per epoch";
-    if (q->loss == NMZ_LOSS_MSE) {
+    if (loss == NMZ_LOSS_MSE) {
         q->train.learning_rate = 0.5f;
         q->why_learning_rate = "0.5 suits squared error on sigmoid outputs, whose gradients are small (<= 0.25*error)";
         q->train.target_loss = 0.001;
         q->why_target_loss = "stop when the average 1/2*error^2 <= 0.001 (outputs within ~0.045 of their targets)";
     } else {
-        q->train.learning_rate = 0.05f;
-        q->why_learning_rate = "0.05 is a safe step for softmax+cross-entropy with momentum 0.9";
-        q->train.target_loss = 0.05;
-        q->why_target_loss = "stop when the average cross-entropy <= 0.05 (about 95% probability on the right class)";
+        q->train.learning_rate = 0.02f;
+        q->why_learning_rate = "0.02 (x10 effective with momentum 0.9): stable for softmax+cross-entropy; 0.05 sometimes stalls";
+        q->train.target_loss = 0.07;
+        q->why_target_loss = "stop when the average cross-entropy <= 0.07 (~93% probability on the right class); lower mostly memorises the data";
     }
     q->train.max_epochs = 5000;
     q->why_epochs = "at most 5000 passes over the data, so training always ends";

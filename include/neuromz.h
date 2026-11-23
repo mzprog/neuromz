@@ -147,6 +147,8 @@ nmz_tensor *nmz_layer_param_value(nmz_layer *l, int i);
 nmz_tensor *nmz_layer_param_grad(nmz_layer *l, int i);
 /* For activation layers: which function (else -1). */
 int nmz_layer_activation_kind(const nmz_layer *l);
+/* For dense layers: the init actually used (AUTO resolved after build), else -1. */
+int nmz_layer_dense_init(const nmz_layer *l);
 /* Output size per sample (product of the per-sample output shape). */
 int nmz_layer_output_size(const nmz_layer *l);
 int nmz_layer_input_size(const nmz_layer *l);
@@ -236,6 +238,9 @@ nmz_status nmz_net_backward(nmz_net *net, const nmz_tensor *t, double *loss);
 /* Apply one SGD/momentum step using the current gradients:
  *   v ← μ·v − η·g ;  w ← w + v */
 nmz_status nmz_net_update(nmz_net *net, float learning_rate, float momentum);
+/* Emit the UPDATE trace events nmz_net_update would emit, without changing
+ * any weight or velocity (for "what would this step do?" teaching views). */
+nmz_status nmz_net_preview_update(nmz_net *net, float learning_rate, float momentum);
 /* ∂L/∂input of the last backward pass ([B, input_shape...]). */
 const nmz_tensor *nmz_net_input_grad(const nmz_net *net);
 /* Output of layer i from the last forward (i = -1: the input copy). */
@@ -255,6 +260,8 @@ typedef struct nmz_dataset {
 
 typedef struct nmz_csv_opts {
     int n_targets;   /* trailing columns that are targets (default 1)       */
+    int n_inputs;    /* if > 0: the first n_inputs columns are inputs and all
+                        remaining columns are targets (overrides n_targets) */
     int header;      /* 1 yes, 0 no, -1 auto-detect (default)               */
     int categorical; /* 1: the single target column holds class labels and
                         is one-hot encoded; 0: numeric; -1: auto (default:
@@ -303,6 +310,9 @@ typedef struct nmz_quick {
 } nmz_quick;
 
 nmz_status nmz_quick_defaults(int n_sizes, const int *sizes, nmz_quick *out);
+/* Only the training fields (train, why_learning_rate ... why_target_loss)
+ * for a given loss; nmz_quick_defaults uses this too. */
+nmz_status nmz_quick_train_defaults(nmz_loss loss, nmz_quick *out);
 /* Build a fully configured net from layer sizes using nmz_quick_defaults.
  * `quick` (may be NULL) receives the choices that were made. */
 nmz_status nmz_net_create_quick(nmz_net **out, int n_sizes, const int *sizes,
@@ -338,7 +348,7 @@ typedef struct nmz_trace_scalar {
 
 typedef struct nmz_trace_event {
     nmz_trace_phase phase;
-    long step;              /* net's backward-pass counter (1-based)        */
+    long step;              /* 1-based number of the pass the event belongs to */
     int layer;              /* layer index, -1 for loss events              */
     int time_step;          /* -1 unless a sequence layer emits per step    */
     const char *layer_type; /* "dense", "activation", "loss", ...           */

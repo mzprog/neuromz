@@ -348,6 +348,19 @@ const nmz_tensor *nmz_net_activation(const nmz_net *net, int i) {
 
 /* -------------------------------------------------------------- compute */
 
+/* Trace events carry the 1-based number of the forward/backward pass they
+ * belong to: a forward pass is numbered step+1 (the backward pass that
+ * follows it will increment step to that number). */
+static nmz_ctx make_ctx_step(const nmz_net *net, int layer, int training, long step) {
+    nmz_ctx c;
+    c.trace = net->trace;
+    c.trace_user = net->trace_user;
+    c.step = step;
+    c.layer_index = layer;
+    c.training = training;
+    return c;
+}
+
 static nmz_ctx make_ctx(const nmz_net *net, int layer, int training) {
     nmz_ctx c;
     c.trace = net->trace;
@@ -380,7 +393,7 @@ nmz_status nmz__net_forward(nmz_net *net, const nmz_tensor *x, int training,
     if ((s = nmz_tensor_copy(&net->acts[0], x)) != NMZ_OK) return s;
     for (i = 0; i < net->n_layers; i++) {
         nmz_layer *l = net->layers[i];
-        nmz_ctx ctx = make_ctx(net, i, training);
+        nmz_ctx ctx = make_ctx_step(net, i, training, net->step + 1);
         if ((s = shape_with_batch(x->shape[0], l->out_rank, l->out_shape, shape)) != NMZ_OK) return s;
         if ((s = nmz_tensor_reshape(&net->acts[i + 1], l->out_rank + 1, shape)) != NMZ_OK) return s;
         if ((s = l->ops->forward(l, &net->acts[i], &net->acts[i + 1], &ctx)) != NMZ_OK) return s;
@@ -486,7 +499,9 @@ nmz_status nmz_net_backward(nmz_net *net, const nmz_tensor *t, double *loss) {
     return NMZ_OK;
 }
 
-nmz_status nmz_net_update(nmz_net *net, float learning_rate, float momentum) {
+/* v ← μ·v − η·g ; w ← w + v. With apply == 0 only the trace events are
+ * produced (delta computed into scratch; nothing is modified). */
+static nmz_status update_impl(nmz_net *net, float learning_rate, float momentum, int apply) {
     int k;
     size_t e;
     nmz_status s;
@@ -495,25 +510,42 @@ nmz_status nmz_net_update(nmz_net *net, float learning_rate, float momentum) {
     if (!(learning_rate > 0.0f) || !isfinite(learning_rate))
         return nmz__fail(NMZ_ERR_ARG, "learning rate must be > 0");
     if (!(momentum >= 0.0f && momentum < 1.0f)) return nmz__fail(NMZ_ERR_ARG, "momentum must be in [0, 1)");
+    if (!apply && !net->trace) return NMZ_OK;
     for (k = 0; k < net->n_params; k++) {
         nmz_layer *l = net->layers[net->param_refs[k].layer];
         int pi = net->param_refs[k].index;
         nmz_tensor *w = nmz_layer_param_value(l, pi), *g = nmz_layer_param_grad(l, pi);
-        nmz_tensor *v = &net->velocity[k];
+        nmz_tensor *v = &net->velocity[k], *v_new = v;
+        const nmz_tensor *v_prev = v;
+        if (!w || !g) return nmz__fail(NMZ_ERR_STATE, "layer %d returned no parameter %d", net->param_refs[k].layer, pi);
         if (net->trace) {
-            if ((s = nmz_tensor_copy(&net->scratch, v)) != NMZ_OK) return s; /* velocity_prev */
+            /* keep a copy of the old velocity (apply) or compute the new one aside (preview) */
+            if ((s = nmz_tensor_copy(&net->scratch, v)) != NMZ_OK) return s;
+            if (apply)
+                v_prev = &net->scratch;
+            else
+                v_new = &net->scratch;
         }
-        for (e = 0; e < w->size; e++) v->data[e] = momentum * v->data[e] - learning_rate * g->data[e];
+        for (e = 0; e < w->size; e++) v_new->data[e] = momentum * v_prev->data[e] - learning_rate * g->data[e];
         if (net->trace) {
             nmz_ctx ctx = make_ctx(net, net->param_refs[k].layer, 1);
             nmz_trace_scalar sc[2] = {{"lr", learning_rate}, {"momentum", momentum}};
-            nmz_trace_item it[4] = {{"value", w}, {"grad", g}, {"velocity_prev", &net->scratch}, {"delta", v}};
+            nmz_trace_item it[4] = {{"value", w}, {"grad", g}, {"velocity_prev", v_prev}, {"delta", v_new}};
             nmz_trace_emit(&ctx, NMZ_TRACE_UPDATE, nmz_layer_type(l), nmz_layer_param_name(l, pi), 2, sc, 4, it);
         }
-        for (e = 0; e < w->size; e++) w->data[e] += v->data[e];
+        if (apply)
+            for (e = 0; e < w->size; e++) w->data[e] += v->data[e];
     }
-    net->have_forward = 0; /* cached activations no longer match the weights */
+    if (apply) net->have_forward = 0; /* cached activations no longer match the weights */
     return NMZ_OK;
+}
+
+nmz_status nmz_net_update(nmz_net *net, float learning_rate, float momentum) {
+    return update_impl(net, learning_rate, momentum, 1);
+}
+
+nmz_status nmz_net_preview_update(nmz_net *net, float learning_rate, float momentum) {
+    return update_impl(net, learning_rate, momentum, 0);
 }
 
 /* -------------------------------------------------------------- summary */

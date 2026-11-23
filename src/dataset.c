@@ -17,6 +17,7 @@
 nmz_csv_opts nmz_csv_defaults(void) {
     nmz_csv_opts o;
     o.n_targets = 1;
+    o.n_inputs = 0;
     o.header = -1;
     o.categorical = -1;
     o.delimiter = ',';
@@ -212,6 +213,14 @@ nmz_status nmz_dataset_load_csv(nmz_dataset **out, const char *path, const nmz_c
         goto done;
     }
     n_cols = rows[0].n;
+    if (o.n_inputs > 0) {
+        if (o.n_inputs >= n_cols) {
+            s = nmz__fail(NMZ_ERR_FORMAT, "%s:%d: %d column(s), but %d input column(s) plus at least one target are needed",
+                          path, rows[0].line, n_cols, o.n_inputs);
+            goto done;
+        }
+        o.n_targets = n_cols - o.n_inputs;
+    }
     if (o.n_targets < 1 || o.n_targets >= n_cols) {
         s = nmz__fail(NMZ_ERR_FORMAT, "%s:%d: %d column(s) cannot hold %d target column(s) plus at least one input",
                       path, rows[0].line, n_cols, o.n_targets);
