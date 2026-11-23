@@ -334,17 +334,67 @@ const nmz_tensor *nmz_net_activation(const nmz_net *net, int i);
 
 /* ----------------------------------------------------------------- dataset */
 
+/* ------------------------------------------------------------------- text */
+
+/* Character vocabulary over Unicode code points (not bytes). */
+typedef struct nmz_vocab {
+    int size;
+    uint32_t *codepoints; /* sorted ascending; id = position */
+    uint64_t *counts;     /* occurrences in the text it was built from */
+    int items;            /* 1: line-per-item text; '\n' ends an item */
+} nmz_vocab;
+
+#define NMZ_REPLACEMENT_CHAR 0xFFFDu
+/* Decode UTF-8 (RFC 3629: no overlong forms, surrogates or values above
+ * U+10FFFF). Each invalid byte becomes U+FFFD and is counted in *invalid.
+ * *out is malloc'd (free with free()). */
+nmz_status nmz_utf8_decode(const char *s, size_t n, uint32_t **out, size_t *out_n, size_t *invalid);
+/* Encode one code point; writes up to 4 bytes + NUL, returns the byte count
+ * (0 for an invalid code point). */
+int nmz_utf8_encode(uint32_t cp, char out[5]);
+/* Vocabulary of the distinct code points in cps[0..n) with their counts. */
+nmz_status nmz_vocab_build(nmz_vocab **out, const uint32_t *cps, size_t n);
+nmz_status nmz_vocab_create(nmz_vocab **out, int size, const uint32_t *codepoints, const uint64_t *counts,
+                            int items);
+nmz_status nmz_vocab_copy(nmz_vocab **out, const nmz_vocab *v);
+int nmz_vocab_index(const nmz_vocab *v, uint32_t cp); /* -1 if absent */
+void nmz_vocab_free(nmz_vocab *v);
+
 typedef struct nmz_dataset {
     int n_samples;
     int n_inputs;
     int n_outputs;
     float *x;           /* n_samples × n_inputs, row-major  */
-    float *y;           /* n_samples × n_outputs, row-major */
+    float *y;           /* n_samples × n_outputs, row-major — or, when
+                           y_index is set, n_samples × time_steps class ids */
     int n_classes;      /* > 0 when targets were one-hot encoded from labels */
     char **class_names; /* n_classes strings, or NULL      */
     int sample_rank;    /* shape of one input sample, e.g. [1,28,28] for */
     int sample_shape[NMZ_MAX_RANK]; /* images; 0 = flat (n_inputs) */
+    /* sequences (text): x holds token ids [n_samples × time_steps], y the ids
+     * of the next tokens; n_outputs is the vocabulary size and targets are
+     * expanded to one-hot rows only when a batch is assembled */
+    int time_steps; /* 0 for non-sequence data */
+    int y_index;    /* 1: y holds class ids, one per time step (or sample) */
+    nmz_vocab *vocab;
+    size_t n_tokens;    /* characters in the text after normalisation */
+    size_t invalid_utf8; /* bytes replaced by U+FFFD while decoding */
 } nmz_dataset;
+
+typedef struct nmz_text_opts {
+    int seq_len;            /* time steps per training sequence (default 64)  */
+    int items;              /* 1: one item per line (names); '\n' ends an item,
+                               empty lines are dropped and the text starts
+                               with '\n' so every item has a start context */
+    const nmz_vocab *vocab; /* encode with this vocabulary (e.g. the model's);
+                               NULL builds one from the text */
+} nmz_text_opts;
+
+nmz_text_opts nmz_text_defaults(void);
+/* Read a UTF-8 text file into non-overlapping sequences: input = ids
+ * [i·T, i·T+T), target = the same window shifted by one character.
+ * Normalisation: a UTF-8 BOM is dropped, CR LF and CR become LF. */
+nmz_status nmz_dataset_load_text(nmz_dataset **out, const char *path, const nmz_text_opts *opts);
 
 typedef struct nmz_csv_opts {
     int n_targets;   /* trailing columns that are targets (default 1)       */

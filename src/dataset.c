@@ -31,6 +31,7 @@ void nmz_dataset_free(nmz_dataset *ds) {
     free(ds->y);
     for (i = 0; i < ds->n_classes; i++) free(ds->class_names ? ds->class_names[i] : NULL);
     free(ds->class_names);
+    nmz_vocab_free(ds->vocab);
     free(ds);
 }
 

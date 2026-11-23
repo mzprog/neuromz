@@ -10,6 +10,7 @@
 #define NMZ_LEAKY_DEFAULT 0.01f
 #define NMZ_MAX_DIM 100000000  /* sanity limit for a single dimension */
 #define NMZ_MAX_ELEMS ((size_t)1 << 31)
+#define NMZ_MAX_VOCAB 65536
 
 /* Record a formatted message as the last error and return `s`. */
 nmz_status nmz__fail(nmz_status s, const char *fmt, ...)
