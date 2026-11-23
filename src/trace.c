@@ -30,6 +30,24 @@ void nmz_trace_emit(const nmz_ctx *ctx, nmz_trace_phase phase, const char *layer
     ctx->trace(&ev, ctx->trace_user);
 }
 
+void nmz_trace_emit_step(const nmz_ctx *ctx, nmz_trace_phase phase, const char *layer_type, const char *detail,
+                         int time_step, int n_items, const nmz_trace_item *items) {
+    nmz_trace_event ev;
+    int i;
+    if (!NMZ_TRACING(ctx)) return;
+    memset(&ev, 0, sizeof ev);
+    ev.phase = phase;
+    ev.step = ctx->step;
+    ev.layer = ctx->layer_index;
+    ev.time_step = time_step;
+    ev.layer_type = layer_type ? layer_type : "";
+    ev.detail = detail ? detail : "";
+    if (n_items > NMZ_TRACE_MAX_ITEMS) n_items = NMZ_TRACE_MAX_ITEMS;
+    ev.n_items = n_items;
+    for (i = 0; i < n_items; i++) ev.items[i] = items[i];
+    ctx->trace(&ev, ctx->trace_user);
+}
+
 const char *nmz_trace_phase_name(nmz_trace_phase p) {
     switch (p) {
     case NMZ_TRACE_FORWARD: return "forward";

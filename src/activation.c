@@ -211,7 +211,7 @@ static void act_destroy(nmz_layer *l) {
 
 const nmz_layer_ops nmz__activation_ops = {
     "activation", act_setup, act_init, act_forward, act_backward, act_param_count, act_param,
-    act_save, act_load, act_describe, act_destroy};
+    act_save, act_load, act_describe, act_destroy, NULL, 0};
 
 nmz_layer *nmz_layer_activation(nmz_act act, float alpha) {
     act_layer *a;

@@ -188,7 +188,7 @@ static void dense_destroy(nmz_layer *l) {
 
 const nmz_layer_ops nmz__dense_ops = {
     "dense", dense_setup, dense_init, dense_forward, dense_backward, dense_param_count,
-    dense_param, dense_save, dense_load, dense_describe, dense_destroy};
+    dense_param, dense_save, dense_load, dense_describe, dense_destroy, NULL, 0};
 
 int nmz_layer_dense_init(const nmz_layer *l) {
     if (!l || l->ops != &nmz__dense_ops) return -1;
@@ -197,6 +197,7 @@ int nmz_layer_dense_init(const nmz_layer *l) {
 
 int nmz_layer_init_used(const nmz_layer *l) {
     if (l && l->ops == &nmz__conv2d_ops) return nmz__conv2d_init_used(l);
+    if (l && (l->ops == &nmz__embedding_ops || l->ops == &nmz__rnn_ops)) return nmz__recurrent_init_used(l);
     return nmz_layer_dense_init(l);
 }
 

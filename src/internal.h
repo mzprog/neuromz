@@ -44,6 +44,9 @@ extern const nmz_layer_ops nmz__conv2d_ops;
 extern const nmz_layer_ops nmz__maxpool2d_ops;
 extern const nmz_layer_ops nmz__flatten_ops;
 extern const nmz_layer_ops nmz__dropout_ops;
+extern const nmz_layer_ops nmz__embedding_ops;
+extern const nmz_layer_ops nmz__rnn_ops;
+int nmz__recurrent_init_used(const nmz_layer *l);
 int nmz__conv2d_init_used(const nmz_layer *l);
 const nmz_tensor *nmz__maxpool_argmax(const nmz_layer *l);
 
@@ -107,6 +110,9 @@ struct nmz_net {
 
     nmz_trace_fn trace;
     void *trace_user;
+
+    int carry;            /* recurrent layers continue from their state */
+    nmz_vocab *vocab;     /* text models: the character vocabulary      */
 };
 
 /* Is the loss fused with a final softmax layer? */

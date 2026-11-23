@@ -43,16 +43,34 @@ static int same_signature(const nmz_net *net, const float *base, float *tmp, siz
 
 /* Every forward pass starts from the same PRNG state, so stochastic layers
  * (dropout) make identical choices and L is a deterministic function of w. */
+/* Carried recurrent state (truncated BPTT) is an input of the forward pass:
+ * every pass must start from the same one. */
+static nmz_status restore_states(nmz_net *net, const nmz_tensor *saved) {
+    int i;
+    nmz_status s;
+    for (i = 0; saved && i < net->n_layers; i++) {
+        nmz_layer *l = net->layers[i];
+        if (!l->ops->state) continue;
+        if (saved[i].size == 0 || !saved[i].data)
+            nmz_tensor_free(l->ops->state(l));
+        else if ((s = nmz_tensor_copy(l->ops->state(l), &saved[i])) != NMZ_OK)
+            return s;
+    }
+    return NMZ_OK;
+}
+
 typedef struct sigbuf {
     float *base, *tmp;
     size_t n;
     int crossed; /* set when a forward's switch pattern differs from base */
+    const nmz_tensor *states; /* carried states to restore before each pass */
 } sigbuf;
 
 static nmz_status loss_at(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t, int training,
                           const nmz_rng *rng0, sigbuf *sb, double *L) {
     nmz_status s;
     net->rng = *rng0;
+    if ((s = restore_states(net, sb->states)) != NMZ_OK) return s;
     s = nmz__net_forward(net, x, training, NULL);
     if (s != NMZ_OK) return s;
     if (!same_signature(net, sb->base, sb->tmp, sb->n)) sb->crossed = 1;
@@ -95,7 +113,9 @@ nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_t
     long saved_step;
     double worst = 0.0;
     nmz_rng rng0;
-    sigbuf sb = {NULL, NULL, 0, 0};
+    sigbuf sb = {NULL, NULL, 0, 0, NULL};
+    nmz_tensor *states = NULL;
+    int li;
     int k;
     if (!net || !x || !t || !result) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
     if (eps <= 0) eps = 1e-3;
@@ -109,7 +129,19 @@ nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_t
     net->trace = NULL;
 
     /* analytic gradients, copied out (they are overwritten by later passes) */
+    states = calloc((size_t)net->n_layers, sizeof *states);
+    if (!states) {
+        s = nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+        goto out;
+    }
+    for (li = 0; li < net->n_layers; li++) {
+        nmz_layer *l = net->layers[li];
+        if (l->ops->state && l->ops->state(l)->size && (s = nmz_tensor_copy(&states[li], l->ops->state(l))) != NMZ_OK)
+            goto out;
+    }
+    sb.states = states;
     net->rng = rng0;
+    if ((s = restore_states(net, states)) != NMZ_OK) goto out;
     if ((s = nmz__net_forward(net, x, training, NULL)) != NMZ_OK) goto out;
     sb.n = signature(net, NULL); /* switch pattern at the unperturbed point */
     if (sb.n) {
@@ -163,9 +195,9 @@ nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_t
         }
         off += w->size;
     }
-    /* input */
+    /* input (not for token ids: they have no gradient) */
     if ((s = nmz_tensor_copy(&xp, x)) != NMZ_OK) goto out;
-    for (e = 0; e < xp.size; e++) {
+    for (e = 0; e < xp.size && !(net->layers[0]->ops->flags & NMZ_LAYER_DISCRETE_INPUT); e++) {
         float orig = xp.data[e];
         double lp, lm;
         xp.data[e] = (float)(orig + eps);
@@ -191,6 +223,11 @@ out:
     nmz_tensor_free(&grads);
     free(sb.base);
     free(sb.tmp);
+    if (states) {
+        restore_states(net, states); /* leave the carried state as it was */
+        for (li = 0; li < net->n_layers; li++) nmz_tensor_free(&states[li]);
+        free(states);
+    }
     *result = r;
     return s;
 }

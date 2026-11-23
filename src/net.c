@@ -62,9 +62,11 @@ int nmz_layer_activation_kind(const nmz_layer *l) {
     return (int)nmz__activation_layer_act(l);
 }
 
+/* Product of the dimensions; NMZ_ANY_LENGTH (0) dims count as 1, so for
+ * sequence nets sizes are "per time step". */
 static int shape_prod(int rank, const int *shape) {
     int i, p = 1;
-    for (i = 0; i < rank; i++) p *= shape[i];
+    for (i = 0; i < rank; i++) p *= shape[i] ? shape[i] : 1;
     return p;
 }
 
@@ -90,6 +92,10 @@ nmz_train_opts nmz_train_defaults(void) {
     o.step_size = 10;
     o.gamma = 0.5f;
     o.min_lr = 0.0f;
+    o.val_fraction = 0.0f;
+    o.clip_norm = 0.0f;
+    o.carry_state = 0;
+    o.seq_len = 0;
     return o;
 }
 
@@ -102,7 +108,12 @@ nmz_status nmz_net_create(nmz_net **out, int input_rank, const int *input_shape,
     *out = NULL;
     if (input_rank < 1 || input_rank > NMZ_MAX_RANK - 1)
         return nmz__fail(NMZ_ERR_ARG, "input rank must be 1..%d (batch dim is added)", NMZ_MAX_RANK - 1);
-    if ((s = nmz__shape_size(input_rank, input_shape, &n)) != NMZ_OK) return s;
+    if (!input_shape) return nmz__fail(NMZ_ERR_ARG, "input shape is NULL");
+    if (input_shape[0] == NMZ_ANY_LENGTH) { /* sequence: any number of time steps */
+        if (input_rank > 1 && (s = nmz__shape_size(input_rank - 1, input_shape + 1, &n)) != NMZ_OK) return s;
+    } else if ((s = nmz__shape_size(input_rank, input_shape, &n)) != NMZ_OK) {
+        return s;
+    }
     net = calloc(1, sizeof *net);
     if (!net) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
     net->in_rank = input_rank;
@@ -147,6 +158,7 @@ void nmz_net_free(nmz_net *net) {
     nmz__norm_free(net);
     nmz_tensor_free(&net->in1);
     nmz_tensor_free(&net->out1);
+    nmz_vocab_free(net->vocab);
     free(net);
 }
 
@@ -374,6 +386,7 @@ const nmz_tensor *nmz_net_activation(const nmz_net *net, int i) {
 static nmz_ctx make_ctx_step(nmz_net *net, int layer, int training, long step) {
     nmz_ctx c;
     c.rng = &net->rng;
+    c.carry = net->carry;
     c.trace = net->trace;
     c.trace_user = net->trace_user;
     c.step = step;
@@ -385,6 +398,7 @@ static nmz_ctx make_ctx_step(nmz_net *net, int layer, int training, long step) {
 static nmz_ctx make_ctx(nmz_net *net, int layer, int training) {
     nmz_ctx c;
     c.rng = &net->rng;
+    c.carry = net->carry;
     c.trace = net->trace;
     c.trace_user = net->trace_user;
     c.step = net->step;
@@ -393,12 +407,26 @@ static nmz_ctx make_ctx(nmz_net *net, int layer, int training) {
     return c;
 }
 
-static nmz_status shape_with_batch(int batch, int rank, const int *shape, int *out) {
+/* [batch, shape...]; NMZ_ANY_LENGTH dims become `steps` (the actual T). */
+static nmz_status shape_with_batch_t(int batch, int steps, int rank, const int *shape, int *out) {
     int i;
     if (rank + 1 > NMZ_MAX_RANK) return nmz__fail(NMZ_ERR_SHAPE, "rank too large");
     out[0] = batch;
-    for (i = 0; i < rank; i++) out[i + 1] = shape[i];
+    for (i = 0; i < rank; i++) out[i + 1] = shape[i] == NMZ_ANY_LENGTH ? steps : shape[i];
     return NMZ_OK;
+}
+
+static nmz_status shape_with_batch(int batch, int rank, const int *shape, int *out) {
+    return shape_with_batch_t(batch, 1, rank, shape, out);
+}
+
+/* does x fit the per-sample input shape (wildcard dims accept any size)? */
+static int input_fits(const nmz_net *net, const nmz_tensor *x) {
+    int d;
+    if (x->rank != net->in_rank + 1) return 0;
+    for (d = 0; d < net->in_rank; d++)
+        if (net->in_shape[d] != NMZ_ANY_LENGTH && x->shape[d + 1] != net->in_shape[d]) return 0;
+    return 1;
 }
 
 nmz_status nmz__net_forward(nmz_net *net, const nmz_tensor *x, int training,
@@ -407,10 +435,13 @@ nmz_status nmz__net_forward(nmz_net *net, const nmz_tensor *x, int training,
     nmz_status s;
     if (!net || !x) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
     if ((s = nmz_net_build(net)) != NMZ_OK) return s;
-    if (x->rank != net->in_rank + 1 ||
-        !nmz__shape_equal(x->rank - 1, x->shape + 1, net->in_rank, net->in_shape))
+    if (!input_fits(net, x)) {
+        if (nmz_net_is_sequence(net))
+            return nmz__fail(NMZ_ERR_SHAPE, "a sequence net needs input of shape [batch, steps%s]",
+                             net->in_rank > 1 ? ", ..." : "");
         return nmz__fail(NMZ_ERR_SHAPE, "input must have shape [batch, %d] (got %d values per sample)",
                          nmz_net_input_size(net), x->rank >= 1 ? (int)(x->size / (size_t)x->shape[0]) : 0);
+    }
     net->have_forward = net->have_grads = 0;
     if ((s = nmz_tensor_copy(&net->acts[0], x)) != NMZ_OK) return s;
     if (net->norm != NMZ_NORM_NONE) {
@@ -437,7 +468,9 @@ nmz_status nmz__net_forward(nmz_net *net, const nmz_tensor *x, int training,
     for (i = 0; i < net->n_layers; i++) {
         nmz_layer *l = net->layers[i];
         nmz_ctx ctx = make_ctx_step(net, i, training, net->step + 1);
-        if ((s = shape_with_batch(x->shape[0], l->out_rank, l->out_shape, shape)) != NMZ_OK) return s;
+        if ((s = shape_with_batch_t(x->shape[0], x->rank > 1 ? x->shape[1] : 1, l->out_rank, l->out_shape, shape)) !=
+            NMZ_OK)
+            return s;
         if ((s = nmz_tensor_reshape(&net->acts[i + 1], l->out_rank + 1, shape)) != NMZ_OK) return s;
         if ((s = l->ops->forward(l, &net->acts[i], &net->acts[i + 1], &ctx)) != NMZ_OK) return s;
     }
@@ -463,6 +496,9 @@ nmz_status nmz_net_predict(nmz_net *net, const float *x, float *y) {
     int shape[NMZ_MAX_RANK];
     nmz_status s;
     if (!net || !x || !y) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
+    if (nmz_net_is_sequence(net))
+        return nmz__fail(NMZ_ERR_UNSUPPORTED, "predict takes one fixed-size sample; for a sequence net use "
+                                              "nmz_net_forward with [1, steps] or nmz_net_generate");
     if ((s = shape_with_batch(1, net->in_rank, net->in_shape, shape)) != NMZ_OK) return s;
     if ((s = nmz_tensor_reshape(&net->in1, net->in_rank + 1, shape)) != NMZ_OK) return s;
     memcpy(net->in1.data, x, net->in1.size * sizeof(float));
@@ -711,6 +747,61 @@ int nmz_net_optimizer_state(const nmz_net *net, long *t) {
     if (t) *t = net ? net->opt_t : 0;
     return net ? net->opt_kind : -1;
 }
+
+nmz_status nmz_net_clip_gradients(nmz_net *net, double max_norm, double *norm, double *scale) {
+    double sq = 0.0, n, f = 1.0;
+    int k;
+    size_t e;
+    if (!net || !(max_norm > 0)) return nmz__fail(NMZ_ERR_ARG, "clip norm must be > 0");
+    if (!net->built) return nmz__fail(NMZ_ERR_STATE, "network is not built");
+    for (k = 0; k < net->n_params; k++) {
+        const nmz_tensor *g = nmz_layer_param_grad(net->layers[net->param_refs[k].layer], net->param_refs[k].index);
+        for (e = 0; e < g->size; e++) sq += (double)g->data[e] * g->data[e];
+    }
+    n = sqrt(sq);
+    if (n > max_norm) {
+        f = max_norm / n;
+        for (k = 0; k < net->n_params; k++) {
+            nmz_tensor *g = nmz_layer_param_grad(net->layers[net->param_refs[k].layer], net->param_refs[k].index);
+            for (e = 0; e < g->size; e++) g->data[e] = (float)(g->data[e] * f);
+        }
+    }
+    if (net->trace) {
+        nmz_ctx ctx = make_ctx(net, -1, 1);
+        nmz_trace_scalar sc[3] = {{"norm", n}, {"max_norm", max_norm}, {"scale", f}};
+        nmz_trace_emit(&ctx, NMZ_TRACE_UPDATE, "clip", f < 1.0 ? "clipped" : "unchanged", 3, sc, 0, NULL);
+    }
+    if (norm) *norm = n;
+    if (scale) *scale = f;
+    return NMZ_OK;
+}
+
+void nmz_net_set_carry(nmz_net *net, int on) {
+    if (net) net->carry = on != 0;
+}
+
+void nmz_net_reset_state(nmz_net *net) {
+    int i;
+    if (!net) return;
+    for (i = 0; i < net->n_layers; i++) {
+        nmz_layer *l = net->layers[i];
+        if (l->ops->state) nmz_tensor_free(l->ops->state(l));
+    }
+}
+
+nmz_status nmz_net_set_vocab(nmz_net *net, const nmz_vocab *v) {
+    nmz_vocab *copy = NULL;
+    nmz_status s;
+    if (!net) return nmz__fail(NMZ_ERR_ARG, "net is NULL");
+    if (v && (s = nmz_vocab_copy(&copy, v)) != NMZ_OK) return s;
+    nmz_vocab_free(net->vocab);
+    net->vocab = copy;
+    return NMZ_OK;
+}
+
+const nmz_vocab *nmz_net_vocab(const nmz_net *net) { return net ? net->vocab : NULL; }
+
+int nmz_net_is_sequence(const nmz_net *net) { return net && net->in_shape[0] == NMZ_ANY_LENGTH; }
 
 /* -------------------------------------------------------------- summary */
 

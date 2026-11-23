@@ -79,7 +79,7 @@ static void test_names(void) {
 
 static void test_errors(void) {
     nmz_net *net = NULL;
-    int in = 2, bad = 0;
+    int in = 2, bad = -1; /* 0 is NMZ_ANY_LENGTH (sequences) */
     nmz_tensor x = NMZ_TENSOR_EMPTY, t = NMZ_TENSOR_EMPTY;
     const nmz_tensor *y;
     int xs[2] = {1, 3}, ts[2] = {1, 2};

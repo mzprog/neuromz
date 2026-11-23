@@ -24,6 +24,10 @@ extern "C" {
 #define NMZ_VERSION_STRING "2.0.0"
 
 #define NMZ_MAX_RANK 4
+/* A per-sample dimension of 0 (first dimension only) means "any length":
+ * sequence nets are created with input shape [NMZ_ANY_LENGTH] and accept
+ * [B, T] batches for any T (64 in training, 1 when generating). */
+#define NMZ_ANY_LENGTH 0
 #define NMZ_TRACE_MAX_ITEMS 8
 
 /* ------------------------------------------------------------------ errors */
@@ -152,6 +156,16 @@ nmz_layer *nmz_layer_flatten(void);
 /* Inverted dropout: in training each value is zeroed with probability `rate`
  * and the rest scaled by 1/(1−rate); identity in evaluation. */
 nmz_layer *nmz_layer_dropout(float rate);
+/* Token ids [steps] → vectors [steps, dim] (W is [vocab, dim]). Its input is
+ * discrete: no input gradient. The weight gradient is sparse (only rows of
+ * tokens that occur are written); optimizers still update the full matrix,
+ * so Adam/momentum behave exactly as for a dense parameter. */
+nmz_layer *nmz_layer_embedding(int vocab, int dim, nmz_init init);
+/* Vanilla RNN over [steps, features] → [steps, units]:
+ * h_t = tanh(x_t·W_xh + h_{t−1}·W_hh + b); BPTT inside the layer. With
+ * carry on (nmz_net_set_carry / train opts carry_state) h_{−1} is the last
+ * hidden state of the previous forward pass, else zeros. AUTO = Glorot. */
+nmz_layer *nmz_layer_rnn(int units, nmz_init init);
 /* Free a layer that was NOT added to a net. */
 void nmz_layer_free(nmz_layer *l);
 
@@ -177,6 +191,7 @@ int nmz_layer_input_size(const nmz_layer *l);
 
 typedef struct nmz_net nmz_net;
 typedef struct nmz_dataset nmz_dataset; /* defined below */
+typedef struct nmz_vocab nmz_vocab;     /* defined below */
 
 /* Training configuration (also stored inside each model). */
 typedef struct nmz_epoch_info {
@@ -184,13 +199,18 @@ typedef struct nmz_epoch_info {
     double loss;         /* loss over the whole training set          */
     double accuracy;     /* NaN when not meaningful (see DESIGN §10.23) */
     float learning_rate; /* η used in this epoch (after the schedule) */
+    double val_loss;     /* loss on the validation split (NaN without one) */
+    double val_accuracy;
+    int clipped_batches; /* batches whose gradients were clipped this epoch */
 } nmz_epoch_info;
 
 typedef struct nmz_batch_info {
-    int epoch;     /* 1-based                               */
-    int batch;     /* 1-based index within the epoch        */
-    int n_batches; /* mini-batches per epoch                */
-    double loss;   /* loss of this mini-batch (before update) */
+    int epoch;        /* 1-based                               */
+    int batch;        /* 1-based index within the epoch        */
+    int n_batches;    /* mini-batches per epoch                */
+    double loss;      /* loss of this mini-batch (before update) */
+    double grad_norm; /* global gradient norm before clipping (NaN if clipping is off) */
+    int clipped;      /* 1 if the gradients were scaled down    */
 } nmz_batch_info;
 
 /* Return non-zero from a callback to stop training early. */
@@ -224,6 +244,15 @@ typedef struct nmz_train_opts {
     int step_size;       /* NMZ_SCHED_STEP: epochs between decays       */
     float gamma;         /* NMZ_SCHED_STEP: decay factor                */
     float min_lr;        /* NMZ_SCHED_COSINE: final learning rate       */
+    float val_fraction;  /* hold out the LAST fraction of the samples for
+                            validation (0 = none); reported every epoch   */
+    float clip_norm;     /* > 0: scale all gradients down so their global
+                            L2 norm is at most this (0 = off)             */
+    int carry_state;     /* recurrent nets: consecutive batches continue
+                            the same streams and the hidden state is
+                            carried over (truncated BPTT); no shuffling   */
+    int seq_len;         /* text: time steps per training sequence (used
+                            by the loaders/CLI, stored with the model)   */
     nmz_epoch_fn on_epoch;
     nmz_batch_fn on_batch;
     void *user;          /* passed to both callbacks                    */
@@ -235,6 +264,8 @@ typedef struct nmz_train_result {
     double accuracy; /* final accuracy, NaN when not meaningful       */
     int converged;   /* 1 if loss <= target_loss                      */
     int stopped;     /* 1 if the on_epoch callback asked to stop      */
+    double val_loss; /* final validation loss (NaN without a split)   */
+    double val_accuracy;
 } nmz_train_result;
 
 /* Library defaults (not tuned for any dataset). */
@@ -327,6 +358,21 @@ nmz_status nmz_net_optimizer_step(nmz_net *net, const nmz_train_opts *o, float l
 nmz_status nmz_net_optimizer_preview(nmz_net *net, const nmz_train_opts *o, float learning_rate);
 /* Which optimizer the stored state belongs to (-1: none yet) and Adam's t. */
 int nmz_net_optimizer_state(const nmz_net *net, long *t);
+/* Scale all gradients so that their global L2 norm sqrt(Σ g²) is at most
+ * max_norm (no change if it already is). *norm receives the norm before
+ * clipping, *scale the factor applied (1 = unchanged). Traced as an
+ * update-phase event of type "clip". */
+nmz_status nmz_net_clip_gradients(nmz_net *net, double max_norm, double *norm, double *scale);
+
+/* Recurrent state: with carry on, recurrent layers start every forward pass
+ * from the state the previous one ended in; reset forgets it (zeros). */
+void nmz_net_set_carry(nmz_net *net, int on);
+void nmz_net_reset_state(nmz_net *net);
+/* 1 if the input has a NMZ_ANY_LENGTH time dimension. */
+int nmz_net_is_sequence(const nmz_net *net);
+/* Text models: the character vocabulary, saved with the model (copied). */
+nmz_status nmz_net_set_vocab(nmz_net *net, const nmz_vocab *v);
+const nmz_vocab *nmz_net_vocab(const nmz_net *net);
 /* ∂L/∂input of the last backward pass ([B, input_shape...]). */
 const nmz_tensor *nmz_net_input_grad(const nmz_net *net);
 /* Output of layer i from the last forward (i = -1: the input copy). */

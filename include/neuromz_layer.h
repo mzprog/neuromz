@@ -29,6 +29,8 @@ typedef struct nmz_ctx {
     int layer_index;
     int training; /* 1 during training passes, 0 for evaluation */
     nmz_rng *rng; /* the net's PRNG (dropout masks); never NULL in forward */
+    int carry;    /* recurrent layers start from (and update) their carried
+                     state instead of zeros (truncated BPTT, generation) */
 } nmz_ctx;
 
 /* Little-endian byte writer/reader used by save_config/load_config. */
@@ -61,7 +63,18 @@ typedef struct nmz_layer_ops {
     nmz_status (*load_config)(nmz_layer **out, nmz_reader *r);
     void (*describe)(const nmz_layer *l, char *buf, size_t n);
     void (*destroy)(nmz_layer *l);
+    /* --- optional (NULL / 0 for most layers) --- */
+    /* The state a recurrent layer carries from one forward to the next
+     * (e.g. the RNN's last hidden state, [B, H]); an empty tensor means
+     * "start from zeros". The engine resets it (frees it) and gradcheck
+     * snapshots/restores it, so the layer only has to read/write it. */
+    nmz_tensor *(*state)(nmz_layer *l);
+    unsigned flags; /* NMZ_LAYER_* */
 } nmz_layer_ops;
+
+/* The layer's input is discrete (token ids): there is no input gradient,
+ * and gradcheck does not perturb the input. */
+#define NMZ_LAYER_DISCRETE_INPUT 1u
 
 struct nmz_layer {
     const nmz_layer_ops *ops;
@@ -81,6 +94,10 @@ nmz_layer *nmz_layer_alloc(const nmz_layer_ops *ops, void *self);
 void nmz_trace_emit(const nmz_ctx *ctx, nmz_trace_phase phase, const char *layer_type,
                     const char *detail, int n_scalars, const nmz_trace_scalar *scalars,
                     int n_items, const nmz_trace_item *items);
+
+/* Same, for one time step of a sequence layer (event.time_step = t). */
+void nmz_trace_emit_step(const nmz_ctx *ctx, nmz_trace_phase phase, const char *layer_type, const char *detail,
+                         int time_step, int n_items, const nmz_trace_item *items);
 
 /* Registry used by the loader: type name → ops. Built-in layers are always
  * registered. Returns NULL if unknown. */
