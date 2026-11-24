@@ -158,11 +158,12 @@ static void wbar(double w, int width) {
 
 /* ------------------------------------------------------------- patterns */
 
-enum { P_SELF, P_PREV, P_PREV2, P_SAME, P_WORD, P_SEP, P_FIRST, P_FAR, N_PAT };
+enum { P_SELF, P_PREV, P_PREV2, P_SAME, P_AFTER, P_WORD, P_SEP, P_FIRST, P_FAR, N_PAT };
 static const char *const k_pat[N_PAT] = {"itself",
                                          "the previous character",
                                          "the character two back",
                                          "earlier copies of the same character",
+                                         "the character after an earlier copy (what came next last time)",
                                          "the start of the current word",
                                          "the last space or punctuation",
                                          "the first position of the window",
@@ -201,6 +202,7 @@ static int in_pat(int p, const nmz_vocab *v, const int *ids, int t, int j, int w
     case P_PREV: return j == t - 1;
     case P_PREV2: return j == t - 2;
     case P_SAME: return j < t && ids[j] == ids[t];
+    case P_AFTER: return j > 0 && j <= t && ids[j - 1] == ids[t] && j - 1 < t;
     case P_WORD: return j == word && word >= 0;
     case P_SEP: return j == sep && sep >= 0;
     case P_FIRST: return j == 0;
@@ -305,7 +307,7 @@ void attn_pats_print(const attn_pats *ap, const nmz_net *net) {
                 printf("spread out: no single kind of position stands out (best: %s %.0f%%, uniform %.0f%%)", k_pat[p1],
                        100 * m1, 100 * u1);
             else
-                printf("%-38s %3.0f%% (uniform %2.0f%%)", k_pat[p1], 100 * m1, 100 * u1);
+                printf("%s: %.0f%% (uniform %.0f%%)", k_pat[p1], 100 * m1, 100 * u1);
             if (m1 - u1 >= 0.1 && p2 >= 0 && m2 - u2 >= 0.05) printf(";  then %s %.0f%%", k_pat[p2], 100 * m2);
             printf("\n                  span %.1f positions, top weight %.2f on average\n", span, top);
         }
@@ -669,6 +671,15 @@ void print_attn_trace(const nmz_trace_recorder *rec, const nmz_vocab *v, const p
             printf("  %s  ", n3(row[idx[r]]));
             wbar(row[idx[r]], 30);
             printf("%s\n", tgt[p] == idx[r] ? "   <- the actual next character" : "");
+        }
+        if (tgt[p] >= 0 && tgt[p] != idx[0] && tgt[p] != idx[1] && tgt[p] != idx[2] && tgt[p] != idx[3] &&
+            tgt[p] != idx[4]) {
+            int rank = 1;
+            for (j = 0; j < V; j++) rank += row[j] > row[tgt[p]];
+            attn_line_start();
+            printf("  the actual next character ");
+            put_quoted(v, tgt[p]);
+            printf(": p = %s (rank %d of %d)\n", n3(row[tgt[p]]), rank, V);
         }
         if (!isnan(L))
             printf("  L = mean over the %d positions of -log p(target) = %s   (perplexity %s)\n", T, nm(L), nm(exp(L)));
