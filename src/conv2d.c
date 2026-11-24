@@ -372,7 +372,7 @@ static void conv_destroy(nmz_layer *l) {
 
 const nmz_layer_ops nmz__conv2d_ops = {"conv2d",        conv_setup,   conv_init,     conv_forward,
                                        conv_backward,   conv_param_count, conv_param, conv_save,
-                                       conv_load,       conv_describe, conv_destroy, NULL, 0};
+                                       conv_load,       conv_describe, conv_destroy, NULL, 0, NULL};
 
 nmz_status nmz_layer_conv2d_set_algo(nmz_layer *l, nmz_conv_algo algo) {
     if (!l || l->ops != &nmz__conv2d_ops) return nmz__fail(NMZ_ERR_ARG, "not a conv2d layer");

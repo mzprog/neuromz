@@ -152,7 +152,7 @@ static void pool_destroy(nmz_layer *l) {
 }
 
 const nmz_layer_ops nmz__maxpool2d_ops = {"maxpool2d", pool_setup, no_init,   pool_forward,  pool_backward, no_params,
-                                          no_param,    pool_save,  pool_load, pool_describe, pool_destroy, NULL, 0};
+                                          no_param,    pool_save,  pool_load, pool_describe, pool_destroy, NULL, 0, NULL};
 
 const nmz_tensor *nmz__maxpool_argmax(const nmz_layer *l) { return &((const pool_layer *)l->self)->argmax; }
 
@@ -238,7 +238,7 @@ static void flat_describe(const nmz_layer *l, char *buf, size_t n) {
 static void flat_destroy(nmz_layer *l) { free(l->self); }
 
 const nmz_layer_ops nmz__flatten_ops = {"flatten", flat_setup, no_init,   flat_forward,  flat_backward, no_params,
-                                        no_param,  flat_save,  flat_load, flat_describe, flat_destroy, NULL, 0};
+                                        no_param,  flat_save,  flat_load, flat_describe, flat_destroy, NULL, 0, NULL};
 
 nmz_layer *nmz_layer_flatten(void) {
     flatten_layer *f = calloc(1, sizeof *f);
@@ -333,7 +333,7 @@ static void drop_destroy(nmz_layer *l) {
 }
 
 const nmz_layer_ops nmz__dropout_ops = {"dropout", drop_setup, no_init,   drop_forward,  drop_backward, no_params,
-                                        no_param,  drop_save,  drop_load, drop_describe, drop_destroy, NULL, 0};
+                                        no_param,  drop_save,  drop_load, drop_describe, drop_destroy, NULL, 0, NULL};
 
 nmz_layer *nmz_layer_dropout(float rate) {
     dropout_layer *d;

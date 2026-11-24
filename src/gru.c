@@ -327,7 +327,7 @@ static void gru_destroy(nmz_layer *l) {
 
 const nmz_layer_ops nmz__gru_ops = {"gru",          gru_setup, gru_init, gru_forward, gru_backward, gru_param_count,
                                     gru_param,      gru_save,  gru_load, gru_describe, gru_destroy, gru_state,
-                                    0};
+                                    0, NULL};
 
 nmz_layer *nmz_layer_gru(int units, nmz_init init) {
     gru_layer *g;

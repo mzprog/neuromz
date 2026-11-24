@@ -101,6 +101,7 @@ typedef enum nmz_act {
     NMZ_ACT_RELU,
     NMZ_ACT_LEAKY_RELU,
     NMZ_ACT_SOFTMAX,
+    NMZ_ACT_GELU, /* x·Φ(x), Φ = standard normal CDF (exact, with erf) */
     NMZ_ACT_COUNT
 } nmz_act;
 
@@ -189,6 +190,41 @@ nmz_layer *nmz_layer_lstm(int units, nmz_init init, float forget_bias);
 nmz_layer *nmz_layer_gru(int units, nmz_init init);
 /* 1 for rnn/lstm/gru layers. */
 int nmz_layer_is_recurrent(const nmz_layer *l);
+
+/* ---- Transformer building blocks (decoder-only, GPT-style). All work on
+ * [steps, D] per sample, i.e. [B, T, D] batches; see DESIGN §3.2. */
+/* Position encoding: y_t = x_t + P[offset + t]. LEARNED: P [max_len, D] is a
+ * parameter; SINUSOIDAL: P[t][2i] = sin(t/10000^(2i/D)), P[t][2i+1] = cos(…),
+ * fixed. max_len is the context window. With carry on (generation) the
+ * offset continues from the previous forward pass. */
+typedef enum nmz_posenc { NMZ_POS_LEARNED = 0, NMZ_POS_SINUSOIDAL, NMZ_POS_COUNT } nmz_posenc;
+nmz_layer *nmz_layer_posenc(nmz_posenc kind, int max_len);
+const char *nmz_posenc_name(nmz_posenc k);
+/* LayerNorm over the last dimension: y = g ⊙ (x − μ)/√(σ² + ε) + b, with
+ * learnable gain g (starts at 1) and bias b (starts at 0); ε = 1e-5. */
+#define NMZ_LAYERNORM_EPS 1e-5f
+nmz_layer *nmz_layer_layernorm(void);
+/* Causal multi-head self-attention, `heads` heads of `head_dim` numbers
+ * (E = heads·head_dim):  [q | k | v] = x·W_qkv + b_qkv   (W_qkv [D, 3E])
+ *   per head: weights = softmax(q·kᵀ/√head_dim) over earlier positions only
+ *             (the causal mask), context = weights·v
+ *   y = context·W_o + b_o   (W_o [E, D]).
+ * head_dim 0 = D/heads. With carry on (generation) the keys and values of
+ * earlier forward passes are kept (the KV cache, the layer's state). */
+nmz_layer *nmz_layer_attention(int heads, int head_dim);
+/* Position-wise feed-forward: y = act(x·W1 + b1)·W2 + b2, act gelu or relu. */
+nmz_layer *nmz_layer_ffn(int hidden, nmz_act act);
+/* Pre-LayerNorm Transformer block (one composite layer):
+ *   h = x + dropout(attention(LN1(x)))     y = h + dropout(ffn(LN2(h)))
+ * hidden 0 = 4·D; dropout 0 = none. */
+nmz_layer *nmz_layer_block(int heads, int head_dim, int ff_hidden, nmz_act act, float dropout);
+/* Output projection tied to the net's embedding: z = x·Eᵀ + b, E = the
+ * embedding matrix [vocab, D] (shared: one parameter, two uses). The
+ * embedding is found when the net is built (the nearest embedding layer
+ * before this one); `vocab` must match it. */
+nmz_layer *nmz_layer_tied_output(int vocab);
+/* 1 for attention layers and blocks (they hold a KV cache when carrying). */
+int nmz_layer_has_attention(const nmz_layer *l);
 /* Free a layer that was NOT added to a net. */
 void nmz_layer_free(nmz_layer *l);
 
@@ -235,6 +271,7 @@ typedef struct nmz_batch_info {
     double loss;      /* loss of this mini-batch (before update) */
     double grad_norm; /* global gradient norm before clipping (NaN if clipping is off) */
     int clipped;      /* 1 if the gradients were scaled down    */
+    float learning_rate; /* η used for this batch's update      */
 } nmz_batch_info;
 
 /* Return non-zero from a callback to stop training early. */
@@ -245,6 +282,9 @@ typedef enum nmz_optimizer {
     NMZ_OPT_SGD = 0, /* v ← μ·v − η·g ; w ← w + v                                 */
     NMZ_OPT_ADAM,    /* m ← β1·m + (1−β1)·g ; v ← β2·v + (1−β2)·g²
                         w ← w − η·m̂/(√v̂ + ε), m̂ = m/(1−β1^t), v̂ = v/(1−β2^t)      */
+    NMZ_OPT_ADAMW,   /* Adam + decoupled weight decay (Loshchilov & Hutter 2019):
+                        w ← w − η·(m̂/(√v̂ + ε) + λ·w), λ = weight_decay, applied
+                        only to weight matrices unless decay_all is set      */
     NMZ_OPT_COUNT
 } nmz_optimizer;
 
@@ -252,6 +292,9 @@ typedef enum nmz_schedule {
     NMZ_SCHED_CONSTANT = 0, /* η_e = η                                               */
     NMZ_SCHED_STEP,         /* η_e = η · γ^floor((e−1)/step_size)                     */
     NMZ_SCHED_COSINE,       /* η_e = η_min + ½(η − η_min)(1 + cos(π·(e−1)/max_epochs)) */
+    NMZ_SCHED_WARMUP_COSINE, /* per BATCH s = 1..S (S = max_epochs · batches per epoch),
+                                W = warmup_steps:  s ≤ W: η·s/W
+                                else η_min + ½(η − η_min)(1 + cos(π·(s−W−1)/(S−W))) */
     NMZ_SCHED_COUNT
 } nmz_schedule;
 
@@ -281,6 +324,12 @@ typedef struct nmz_train_opts {
                             many epochs without a new best validation
                             loss and restore the best weights (early
                             stopping); 0 = off                            */
+    float weight_decay;  /* NMZ_OPT_ADAMW: λ (0 = plain Adam)           */
+    int decay_all;       /* AdamW: 1 = decay every parameter; 0 (default) =
+                            only weight matrices — not biases, LayerNorm
+                            gains/biases, embeddings or position tables  */
+    int warmup_steps;    /* NMZ_SCHED_WARMUP_COSINE: batches of linear
+                            warm-up from 0 to the learning rate          */
     nmz_epoch_fn on_epoch;
     nmz_batch_fn on_batch;
     void *user;          /* passed to both callbacks                    */
@@ -299,8 +348,13 @@ typedef struct nmz_train_result {
 
 /* Library defaults (not tuned for any dataset). */
 nmz_train_opts nmz_train_defaults(void);
-/* Learning rate for epoch e (1-based) under o's schedule. */
+/* Learning rate for epoch e (1-based) under o's schedule (for the per-batch
+ * NMZ_SCHED_WARMUP_COSINE: the base rate η). */
 float nmz_schedule_lr(const nmz_train_opts *o, int epoch);
+/* Learning rate for batch `step` (1-based) of `total` batches in the whole
+ * run: NMZ_SCHED_WARMUP_COSINE per batch; other schedules give
+ * nmz_schedule_lr of the epoch that batch falls in (`per_epoch` batches). */
+float nmz_schedule_lr_step(const nmz_train_opts *o, long step, long total, long per_epoch);
 const char *nmz_optimizer_name(nmz_optimizer o);
 const char *nmz_schedule_name(nmz_schedule s);
 nmz_status nmz_optimizer_parse(const char *s, nmz_optimizer *out);
@@ -399,6 +453,9 @@ void nmz_net_set_carry(nmz_net *net, int on);
 void nmz_net_reset_state(nmz_net *net);
 /* 1 if the input has a NMZ_ANY_LENGTH time dimension. */
 int nmz_net_is_sequence(const nmz_net *net);
+/* Context window (positions) of a Transformer: the smallest max_len of its
+ * position-encoding layers; 0 if it has none (no limit). */
+int nmz_net_context_length(const nmz_net *net);
 /* Text generation from a character model (embedding input + vocabulary). */
 typedef struct nmz_gen_opts {
     const char *prime;  /* UTF-8 text fed first; NULL/"" = the end-of-item
@@ -409,6 +466,13 @@ typedef struct nmz_gen_opts {
     int top_k;          /* sample only among the k most likely (0 = all)  */
     uint64_t seed;      /* same seed + same model = same text             */
     int stop_at_end;    /* stop after generating '\n' (one item)          */
+    int context;        /* Transformers: positions the model sees (0 = its
+                           context length). When the text outgrows it the
+                           window slides: the newest context/2 characters
+                           are kept and re-encoded from position 0        */
+    int no_cache;       /* Transformers: 1 = recompute the whole window at
+                           every step instead of using the KV cache (the
+                           reference; the text is bit-identical)         */
 } nmz_gen_opts;
 nmz_gen_opts nmz_gen_defaults(void);
 /* *out receives malloc'd UTF-8 (free with free()); the prime is not
@@ -426,6 +490,11 @@ const nmz_vocab *nmz_net_vocab(const nmz_net *net);
 const nmz_tensor *nmz_net_input_grad(const nmz_net *net);
 /* Output of layer i from the last forward (i = -1: the input copy). */
 const nmz_tensor *nmz_net_activation(const nmz_net *net, int i);
+/* ∂L/∂(output of layer i) from the last backward pass (i = -1: ∂L/∂input). */
+const nmz_tensor *nmz_net_activation_grad(const nmz_net *net, int i);
+/* Is parameter i of layer l decayed by AdamW? Weight matrices yes; biases,
+ * gains, embeddings and position tables no — unless decay_all. */
+int nmz_layer_param_decays(const nmz_layer *l, int i, int decay_all);
 
 /* ----------------------------------------------------------------- dataset */
 
@@ -680,6 +749,21 @@ nmz_status nmz_net_gradcheck(nmz_net *net, const nmz_tensor *x, const nmz_tensor
 nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t,
                                   double eps, double atol, double rtol, int training,
                                   nmz_gradcheck_result *result);
+
+/* ------------------------------------------------------------ matrix product */
+
+/* C[M,N] = A[M,K]·B[K,N], row-major floats, sums in float in increasing k.
+ * TRANS_A: A is stored [K,M]; TRANS_B: B is stored [N,K] (not both);
+ * ACCUMULATE: C += A·B. nmz_matmul is cache-blocked (and multi-threaded
+ * when built with OpenMP); nmz_matmul_naive is the three-loop reference.
+ * Both give bit-identical results (DESIGN decision 92). */
+#define NMZ_MM_TRANS_A 1u
+#define NMZ_MM_TRANS_B 2u
+#define NMZ_MM_ACCUMULATE 4u
+nmz_status nmz_matmul(int M, int N, int K, const float *A, const float *B, float *C, unsigned flags);
+nmz_status nmz_matmul_naive(int M, int N, int K, const float *A, const float *B, float *C, unsigned flags);
+/* Threads the library computes with (1 unless built with OpenMP). */
+int nmz_threads(void);
 
 /* ----------------------------------------------------------------- summary */
 

@@ -15,7 +15,8 @@
 #include <string.h>
 
 /* The "switch pattern" of a forward pass: which side of 0 every relu /
- * leaky-relu input is on, and every max-pool winner. If a perturbation
+ * leaky-relu input is on (also inside a Transformer's feed-forward layer),
+ * and every max-pool winner. If a perturbation
  * changes it, the loss is not differentiable between the two points. */
 static size_t signature(const nmz_net *net, float *out) {
     size_t n = 0, e;
@@ -30,6 +31,9 @@ static size_t signature(const nmz_net *net, float *out) {
             const nmz_tensor *am = nmz__maxpool_argmax(l);
             for (e = 0; e < am->size; e++, n++)
                 if (out) out[n] = am->data[e];
+        }
+        else {
+            n += nmz__kink_signature(l, out ? out + n : NULL);
         }
     }
     return n;

@@ -8,7 +8,7 @@
 #include <string.h>
 
 static const char *const k_act_names[NMZ_ACT_COUNT] = {
-    "linear", "sigmoid", "tanh", "relu", "leaky_relu", "softmax"};
+    "linear", "sigmoid", "tanh", "relu", "leaky_relu", "softmax", "gelu"};
 
 const char *nmz_act_name(nmz_act a) {
     if ((int)a < 0 || a >= NMZ_ACT_COUNT) return "?";
@@ -27,8 +27,13 @@ nmz_status nmz_act_parse(const char *s, nmz_act *out) {
     if (strcmp(s, "identity") == 0 || strcmp(s, "none") == 0) { *out = NMZ_ACT_LINEAR; return NMZ_OK; }
     return nmz__fail(NMZ_ERR_ARG,
                      "unknown activation '%s' (expected linear, sigmoid, tanh, relu, "
-                     "leaky_relu, softmax)", s);
+                     "leaky_relu, softmax, gelu)", s);
 }
+
+/* GELU (Hendrycks & Gimpel 2016), the exact form: x·Φ(x) with Φ the
+ * standard normal CDF, Φ(x) = ½(1 + erf(x/√2)); derivative Φ(x) + x·φ(x).
+ * (GPT-2 used a tanh approximation of the same curve.) */
+static double gelu_cdf(double z) { return 0.5 * (1.0 + erf(z * 0.70710678118654752440)); }
 
 /* Numerically stable logistic function. */
 static double sigmoid_d(double z) {
@@ -46,6 +51,7 @@ float nmz_act_apply(nmz_act a, float z, float alpha) {
     case NMZ_ACT_TANH: return (float)tanh(z);
     case NMZ_ACT_RELU: return z > 0.0f ? z : 0.0f;
     case NMZ_ACT_LEAKY_RELU: return z > 0.0f ? z : alpha * z;
+    case NMZ_ACT_GELU: return (float)(z * gelu_cdf(z));
     case NMZ_ACT_SOFTMAX:
     case NMZ_ACT_COUNT: break;
     }
@@ -67,6 +73,7 @@ float nmz_act_derivative(nmz_act a, float z, float alpha) {
     }
     case NMZ_ACT_RELU: return z > 0.0f ? 1.0f : 0.0f;
     case NMZ_ACT_LEAKY_RELU: return z > 0.0f ? 1.0f : alpha;
+    case NMZ_ACT_GELU: return (float)(gelu_cdf(z) + z * 0.39894228040143267794 * exp(-0.5 * (double)z * z));
     case NMZ_ACT_SOFTMAX:
     case NMZ_ACT_COUNT: break;
     }
@@ -211,7 +218,7 @@ static void act_destroy(nmz_layer *l) {
 
 const nmz_layer_ops nmz__activation_ops = {
     "activation", act_setup, act_init, act_forward, act_backward, act_param_count, act_param,
-    act_save, act_load, act_describe, act_destroy, NULL, 0};
+    act_save, act_load, act_describe, act_destroy, NULL, 0, NULL};
 
 nmz_layer *nmz_layer_activation(nmz_act act, float alpha) {
     act_layer *a;

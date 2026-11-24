@@ -70,11 +70,16 @@ typedef struct nmz_layer_ops {
      * snapshots/restores it, so the layer only has to read/write it. */
     nmz_tensor *(*state)(nmz_layer *l);
     unsigned flags; /* NMZ_LAYER_* */
+    /* Called when the net is built (and after loading), with the whole
+     * stack: lets a layer use another layer's parameter (weight tying). */
+    nmz_status (*bind)(nmz_layer *l, nmz_layer *const *layers, int n_layers, int self_index);
 } nmz_layer_ops;
 
 /* The layer's input is discrete (token ids): there is no input gradient,
  * and gradcheck does not perturb the input. */
 #define NMZ_LAYER_DISCRETE_INPUT 1u
+/* AdamW does not decay this layer's parameters (position tables). */
+#define NMZ_LAYER_NO_DECAY 2u
 
 struct nmz_layer {
     const nmz_layer_ops *ops;

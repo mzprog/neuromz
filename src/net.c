@@ -237,6 +237,10 @@ nmz_status nmz__net_finish_build(nmz_net *net) {
         return nmz__fail(NMZ_ERR_ARG,
                          "cross_entropy requires a softmax output layer (it is computed fused "
                          "with softmax); use --loss mse or make the last activation softmax");
+    for (i = 0; i < net->n_layers; i++) { /* layers that use another layer's parameter (tied weights) */
+        nmz_layer *l = net->layers[i];
+        if (l->ops->bind && (s = l->ops->bind(l, net->layers, net->n_layers, i)) != NMZ_OK) return s;
+    }
     free_buffers(net);
     net->acts = calloc((size_t)net->n_layers + 1, sizeof *net->acts);
     net->dacts = calloc((size_t)net->n_layers + 1, sizeof *net->dacts);
@@ -377,6 +381,22 @@ const nmz_tensor *nmz_net_input_grad(const nmz_net *net) {
 const nmz_tensor *nmz_net_activation(const nmz_net *net, int i) {
     if (!net || !net->have_forward || i < -1 || i >= net->n_layers) return NULL;
     return &net->acts[i + 1];
+}
+
+const nmz_tensor *nmz_net_activation_grad(const nmz_net *net, int i) {
+    if (!net || !net->have_grads || i < -1 || i >= net->n_layers) return NULL;
+    return &net->dacts[i + 1];
+}
+
+int nmz_layer_param_decays(const nmz_layer *l, int i, int decay_all) {
+    const nmz_tensor *v;
+    if (!l || i < 0 || i >= nmz_layer_param_count(l)) return 0;
+    if (decay_all) return 1;
+    /* embeddings and position tables are looked up, not multiplied: decaying
+     * them pulls rarely seen characters/positions towards 0 (decision 94) */
+    if (l->ops->flags & (NMZ_LAYER_DISCRETE_INPUT | NMZ_LAYER_NO_DECAY)) return 0;
+    v = layer_param(l, i).value;
+    return v && v->rank >= 2; /* weight matrices; biases and LayerNorm gains are vectors */
 }
 
 /* -------------------------------------------------------------- compute */
@@ -629,8 +649,10 @@ static nmz_status sgd_param(nmz_net *net, int k, float lr, float mu, int apply, 
     return NMZ_OK;
 }
 
+/* AdamW (decay > 0): the decoupled weight decay λ·w is added to the Adam
+ * step, using the weight before the step: Δ = −η·(m̂/(√v̂ + ε) + λ·w). */
 static nmz_status adam_param(nmz_net *net, int k, const nmz_train_opts *o, float lr, long t, int apply,
-                             int fresh) {
+                             int fresh, double decay) {
     nmz_layer *l = net->layers[net->param_refs[k].layer];
     int pi = net->param_refs[k].index, j;
     nmz_tensor *w = nmz_layer_param_value(l, pi), *g = nmz_layer_param_grad(l, pi);
@@ -647,7 +669,7 @@ static nmz_status adam_param(nmz_net *net, int k, const nmz_train_opts *o, float
             double mi = b1 * m->data[e] + (1.0 - b1) * gi, vi = b2 * v->data[e] + (1.0 - b2) * gi * gi;
             m->data[e] = (float)mi;
             v->data[e] = (float)vi;
-            w->data[e] += (float)(-lr * (mi / bc1) / (sqrt(vi / bc2) + eps));
+            w->data[e] += (float)(-lr * ((mi / bc1) / (sqrt(vi / bc2) + eps) + decay * w->data[e]));
         }
         return NMZ_OK;
     }
@@ -662,15 +684,17 @@ static nmz_status adam_param(nmz_net *net, int k, const nmz_train_opts *o, float
         net->scratch[1].data[e] = (float)vi;
         net->scratch[2].data[e] = (float)mhat;
         net->scratch[3].data[e] = (float)vhat;
-        net->scratch[4].data[e] = (float)(-lr * mhat / (sqrt(vhat) + eps));
+        net->scratch[4].data[e] = (float)(-lr * (mhat / (sqrt(vhat) + eps) + decay * w->data[e]));
     }
     {
         nmz_ctx ctx = make_ctx(net, net->param_refs[k].layer, 1);
-        nmz_trace_scalar sc[5] = {{"lr", lr}, {"beta1", b1}, {"beta2", b2}, {"epsilon", eps}, {"t", (double)t}};
+        nmz_trace_scalar sc[6] = {{"lr", lr}, {"beta1", b1}, {"beta2", b2}, {"epsilon", eps}, {"t", (double)t},
+                                  {"weight_decay", decay}};
         nmz_trace_item it[7] = {{"value", w},         {"grad", g},           {"m", &net->scratch[0]},
                                 {"v", &net->scratch[1]}, {"m_hat", &net->scratch[2]}, {"v_hat", &net->scratch[3]},
                                 {"delta", &net->scratch[4]}};
-        nmz_trace_emit(&ctx, NMZ_TRACE_UPDATE, nmz_layer_type(l), nmz_layer_param_name(l, pi), 5, sc, 7, it);
+        nmz_trace_emit(&ctx, NMZ_TRACE_UPDATE, nmz_layer_type(l), nmz_layer_param_name(l, pi),
+                       o->optimizer == NMZ_OPT_ADAMW ? 6 : 5, sc, 7, it);
     }
     if (apply)
         for (e = 0; e < w->size; e++) {
@@ -691,9 +715,11 @@ static nmz_status optimize(nmz_net *net, const nmz_train_opts *o, float lr, int 
     if ((int)o->optimizer < 0 || o->optimizer >= NMZ_OPT_COUNT) return nmz__fail(NMZ_ERR_ARG, "invalid optimizer");
     if (o->optimizer == NMZ_OPT_SGD && !(o->momentum >= 0.0f && o->momentum < 1.0f))
         return nmz__fail(NMZ_ERR_ARG, "momentum must be in [0, 1)");
-    if (o->optimizer == NMZ_OPT_ADAM && !(o->beta1 >= 0.0f && o->beta1 < 1.0f && o->beta2 >= 0.0f &&
-                                          o->beta2 < 1.0f && o->epsilon > 0.0f))
+    if (o->optimizer != NMZ_OPT_SGD && !(o->beta1 >= 0.0f && o->beta1 < 1.0f && o->beta2 >= 0.0f &&
+                                         o->beta2 < 1.0f && o->epsilon > 0.0f))
         return nmz__fail(NMZ_ERR_ARG, "Adam needs 0 <= beta1, beta2 < 1 and epsilon > 0");
+    if (o->optimizer == NMZ_OPT_ADAMW && !(o->weight_decay >= 0.0f && o->weight_decay < 10.0f))
+        return nmz__fail(NMZ_ERR_ARG, "weight decay must be in [0, 10)");
     if (!apply && !net->trace) return NMZ_OK;
     fresh = net->opt_kind != (int)o->optimizer;
     if (fresh && apply) {
@@ -708,12 +734,19 @@ static nmz_status optimize(nmz_net *net, const nmz_train_opts *o, float lr, int 
     }
     t = (fresh ? 0 : net->opt_t) + 1;
     for (k = 0; k < net->n_params; k++) {
-        s = o->optimizer == NMZ_OPT_ADAM ? adam_param(net, k, o, lr, t, apply, fresh)
-                                         : sgd_param(net, k, lr, o->momentum, apply, fresh);
+        if (o->optimizer == NMZ_OPT_SGD) {
+            s = sgd_param(net, k, lr, o->momentum, apply, fresh);
+        } else {
+            double decay = 0.0;
+            if (o->optimizer == NMZ_OPT_ADAMW &&
+                nmz_layer_param_decays(net->layers[net->param_refs[k].layer], net->param_refs[k].index, o->decay_all))
+                decay = o->weight_decay;
+            s = adam_param(net, k, o, lr, t, apply, fresh, decay);
+        }
         if (s != NMZ_OK) return s;
     }
     if (apply) {
-        if (o->optimizer == NMZ_OPT_ADAM) net->opt_t = t;
+        if (o->optimizer != NMZ_OPT_SGD) net->opt_t = t;
         net->have_forward = 0; /* cached activations no longer match the weights */
     }
     return NMZ_OK;

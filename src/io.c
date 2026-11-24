@@ -167,7 +167,9 @@ static nmz_status read_str(nmz_reader *r, char **out) {
 static const nmz_layer_ops *const k_registry[] = {&nmz__dense_ops,     &nmz__activation_ops, &nmz__conv2d_ops,
                                                   &nmz__maxpool2d_ops, &nmz__flatten_ops,    &nmz__dropout_ops,
                                                   &nmz__embedding_ops, &nmz__rnn_ops,       &nmz__lstm_ops,
-                                                  &nmz__gru_ops};
+                                                  &nmz__gru_ops,       &nmz__posenc_ops,    &nmz__layernorm_ops,
+                                                  &nmz__attention_ops, &nmz__ffn_ops,       &nmz__block_ops,
+                                                  &nmz__tied_output_ops};
 
 const nmz_layer_ops *nmz_layer_ops_find(const char *type) {
     size_t i;
@@ -201,7 +203,7 @@ static void sec_optimizer(nmz_net *net, nmz_writer *w) {
     for (k = 0; k < net->n_params; k++) {
         nmz_write_u32(w, (uint32_t)net->opt_m[k].size);
         for (e = 0; e < net->opt_m[k].size; e++) nmz_write_f32(w, net->opt_m[k].data[e]);
-        if (net->opt_kind == NMZ_OPT_ADAM)
+        if (net->opt_kind == NMZ_OPT_ADAM || net->opt_kind == NMZ_OPT_ADAMW)
             for (e = 0; e < net->opt_v[k].size; e++) nmz_write_f32(w, net->opt_v[k].data[e]);
     }
 }
@@ -229,6 +231,17 @@ static void sec_train_ext(nmz_net *net, nmz_writer *w) {
     nmz_write_u32(w, (uint32_t)(net->train.carry_state != 0));
     nmz_write_u32(w, (uint32_t)net->train.seq_len);
     nmz_write_u32(w, (uint32_t)net->train.patience);
+}
+
+/* phase 5: AdamW and warm-up settings (only when used, so older models stay
+ * byte-identical) */
+static int has_train_ext2(const nmz_net *net) {
+    return net->train.weight_decay != 0.0f || net->train.decay_all || net->train.warmup_steps != 0;
+}
+static void sec_train_ext2(nmz_net *net, nmz_writer *w) {
+    nmz_write_f32(w, net->train.weight_decay);
+    nmz_write_u32(w, (uint32_t)(net->train.decay_all != 0));
+    nmz_write_u32(w, (uint32_t)net->train.warmup_steps);
 }
 
 static void write_section(nmz_net *net, nmz_writer *w, const char *tag, void (*fn)(nmz_net *, nmz_writer *)) {
@@ -295,12 +308,14 @@ static nmz_status save_body(nmz_net *net, nmz_writer *w, unsigned flags) {
         int with_opt = net->opt_kind >= 0 && !(flags & NMZ_SAVE_NO_OPTIMIZER);
         int with_vocab = net->vocab != NULL;
         int with_tnorm = with_vocab && net->vocab->normalize != 0;
-        nmz_write_u32(w, (uint32_t)(with_norm + with_opt + with_vocab + with_tnorm + 1));
+        int with_ext2 = has_train_ext2(net);
+        nmz_write_u32(w, (uint32_t)(with_norm + with_opt + with_vocab + with_tnorm + 1 + with_ext2));
         if (with_norm) write_section(net, w, "normalize", sec_normalize);
         if (with_opt) write_section(net, w, "optimizer", sec_optimizer);
         if (with_vocab) write_section(net, w, "vocab", sec_vocab);
         if (with_tnorm) write_section(net, w, "text_norm", sec_text_norm);
         write_section(net, w, "train_ext", sec_train_ext);
+        if (with_ext2) write_section(net, w, "train_ext2", sec_train_ext2);
     }
     return nmz_write_u32(w, w->crc); /* footer: CRC of everything above */
 }
@@ -372,7 +387,7 @@ static nmz_status read_optimizer(nmz_reader *r, nmz_net *net) {
         if (nmz_read_u32(r, &count) != NMZ_OK) return r->err;
         if (count != net->opt_m[k].size) return r->err = nmz__fail(NMZ_ERR_FORMAT, "optimizer state does not match the layers");
         for (e = 0; e < count; e++) nmz_read_f32(r, &net->opt_m[k].data[e]);
-        if (kind == NMZ_OPT_ADAM)
+        if (kind == NMZ_OPT_ADAM || kind == NMZ_OPT_ADAMW)
             for (e = 0; e < count; e++) nmz_read_f32(r, &net->opt_v[k].data[e]);
     }
     if (r->err == NMZ_OK) {
@@ -450,6 +465,19 @@ static nmz_status read_sections(nmz_reader *r, nmz_net *net) {
             read_vocab(r, net);
         else if (!strcmp(tag, "train_ext"))
             read_train_ext(r, net);
+        else if (!strcmp(tag, "train_ext2")) {
+            float wd = 0;
+            uint32_t all = 0, warm = 0;
+            nmz_read_f32(r, &wd);
+            nmz_read_u32(r, &all);
+            if (nmz_read_u32(r, &warm) == NMZ_OK) {
+                if (!(wd >= 0.0f && wd < 10.0f) || all > 1 || warm > 100000000u)
+                    r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt train_ext2 section");
+                net->train.weight_decay = wd;
+                net->train.decay_all = (int)all;
+                net->train.warmup_steps = (int)warm;
+            }
+        }
         else if (!strcmp(tag, "text_norm")) {
             uint32_t f = 0;
             if (nmz_read_u32(r, &f) == NMZ_OK) {

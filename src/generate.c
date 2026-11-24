@@ -14,7 +14,19 @@
  * so row r is exactly what nmz_net_generate with seed + r produces — the
  * output does not depend on the batch size. A row that has finished (end
  * of item, or length reached) leaves the batch: its row of every layer's
- * carried state is removed, so no work is spent on padding. */
+ * carried state is removed, so no work is spent on padding.
+ *
+ * Transformers (nets with attention): the "carried state" is the KV cache
+ * of every attention layer plus the position counter of the position
+ * encoding, so the same loop feeds one new character per step and each
+ * step costs one row of work per layer instead of the whole context. The
+ * model can only see `context` positions (its posenc max_len). When the
+ * text grows past that, the window slides: the newest context/2 characters
+ * are kept, the cache is dropped and they are re-encoded from position 0
+ * (one full pass), then single steps continue — positions are absolute, so
+ * a cached key cannot simply be shifted to a new position. With no_cache
+ * the whole window is recomputed at every step instead; the window rule is
+ * the same, so the text is bit-identical (tested, decision 98). */
 #include "internal.h"
 
 #include <math.h>
@@ -29,6 +41,8 @@ nmz_gen_opts nmz_gen_defaults(void) {
     o.top_k = 0;
     o.seed = 1;
     o.stop_at_end = 0;
+    o.context = 0;
+    o.no_cache = 0;
     return o;
 }
 
@@ -133,6 +147,8 @@ nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int co
     uint32_t *pcp = NULL;
     size_t np = 0, bad = 0, i;
     int *ids = NULL, *act = NULL, *keep = NULL, V, id, end_id, r, n_act, k;
+    int attn = 0, L = 0, K = 0, wlen = 0, full = 0;
+    int *win = NULL; /* Transformers: the last ≤ L ids of every row (row r at win + r·(L+1)) */
     double *probs = NULL;
     gen_row *rows = NULL;
     nmz_status s;
@@ -148,6 +164,15 @@ nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int co
     if (!(o.temperature > 0.0f) || !isfinite(o.temperature)) return nmz__fail(NMZ_ERR_ARG, "temperature must be > 0");
     if (o.top_k < 0) return nmz__fail(NMZ_ERR_ARG, "top-k must be >= 0");
     if ((s = nmz_net_build(net)) != NMZ_OK) return s;
+    for (i = 0; i < (size_t)net->n_layers; i++) attn |= nmz_layer_has_attention(net->layers[i]);
+    if (o.context < 0) return nmz__fail(NMZ_ERR_ARG, "context must be >= 0");
+    if (attn) {
+        int model = nmz_net_context_length(net);
+        if (o.context > 0 && model > 0 && o.context > model)
+            return nmz__fail(NMZ_ERR_ARG, "context %d is longer than the model's context window (%d positions)", o.context,
+                             model);
+        L = o.context > 0 ? o.context : model;
+    }
     end_id = nmz_vocab_index(v, '\n');
     /* prime → ids (normalised like the training text, e.g. tashkeel stripped) */
     if (o.prime && *o.prime) {
@@ -185,6 +210,22 @@ nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int co
         }
     }
     for (r = 1; r < count; r++) memcpy(ids + (size_t)r * np, ids, np * sizeof *ids); /* every row: same prime */
+    if (attn) {
+        if (L == 0) L = (int)(np + (size_t)o.length < 100000000u ? np + (size_t)o.length : 100000000u); /* no limit */
+        K = L / 2 > 0 ? L / 2 : 1;
+        if ((double)count * (L + 1) > 2e8) {
+            s = nmz__fail(NMZ_ERR_ARG, "count x context is too large");
+            goto done;
+        }
+        win = malloc((size_t)count * (size_t)(L + 1) * sizeof *win);
+        if (!win) {
+            s = nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+            goto done;
+        }
+        /* the prime fills the window; a prime longer than L keeps its newest K characters */
+        wlen = np > (size_t)L ? K : (int)np;
+        for (r = 0; r < count; r++) memcpy(win + (size_t)r * (L + 1), ids + np - (size_t)wlen, (size_t)wlen * sizeof *win);
+    }
     for (r = 0; r < count; r++) { /* row r = what a single run with seed + r would give */
         nmz_rng_seed(&rows[r].rng, o.seed + (uint64_t)r, 0x67656eULL /* "gen" */);
         if ((s = row_append(&rows[r], 0)) != NMZ_OK) goto done; /* allocate, "" */
@@ -198,9 +239,13 @@ nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int co
     {
         int shape[2];
         shape[0] = count;
-        shape[1] = (int)np;
+        shape[1] = attn ? wlen : (int)np;
         if ((s = nmz_tensor_reshape(&x, 2, shape)) != NMZ_OK) goto done;
-        for (i = 0; i < np * (size_t)count; i++) x.data[i] = (float)ids[i];
+        if (attn)
+            for (r = 0; r < count; r++)
+                for (k = 0; k < wlen; k++) x.data[(size_t)r * wlen + k] = (float)win[(size_t)r * (L + 1) + k];
+        else
+            for (i = 0; i < np * (size_t)count; i++) x.data[i] = (float)ids[i];
         if ((s = nmz__net_forward(net, &x, 0, NULL)) != NMZ_OK) goto done;
     }
     /* act[k] = the output row of batch row k; finished rows leave the batch */
@@ -223,14 +268,36 @@ nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int co
             }
             keep[n_keep] = k;
             x.data[n_keep++] = (float)id; /* the next input of this row (n_keep <= k: safe in place) */
+            if (attn) win[(size_t)act[k] * (L + 1) + wlen] = id;
         }
         if (n_keep == 0) break;
+        if (attn) { /* every active row has the same window length */
+            wlen++;
+            full = o.no_cache;
+            if (wlen > L) { /* slide: keep the newest K characters, re-encode them from position 0 */
+                for (k = 0; k < n_keep; k++) {
+                    int *w = win + (size_t)act[keep[k]] * (L + 1);
+                    memmove(w, w + wlen - K, (size_t)K * sizeof *w);
+                }
+                wlen = K;
+                full = 1;
+            }
+        }
         if (n_keep < n_act) { /* drop finished rows: no wasted work on them */
             compact_states(net, n_act, keep, n_keep);
             for (k = 0; k < n_keep; k++) act[k] = act[keep[k]];
         }
         n_act = n_keep;
-        {
+        if (attn && full) { /* the whole window from position 0 (no cache, or after a slide) */
+            int shape[2];
+            nmz_net_reset_state(net);
+            shape[0] = n_act;
+            shape[1] = wlen;
+            if ((s = nmz_tensor_reshape(&x, 2, shape)) != NMZ_OK) goto done;
+            for (k = 0; k < n_act; k++)
+                for (r = 0; r < wlen; r++) x.data[(size_t)k * wlen + r] = (float)win[(size_t)act[k] * (L + 1) + r];
+            if ((s = nmz__net_forward(net, &x, 0, NULL)) != NMZ_OK) goto done;
+        } else {
             int shape[2];
             shape[0] = n_act;
             shape[1] = 1;
@@ -249,6 +316,7 @@ done:
     free(ids);
     free(act);
     free(keep);
+    free(win);
     free(probs);
     if (rows) {
         for (r = 0; r < count; r++) {

@@ -195,6 +195,7 @@ static const char *act_formula(const char *act) {
     if (!strcmp(act, "relu")) return "a = max(0, z)";
     if (!strcmp(act, "leaky_relu")) return g_ascii ? "a = z if z > 0 else alpha*z" : "a = z if z > 0 else α·z";
     if (!strcmp(act, "linear")) return "a = z";
+    if (!strcmp(act, "gelu")) return g_ascii ? "a = z*Phi(z) = z*(1+erf(z/sqrt2))/2" : "a = z·Φ(z) = z·(1+erf(z/√2))/2";
     return "a = f(z)";
 }
 

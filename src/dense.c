@@ -188,7 +188,7 @@ static void dense_destroy(nmz_layer *l) {
 
 const nmz_layer_ops nmz__dense_ops = {
     "dense", dense_setup, dense_init, dense_forward, dense_backward, dense_param_count,
-    dense_param, dense_save, dense_load, dense_describe, dense_destroy, NULL, 0};
+    dense_param, dense_save, dense_load, dense_describe, dense_destroy, NULL, 0, NULL};
 
 int nmz_layer_dense_init(const nmz_layer *l) {
     if (!l || l->ops != &nmz__dense_ops) return -1;

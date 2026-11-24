@@ -12,8 +12,8 @@
 #include <string.h>
 
 static const char *const k_norm_names[NMZ_NORM_COUNT] = {"none", "minmax", "zscore"};
-static const char *const k_opt_names[NMZ_OPT_COUNT] = {"sgd", "adam"};
-static const char *const k_sched_names[NMZ_SCHED_COUNT] = {"constant", "step", "cosine"};
+static const char *const k_opt_names[NMZ_OPT_COUNT] = {"sgd", "adam", "adamw"};
+static const char *const k_sched_names[NMZ_SCHED_COUNT] = {"constant", "step", "cosine", "warmup-cosine"};
 
 static nmz_status parse_name(const char *s, const char *const *names, int n, int *out, const char *what) {
     int i;
@@ -42,14 +42,14 @@ nmz_status nmz_norm_parse(const char *s, nmz_norm *out) {
 
 nmz_status nmz_optimizer_parse(const char *s, nmz_optimizer *out) {
     int v = 0;
-    nmz_status st = parse_name(s, k_opt_names, NMZ_OPT_COUNT, &v, "optimizer (expected sgd or adam)");
+    nmz_status st = parse_name(s, k_opt_names, NMZ_OPT_COUNT, &v, "optimizer (expected sgd, adam or adamw)");
     if (st == NMZ_OK) *out = (nmz_optimizer)v;
     return st;
 }
 
 nmz_status nmz_schedule_parse(const char *s, nmz_schedule *out) {
     int v = 0;
-    nmz_status st = parse_name(s, k_sched_names, NMZ_SCHED_COUNT, &v, "schedule (expected constant, step or cosine)");
+    nmz_status st = parse_name(s, k_sched_names, NMZ_SCHED_COUNT, &v, "schedule (expected constant, step, cosine or warmup-cosine)");
     if (st == NMZ_OK) *out = (nmz_schedule)v;
     return st;
 }
@@ -70,10 +70,32 @@ float nmz_schedule_lr(const nmz_train_opts *o, int epoch) {
         lr = o->min_lr + 0.5 * (lr - o->min_lr) * (1.0 + cos(pi * frac));
         break;
     }
+    case NMZ_SCHED_WARMUP_COSINE: /* per batch: see nmz_schedule_lr_step */
     case NMZ_SCHED_CONSTANT:
     case NMZ_SCHED_COUNT: break;
     }
     return (float)lr;
+}
+
+/* Warm-up + cosine, per batch (DESIGN decision 95): the first W updates ramp
+ * linearly up to η (Adam's second-moment estimates are still noisy, and a
+ * Transformer's early updates through LayerNorm and attention can be large),
+ * then a cosine from η towards η_min: batch W+1 uses η, batch S uses a rate
+ * one step above η_min (with η_min = 0 the last update is not wasted). */
+float nmz_schedule_lr_step(const nmz_train_opts *o, long step, long total, long per_epoch) {
+    const double pi = 3.14159265358979323846;
+    double lr, frac;
+    long W;
+    if (!o) return 0.0f;
+    if (o->schedule != NMZ_SCHED_WARMUP_COSINE)
+        return nmz_schedule_lr(o, per_epoch > 0 ? (int)((step - 1) / per_epoch) + 1 : 1);
+    lr = o->learning_rate;
+    W = o->warmup_steps > 0 ? o->warmup_steps : 0;
+    if (step < 1) step = 1;
+    if (W > 0 && step <= W) return (float)(lr * (double)step / (double)W);
+    frac = total > W ? (double)(step - W - 1) / (double)(total - W) : 1.0;
+    if (frac > 1.0) frac = 1.0;
+    return (float)(o->min_lr + 0.5 * (lr - o->min_lr) * (1.0 + cos(pi * frac)));
 }
 
 /* ------------------------------------------------------------ normalization */

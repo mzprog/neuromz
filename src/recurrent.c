@@ -161,7 +161,7 @@ static void embed_destroy(nmz_layer *l) {
 const nmz_layer_ops nmz__embedding_ops = {"embedding",  embed_setup,       embed_init,   embed_forward,
                                           embed_backward, embed_param_count, embed_param, embed_save,
                                           embed_load,   embed_describe,    embed_destroy, NULL,
-                                          NMZ_LAYER_DISCRETE_INPUT};
+                                          NMZ_LAYER_DISCRETE_INPUT, NULL};
 
 nmz_layer *nmz_layer_embedding(int vocab, int dim, nmz_init init) {
     embed_layer *e;
@@ -522,7 +522,7 @@ static void rnn_destroy(nmz_layer *l) {
 
 const nmz_layer_ops nmz__rnn_ops = {"rnn",        rnn_setup,       rnn_init,  rnn_forward, rnn_backward,
                                     rnn_param_count, rnn_param,    rnn_save,  rnn_load,    rnn_describe,
-                                    rnn_destroy,  rnn_state,       0};
+                                    rnn_destroy,  rnn_state,       0, NULL};
 
 nmz_layer *nmz_layer_rnn(int units, nmz_init init) {
     rnn_layer *r;

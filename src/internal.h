@@ -48,7 +48,20 @@ extern const nmz_layer_ops nmz__embedding_ops;
 extern const nmz_layer_ops nmz__rnn_ops;
 extern const nmz_layer_ops nmz__lstm_ops;
 extern const nmz_layer_ops nmz__gru_ops;
+extern const nmz_layer_ops nmz__posenc_ops;
+extern const nmz_layer_ops nmz__layernorm_ops;
+extern const nmz_layer_ops nmz__attention_ops;
+extern const nmz_layer_ops nmz__ffn_ops;
+extern const nmz_layer_ops nmz__block_ops;
+extern const nmz_layer_ops nmz__tied_output_ops;
 int nmz__recurrent_init_used(const nmz_layer *l);
+/* transformer helpers (attention.c, transformer.c) */
+void nmz__attention_dims(const nmz_layer *l, int *heads, int *head_dim, int *head_dim_req);
+nmz_status nmz__colsum_add(const float *A, int rows, int cols, float *out); /* out[j] += Σ_r A[r][j] (double) */
+void nmz__add_rows(float *Y, int rows, int cols, const float *bias);       /* Y[r] += bias           */
+nmz_layer *nmz__block_sub(const nmz_layer *l, int i); /* 0 ln1, 1 attention, 2 ln2, 3 ffn */
+int nmz__tied_embedding(const nmz_layer *l);          /* index of the shared embedding, or -1 */
+size_t nmz__kink_signature(const nmz_layer *l, float *out); /* relu sides inside ffn/block (gradcheck) */
 int nmz__gated_init_used(const nmz_layer *l); /* lstm or gru */
 int nmz__lstm_init_used(const nmz_layer *l);
 float nmz__lstm_forget_bias(const nmz_layer *l);

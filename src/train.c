@@ -32,8 +32,12 @@ nmz_status nmz__train_opts_validate(const nmz_train_opts *o) {
     if ((int)o->schedule < 0 || o->schedule >= NMZ_SCHED_COUNT) return nmz__fail(NMZ_ERR_ARG, "invalid schedule");
     if (o->schedule == NMZ_SCHED_STEP && (o->step_size < 1 || !(o->gamma > 0.0f && o->gamma <= 1.0f)))
         return nmz__fail(NMZ_ERR_ARG, "step schedule needs step size >= 1 and 0 < gamma <= 1");
-    if (o->schedule == NMZ_SCHED_COSINE && !(o->min_lr >= 0.0f && o->min_lr <= o->learning_rate))
+    if ((o->schedule == NMZ_SCHED_COSINE || o->schedule == NMZ_SCHED_WARMUP_COSINE) &&
+        !(o->min_lr >= 0.0f && o->min_lr <= o->learning_rate))
         return nmz__fail(NMZ_ERR_ARG, "cosine schedule needs 0 <= min lr <= lr");
+    if (o->warmup_steps < 0 || o->warmup_steps > 100000000) return nmz__fail(NMZ_ERR_ARG, "warm-up steps must be >= 0");
+    if (!(o->weight_decay >= 0.0f && o->weight_decay < 10.0f))
+        return nmz__fail(NMZ_ERR_ARG, "weight decay must be in [0, 10)");
     if (!(o->val_fraction >= 0.0f && o->val_fraction < 1.0f))
         return nmz__fail(NMZ_ERR_ARG, "validation fraction must be in [0, 1)");
     if (!(o->clip_norm >= 0.0f) || !isfinite(o->clip_norm)) return nmz__fail(NMZ_ERR_ARG, "clip norm must be >= 0");
@@ -244,6 +248,7 @@ nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_data
     for (epoch = 1; epoch <= o.max_epochs; epoch++) {
         int start, batch = 0, n_batches = (used + bs - 1) / bs, clipped = 0;
         float lr = nmz_schedule_lr(&o, epoch);
+        long total_steps = (long)n_batches * o.max_epochs;
         nmz_epoch_info info;
         if (o.carry_state) {
             int nb = used / bs, k, r;
@@ -266,6 +271,8 @@ nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_data
         for (start = 0; start < used; start += bs) {
             int b = used - start < bs ? used - start : bs;
             double gnorm = NAN, scale = 1.0;
+            if (o.schedule == NMZ_SCHED_WARMUP_COSINE) /* per batch */
+                lr = nmz_schedule_lr_step(&o, (long)(epoch - 1) * n_batches + start / bs + 1, total_steps, n_batches);
             if ((s = batch_shapes(net, ds, b, &xb, &tb)) != NMZ_OK) goto done;
             if ((s = gather(ds, perm, start, b, &xb, &tb)) != NMZ_OK) goto done;
             if ((s = nmz__net_forward(net, &xb, 1, NULL)) != NMZ_OK) goto done;
@@ -288,6 +295,7 @@ nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_data
                 bi.loss = bl;
                 bi.grad_norm = gnorm;
                 bi.clipped = scale < 1.0;
+                bi.learning_rate = lr;
                 if (o.on_batch(&bi, o.user)) {
                     res.stopped = 1;
                     s = NMZ_OK;

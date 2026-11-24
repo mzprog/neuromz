@@ -303,6 +303,7 @@ const char *cli_act_reason(nmz_act a) {
     case NMZ_ACT_RELU: return "max(0,z): cheap and does not saturate for z > 0 (units can die)";
     case NMZ_ACT_LEAKY_RELU: return "like relu with a small slope for z < 0, so units cannot die";
     case NMZ_ACT_SOFTMAX: return "probabilities over classes that sum to 1";
+    case NMZ_ACT_GELU: return "x*Phi(x): a smooth relu (lets small negative values through), used in Transformers";
     case NMZ_ACT_COUNT: break;
     }
     return "";

@@ -341,7 +341,7 @@ static void lstm_destroy(nmz_layer *l) {
 
 const nmz_layer_ops nmz__lstm_ops = {"lstm",          lstm_setup,  lstm_init,  lstm_forward,  lstm_backward,
                                      lstm_param_count, lstm_param, lstm_save,  lstm_load,     lstm_describe,
-                                     lstm_destroy,    lstm_state,  0};
+                                     lstm_destroy,    lstm_state,  0, NULL};
 
 nmz_layer *nmz_layer_lstm(int units, nmz_init init, float forget_bias) {
     lstm_layer *m;
