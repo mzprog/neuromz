@@ -178,6 +178,11 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
     char desc[160];
     nmz_norm norm;
     if (argc > 1 && !strcmp(argv[1], "gates")) return show_gates(st, argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "attention")) return show_attention(st, argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "params")) {
+        if (argc > 2) return fail("show params takes no options, got '%s'", argv[2]);
+        return need_net(st) ? show_params(st) : 1;
+    }
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "weights") || !strcmp(argv[i], "--weights"))
             weights = 1;
@@ -193,8 +198,8 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
             if (!(data = cli_opt_value(argc, argv, &i))) return 1;
         } else if (parse_header_opt(argv[i], &header)) {
         } else
-            return fail("show takes `weights`, `filters`, `vocab`, `gates [--text T | --data FILE]` or `sample N "
-                        "[--data SPEC]`, got '%s'", argv[i]);
+            return fail("show takes `weights`, `filters`, `vocab`, `params`, `gates [--text T | --data FILE]`, "
+                        "`attention [--text T | --data FILE]` or `sample N [--data SPEC]`, got '%s'", argv[i]);
     }
     if (sample) return show_sample(st, sample, data, header);
     if (!need_net(st)) return 1;
@@ -344,6 +349,10 @@ static int cmd_generate(cli_state *st, int argc, char **argv) {
             new_only = 1;
             continue;
         }
+        if (!strcmp(a, "--no-cache")) {
+            g.no_cache = 1;
+            continue;
+        }
         if (!(val = cli_opt_value(argc, argv, &i))) return 1;
         if (!strcmp(a, "--prime")) g.prime = val;
         else if (!strcmp(a, "--length")) {
@@ -362,6 +371,9 @@ static int cmd_generate(cli_state *st, int argc, char **argv) {
             if (!cli_parse_int(val, 1, 10000, &count)) return fail("--count needs a positive integer, got '%s'", val);
         } else if (!strcmp(a, "--data")) {
             data = val;
+        } else if (!strcmp(a, "--context")) {
+            if (!cli_parse_int(val, 1, 100000, &n)) return fail("--context needs a positive integer, got '%s'", val);
+            g.context = (int)n;
         } else {
             return fail("unknown option '%s' for generate (see `help generate`)", a);
         }
@@ -847,7 +859,7 @@ static int sample_tensors(cli_state *st, const sample_args *a, nmz_tensor *x, nm
 /* ------------------------------------------------------ trace on a sequence */
 
 typedef struct seq_args {
-    int *ids, *tgt, T, unit, full, layer;
+    int *ids, *tgt, T, unit, full, layer, pos, head, attn_n;
     long sample;
     const char *data, *json, *text;
     print_opts po;
@@ -863,10 +875,25 @@ static int parse_seq_args(cli_state *st, int argc, char **argv, seq_args *a) {
     a->o = *nmz_net_train_config(st->net);
     a->unit = -1;
     a->layer = -1;
+    a->pos = -1;
+    a->head = -1;
+    a->attn_n = 1;
     for (i = 1; i < argc; i++) {
         const char *s = argv[i], *val;
         if (!strcmp(s, "--full")) {
             a->full = 1;
+            continue;
+        }
+        if (!strcmp(s, "--pos") || !strcmp(s, "--head")) {
+            if (!(val = cli_opt_value(argc, argv, &i))) return 1;
+            if (!net_has_attention(st->net)) return fail("%s applies to Transformer models (attention)", s);
+            if (!cli_parse_int(val, 0, 1000000, &n)) {
+                fprintf(stderr, "error: %s needs an integer, got '%s'\n", s, val);
+                return 1;
+            }
+            if (!strcmp(s, "--pos")) a->pos = (int)n; /* 0-based, like the trace's position numbers */
+            else if (n < 1) return fail("--head is 1-based, got '%s'", val);
+            else a->head = (int)n - 1;
             continue;
         }
         if (!strcmp(s, "--text") || !strcmp(s, "--sample") || !strcmp(s, "--data") || !strcmp(s, "--json") ||
@@ -879,7 +906,11 @@ static int parse_seq_args(cli_state *st, int argc, char **argv, seq_args *a) {
                 if (!cli_parse_int(val, 1, 1000000000L, &a->sample)) return fail("--sample needs a positive integer, got '%s'", val);
             } else if (!strcmp(s, "--layer")) {
                 if (!cli_parse_int(val, 1, 1000, &n)) return fail("--layer needs a positive integer (1-based), got '%s'", val);
-                if ((a->layer = seq_recurrent_layer(st->net, (int)n)) < 0)
+                if (net_has_attention(st->net)) {
+                    if (seq_attention_layer(st->net, (int)n) < 0)
+                        return fail("--layer %s: the model has fewer attention layers (blocks)", val);
+                    a->attn_n = (int)n;
+                } else if ((a->layer = seq_recurrent_layer(st->net, (int)n)) < 0)
                     return fail("--layer %s: the model has fewer recurrent layers (rnn/lstm/gru)", val);
             } else {
                 if (!cli_parse_int(val, 1, 100000, &n)) return fail("--unit needs a positive integer (1-based), got '%s'", val);
@@ -948,6 +979,18 @@ static int parse_seq_args(cli_state *st, int argc, char **argv, seq_args *a) {
     } else {
         return fail("give a sequence: trace --text \"some text\" (or --sample N --data FILE)%s", NULL);
     }
+    if (a->pos >= a->T) {
+        fprintf(stderr, "error: --pos %d: the text has positions 0..%d\n", a->pos, a->T - 1);
+        return 1;
+    }
+    {
+        int ctx = nmz_net_context_length(st->net);
+        if (ctx > 0 && a->T > ctx) {
+            fprintf(stderr, "error: the text has %d positions but the model's context window is %d characters (use a "
+                            "shorter --text)\n", a->T, ctx);
+            return 1;
+        }
+    }
     a->po.full = a->full;
     a->po.max_rows = a->full ? 0 : 24;
     a->po.max_terms = a->full ? 0 : 6;
@@ -975,7 +1018,7 @@ static int run_trace_seq(cli_state *st, int argc, char **argv, int apply) {
     nmz_tensor x = NMZ_TENSOR_EMPTY, t = NMZ_TENSOR_EMPTY;
     const nmz_vocab *v = nmz_net_vocab(st->net);
     seq_survival sv;
-    double L = 0;
+    double L = 0, *grad_e = NULL;
     int rc = 1, V = nmz_net_output_size(st->net);
     memset(&sv, 0, sizeof sv);
     if (parse_seq_args(st, argc, argv, &a)) goto out;
@@ -989,6 +1032,22 @@ static int run_trace_seq(cli_state *st, int argc, char **argv, int apply) {
     nmz_net_set_trace(st->net, nmz_trace_recorder_fn, rec);
     if (nmz_net_forward_mode(st->net, &x, 0, NULL) != NMZ_OK || nmz_net_backward(st->net, &t, NULL) != NMZ_OK) goto lib;
     if (seq_survival_collect(rec, a.layer, a.T, &sv)) seq_survival_free(&sv); /* (no recurrent layer: no view) */
+    if (net_has_attention(st->net)) { /* |dL/dx_t| at the embedding output */
+        size_t i;
+        free(grad_e);
+        grad_e = calloc((size_t)a.T, sizeof *grad_e);
+        for (i = 0; grad_e && i < nmz_trace_recorder_count(rec); i++) {
+            const nmz_trace_event *ev = nmz_trace_recorder_get(rec, i);
+            const nmz_tensor *de = nmz_trace_find(ev, "dL/de");
+            int k, d;
+            if (ev->phase != NMZ_TRACE_BACKWARD || strcmp(ev->layer_type, "embedding") || !de || de->rank != 3) continue;
+            for (k = 0; k < a.T; k++) {
+                double sq = 0;
+                for (d = 0; d < de->shape[2]; d++) sq += (double)de->data[(size_t)k * de->shape[2] + d] * de->data[(size_t)k * de->shape[2] + d];
+                grad_e[k] = sqrt(sq);
+            }
+        }
+    }
     nmz_trace_recorder_clear(rec);
     /* 2. the real pass: every step's loss */
     if (seq_tensors(&a, V, 0, &x, &t)) goto lib;
@@ -1002,9 +1061,16 @@ static int run_trace_seq(cli_state *st, int argc, char **argv, int apply) {
         fail("out of memory while recording the trace%s", NULL);
         goto out;
     }
-    printf("%s of one sequence (%d steps): every value of the forward and backward pass, unrolled through time\n",
-           apply ? "STEP" : "TRACE", a.T);
-    print_seq_trace(rec, v, &a.po, apply, a.unit, a.layer, &sv);
+    if (net_has_attention(st->net)) {
+        printf("%s of one sequence (%d positions) through a Transformer: attention step by step\n",
+               apply ? "STEP" : "TRACE", a.T);
+        print_attn_trace(rec, v, &a.po, a.pos, a.attn_n, a.head, grad_e, st->net);
+        print_update_section(rec, &a.po, apply);
+    } else {
+        printf("%s of one sequence (%d steps): every value of the forward and backward pass, unrolled through time\n",
+               apply ? "STEP" : "TRACE", a.T);
+        print_seq_trace(rec, v, &a.po, apply, a.unit, a.layer, &sv);
+    }
     printf("\n");
     print_rule();
     if (apply) {
@@ -1025,6 +1091,7 @@ out:
     nmz_tensor_free(&x);
     nmz_tensor_free(&t);
     seq_survival_free(&sv);
+    free(grad_e);
     free(a.ids);
     free(a.tgt);
     return rc;
@@ -1241,18 +1308,31 @@ static const cmd k_cmds[] = {
      "    embed:D  rnn:H  lstm:H[:forget_bias=F]  gru:H  (inits: auto = orthogonal, xavier, he)  vocab\n"
      "    e.g. new text embed:32 lstm:64 dropout:0.2 lstm:64 vocab --data FILE   (stacked)\n"
      "    --items/--no-items, --strip-diacritics (Arabic tashkeel + tatweel), --unify-alef (أ إ آ -> ا)\n"
+     "  Transformers (decoder-only, GPT-style), text input:\n"
+     "    pos:learned:CTX | pos:sin:CTX     position encoding; CTX = the context window\n"
+     "    block[:heads=H][:head_dim=K][:ff=F][:gelu|relu][:dropout=R]   pre-LN block (H=4, K=D/H, F=4D)\n"
+     "    attn[:heads=H][:head_dim=K]  ffn[:F][:gelu|relu]  ln          the parts on their own\n"
+     "    vocab:tied                        output = the embedding matrix, transposed (weight tying)\n"
+     "    e.g. new text embed:64 pos:learned:128 block:heads=4 block:heads=4 ln vocab:tied --data FILE\n"
+     "    defaults: AdamW (weight decay 0.1 on weight matrices), warm-up + cosine per batch, clip 1\n"
      "  Quick mode: new 2 4 1   (defaults chosen and explained).\n"
      "  Presets: mnist-cnn mnist-mlp names char-rnn names-lstm char-lstm arabic-text\n"
+     "           names-gpt char-gpt arabic-gpt\n"
      "  options: --loss mse|ce --normalize none|minmax|zscore --seed N\n"
-     "           --optimizer sgd|adam --lr X --momentum X --beta1 X --beta2 X --eps X\n"
-     "           --schedule constant|step|cosine --step-size N --gamma X --min-lr X\n"
+     "           --optimizer sgd|adam|adamw --lr X --momentum X --beta1 X --beta2 X --eps X\n"
+     "           --weight-decay X --decay-all --warmup N (batches)\n"
+     "           --schedule constant|step|cosine|warmup-cosine --step-size N --gamma X --min-lr X\n"
      "           --batch N --epochs N --target-loss X --no-shuffle"},
-    {"show", cmd_show, "show [weights | filters | vocab | gates (--text T | --data FILE) | sample N [--data SPEC]]",
+    {"show", cmd_show, "show [weights | filters | vocab | params | gates (--text T | --data FILE) | attention (--text T | --data FILE) | sample N [--data SPEC]]",
      "Describe the network; `weights` prints every parameter, `filters` draws the conv kernels as\n"
      "  ASCII heatmaps, `sample N` draws sample N (default from mnist:test) with the prediction,\n"
      "  `vocab` lists a text model's characters. `gates` runs a text (--text, or --data FILE with\n"
      "  --from K --chars N, default 20000 characters) through an LSTM/GRU model and summarises its\n"
-     "  gates: means, how often they are near 0 or 1, the forget/update gate per unit, memory half-lives."},
+     "  gates: means, how often they are near 0 or 1, the forget/update gate per unit, memory half-lives.\n"
+     "  `attention` (Transformers): a heatmap of query x key positions for --layer N --head H (1-based,\n"
+     "  default 1 1; --full: all positions), and for every head what it mostly attends to (previous\n"
+     "  character, itself, start of the word, ...) - measured over the text (default 4000 characters of\n"
+     "  --data), in windows of the context length. `params`: parameters per layer and per component."},
     {"train", cmd_train, "train DATA [options]",
      "Train. DATA is a CSV file (first INPUTS columns are inputs, the rest targets; a text label column\n"
      "  is one-hot encoded), `mnist` (the training set, after `make data`) or an IDX images file.\n"
@@ -1260,7 +1340,8 @@ static const cmd k_cmds[] = {
      "  --limit N (first N samples) --epochs N --batch N --lr X --optimizer sgd|adam --schedule ...\n"
      "  --every N --quiet --header/--no-header. A live progress line is shown on terminals.\n"
      "  Validation: --val F (the last fraction F of DATA) or --val-file FILE (a separate set; then all\n"
-     "  of DATA trains). Text models: --seq-len N --carry/--no-carry --clip X --patience N."},
+     "  of DATA trains). Text models: --seq-len N --carry/--no-carry --clip X --patience N.\n"
+     "  AdamW: --weight-decay X --decay-all; per-batch schedule: --schedule warmup-cosine --warmup N."},
     {"test", cmd_test, "test DATA [--limit N]",
      "Loss and accuracy on a dataset (`mnist` = the 10 000 test images), with a confusion matrix."},
     {"predict", cmd_predict, "predict X1 ... Xn  |  predict --sample N [--data SPEC]",
@@ -1276,21 +1357,31 @@ static const cmd k_cmds[] = {
      "  h_t with bars; gru z, r, h~ and h_t. Then heatmaps over time (all hidden units, or the gates of\n"
      "  one cell and the forget/update gate of every cell), backpropagation through time and how the\n"
      "  gradient of the last character vanishes (along h, and along the LSTM cell state c).\n"
-     "  Stacked models: --layer N shows the N-th recurrent layer."},
+     "  Stacked models: --layer N shows the N-th recurrent layer.\n"
+     "  Transformers: one query position (--pos P, 0-based; default the last) in one layer and head\n"
+     "  (--layer N, --head H; default layer 1 and its most decisive head): q, every k, the raw scores,\n"
+     "  the causal mask, the softmax weights as bars with the characters, why the winner wins, the\n"
+     "  weighted sum of the values; then all heads at that position, a heatmap, what each head\n"
+     "  attends to, the residual stream, the prediction and the direct gradient path."},
     {"step", cmd_step_fwd, "step (same arguments as trace) [--lr X] [--optimizer ...]",
      "Like trace, but in training mode and the weight update is applied: one step you can follow."},
     {"generate", cmd_generate,
-     "generate [--prime TEXT] [--length N] [--temperature X] [--top-k K] [--seed N] [--count N] [--data FILE] [--new-only]",
+     "generate [--prime TEXT] [--length N] [--temperature X] [--top-k K] [--seed N] [--count N] [--data FILE] [--new-only] [--context N] [--no-cache]",
      "Sample text from a character model. Line-per-item models (names) print --count distinct items\n"
      "  (default 10), each ended by the end-of-item token; with --data FILE items that occur in that\n"
      "  file are marked, --new-only skips them. Running-text models print --length characters (300).\n"
      "  --temperature < 1 is safer/more repetitive, > 1 wilder; --top-k K samples among the K most\n"
-     "  likely characters only; the same --seed gives the same text."},
+     "  likely characters only; the same --seed gives the same text.\n"
+     "  Transformers use a KV cache (one new position per step); past the context window the newest half\n"
+     "  is kept and re-encoded. --context N uses a smaller window; --no-cache recomputes the whole window\n"
+     "  at every step (same text, slower: the reference the cache is tested against)."},
     {"compare", cmd_compare, "compare MODEL.nmz [MODEL.nmz ...] (--text TEXT | --data FILE [--from K] [--chars N]) [--layer N] [--full]",
      "Gradient survival side by side: for each trained text model (e.g. an rnn, an lstm and a gru\n"
      "  trained on the same data), how much of the LAST character's loss gradient reaches the step k\n"
      "  characters back - along h, along an LSTM's cell state c, and the product of the forget (LSTM)\n"
-     "  or update (GRU) gates. With --data the text is --chars characters (default 65) from offset --from."},
+     "  or update (GRU) gates. With --data the text is --chars characters (default 65) from offset --from.\n"
+     "  Transformers are compared at the input of their first block: attention reaches every earlier\n"
+     "  position directly (the text must fit the context window)."},
     {"gradcheck", cmd_gradcheck, "gradcheck (X1 ... Xn --target T... | --sample N [--data SPEC] | --text TEXT)",
      "Compare every backprop gradient with a numerical derivative (L(w+e)-L(w-e))/2e."},
     {"save", cmd_save, "save [FILE] [--no-optimizer]",

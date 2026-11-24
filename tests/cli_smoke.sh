@@ -170,6 +170,46 @@ check 1 "gru needs a number" "$B" new text embed:4 gru vocab --data examples/nam
 check 1 "text models only" "$B" new 2 4 1 --strip-diacritics
 check 1 "cannot open\|cannot read" "$B" -m "$T/nl.nmz" train examples/names_en.txt --val-file "$T/missing.txt"
 
+# --- Transformers (phase 5): specs, trace, show attention/params, KV-cache generation, compare
+NL='
+'
+check 0 "Transformer: context 16" "$B" new text embed:8 pos:learned:16 block:heads=2 block:heads=2:relu:dropout=0.1 ln vocab:tied --data examples/names_en.txt -o "$T/g.nmz"
+check 0 "weight decay 0.05" "$B" -m "$T/g.nmz" train examples/names_en.txt --epochs 1 --weight-decay 0.05 --warmup 3 -o "$T/g.nmz"
+check 0 "ATTENTION AT ONE POSITION" "$B" -m "$T/g.nmz" trace --text "${NL}Anna${NL}Bo"
+check 0 "head 2 of 2" "$B" -m "$T/g.nmz" trace --text "Anna" --layer 2 --head 2 --pos 1 --full
+check 0 "THE RESIDUAL STREAM" "$B" -m "$T/g.nmz" trace --text "Anna" --ascii
+check 0 "AdamW" "$B" -m "$T/g.nmz" step --text "Anna" -o "$T/g2.nmz"
+check 1 "context window is 16" "$B" -m "$T/g.nmz" trace --text "abcdefghijklmnopqrstuvwxyz"
+check 1 "positions 0..2" "$B" -m "$T/g.nmz" trace --text "Anna" --pos 9
+check 1 "fewer attention layers" "$B" -m "$T/g.nmz" trace --text "Anna" --layer 3
+check 1 "head is 1-based" "$B" -m "$T/g.nmz" trace --text "Anna" --head 0
+check 1 "Transformer models" "$B" -m "$T/nl.nmz" trace --text "Anna" --pos 1
+check 0 "WHAT EACH HEAD ATTENDS TO" "$B" -m "$T/g.nmz" show attention --data examples/names_en.txt --chars 300
+check 0 "layer 2, head 2" "$B" -m "$T/g.nmz" show attention --text "AnnaMariaBob" --layer 2 --head 2 --full
+check 1 "has 2 heads" "$B" -m "$T/g.nmz" show attention --text "Anna" --head 3
+check 1 "needs a Transformer" "$B" -m "$T/nl.nmz" show attention --text "Anna"
+check 0 "feed-forward" "$B" -m "$T/g.nmz" show params
+check 0 "reuses the embedding" "$B" -m "$T/g.nmz" show params
+check 0 "   3. " "$B" -m "$T/g.nmz" generate --count 3 --seed 2
+check 0 "   3. " "$B" -m "$T/g.nmz" generate --count 3 --seed 2 --no-cache --context 8
+check 1 "longer than the model" "$B" -m "$T/g.nmz" generate --context 99
+check 0 "gpt x" "$B" compare "$T/nl.nmz" "$T/g.nmz" --data examples/names_en.txt --from 100 --chars 16
+check 1 "sees at most 16" "$B" compare "$T/g.nmz" --data examples/names_en.txt --chars 40
+check 0 "Transformer: context 8" "$B" new text embed:8 pos:sin:8 attn:heads=2 ffn:16:relu ln vocab --data examples/names_ar.txt -o "$T/ga.nmz"
+check 0 "validation" "$B" -m "$T/ga.nmz" train examples/names_ar.txt --epochs 1 -o "$T/ga.nmz"
+check 0 "ATTENTION HEATMAP" "$B" -m "$T/ga.nmz" trace --text "سارة"
+check 0 "WHAT EACH HEAD" "$B" -m "$T/ga.nmz" show attention --data examples/names_ar.txt --chars 100 --ascii
+check 0 "\[preset\]" "$B" new --preset names-gpt --epochs 1 -o "$T/ngp.nmz"
+check 1 "carry does not apply" "$B" new text embed:8 pos:learned:8 block vocab:tied --data examples/names_en.txt --carry
+check 1 "need the .text. input" "$B" new 4 block 2
+check 1 "heads needs a positive" "$B" new text embed:8 block:heads=x vocab --data examples/names_en.txt
+check 1 "do not split into 4 heads" "$B" new text embed:10 block:heads=4 vocab --data examples/names_en.txt
+check 1 "pos needs a kind" "$B" new text embed:8 pos:foo:8 vocab --data examples/names_en.txt
+check 1 "longer than the context" "$B" new text embed:8 pos:learned:8 block vocab:tied --data examples/names_en.txt --seq-len 20
+check 1 "weight-decay needs" "$B" -m "$T/g.nmz" train examples/names_en.txt --weight-decay -1
+check 1 "warmup needs" "$B" -m "$T/g.nmz" train examples/names_en.txt --warmup x
+check 1 "see .help new." "$B" new text embed:8 block:foo=1 vocab --data examples/names_en.txt
+
 if [ -f data/alice.txt ]; then
     check 0 "\[preset\]" "$B" new --preset char-rnn --epochs 1 -o "$T/c.nmz"
     check 0 "validation" "$B" -m "$T/c.nmz" train data/alice.txt --limit 60 -o "$T/c.nmz"
@@ -178,6 +218,10 @@ if [ -f data/alice.txt ]; then
     check 0 "\[preset\]" "$B" new --preset char-lstm --epochs 1 -o "$T/cl.nmz"
     check 0 "validation" "$B" -m "$T/cl.nmz" train data/alice.txt --limit 40 -o "$T/cl.nmz"
     check 0 "GRADIENT SURVIVAL" "$B" compare "$T/c.nmz" "$T/cl.nmz" --data data/alice.txt --from 1000
+    check 0 "\[preset\]" "$B" new --preset char-gpt --epochs 1 -o "$T/cg.nmz"
+    check 0 "validation" "$B" -m "$T/cg.nmz" train data/alice.txt --limit 40 -o "$T/cg.nmz"
+    check 0 "gpt x" "$B" compare "$T/cl.nmz" "$T/cg.nmz" --data data/alice.txt --from 1000
+    check 0 "" "$B" -m "$T/cg.nmz" generate --length 300 --prime "Alice" --seed 4
 else
     echo "skip char-rnn checks (run make data-text)"
 fi
@@ -185,6 +229,10 @@ if [ -f data/kalila.txt ]; then
     check 0 "\[preset\]" "$B" new --preset arabic-text --epochs 1 --strip-diacritics -o "$T/k.nmz"
     check 0 "validation" "$B" -m "$T/k.nmz" train data/kalila.txt --limit 20 -o "$T/k.nmz"
     check 0 "" "$B" -m "$T/k.nmz" generate --length 30 --prime "قال"
+    check 0 "\[preset\]" "$B" new --preset arabic-gpt --epochs 1 -o "$T/kg.nmz"
+    check 0 "validation" "$B" -m "$T/kg.nmz" train data/kalila.txt --limit 20 -o "$T/kg.nmz"
+    check 0 "WHAT EACH HEAD" "$B" -m "$T/kg.nmz" show attention --data data/kalila.txt --chars 500
+    check 0 "ATTENTION AT ONE POSITION" "$B" -m "$T/kg.nmz" trace --text "قال دمنة"
 else
     echo "skip Arabic text checks (run make data-text)"
 fi

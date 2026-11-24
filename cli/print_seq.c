@@ -503,6 +503,21 @@ int seq_survival_collect(const nmz_trace_recorder *rec, int layer, int T, seq_su
     size_t k;
     int t;
     memset(sv, 0, sizeof *sv);
+    if (!fw && T >= 1) { /* a Transformer: |dL/dx_t| at the embedding output (attention's direct paths) */
+        const nmz_trace_event *at = find(rec, NMZ_TRACE_FORWARD, "attention", -1, -1, 0);
+        const nmz_tensor *de;
+        emb = find(rec, NMZ_TRACE_BACKWARD, "embedding", -1, -1, 0);
+        de = emb ? nmz_trace_find(emb, "dL/de") : NULL;
+        if (!at || !de || de->rank != 3 || de->shape[1] != T) return 1;
+        sv->T = T;
+        sv->layer = at->layer;
+        snprintf(sv->kind, sizeof sv->kind, "gpt");
+        sv->h = calloc((size_t)T, sizeof *sv->h);
+        sv->x = calloc((size_t)T, sizeof *sv->x);
+        if (!sv->h || !sv->x) return 1;
+        for (t = 0; t < T; t++) sv->h[t] = sv->x[t] = norm_row(de->data + (size_t)t * de->shape[2], de->shape[2]);
+        return 0;
+    }
     if (!fw || T < 1) return 1;
     sv->T = T;
     sv->layer = fw->layer;
@@ -707,6 +722,10 @@ void print_seq_trace(const nmz_trace_recorder *rec, const nmz_vocab *v, const pr
     bptt_table(&s, rl->layer_type);
     if (sv && sv->T > 1) vanishing(&s, sv);
 
+    print_update_section(rec, o, applied);
+}
+
+void print_update_section(const nmz_trace_recorder *rec, const print_opts *o, int applied) {
     {
         const nmz_trace_event *clip = find(rec, NMZ_TRACE_UPDATE, "clip", -1, -1, 0);
         size_t i;
@@ -737,5 +756,5 @@ void print_seq_trace(const nmz_trace_recorder *rec, const nmz_vocab *v, const pr
             else
                 print_sgd_update(ev, o);
         }
-    }
+}
 }

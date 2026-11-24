@@ -92,15 +92,19 @@ void cli_replace_net(cli_state *st, nmz_net *net, const char *path) {
 }
 
 void cli_print_train_config(const nmz_train_opts *o) {
-    if (o->optimizer == NMZ_OPT_ADAM)
-        printf("adam lr %g (beta1 %g, beta2 %g, eps %g)", (double)o->learning_rate, (double)o->beta1,
-               (double)o->beta2, (double)o->epsilon);
+    if (o->optimizer == NMZ_OPT_ADAM || o->optimizer == NMZ_OPT_ADAMW)
+        printf("%s lr %g (beta1 %g, beta2 %g, eps %g)", nmz_optimizer_name(o->optimizer), (double)o->learning_rate,
+               (double)o->beta1, (double)o->beta2, (double)o->epsilon);
+    if (o->optimizer == NMZ_OPT_ADAMW)
+        printf(", weight decay %g (%s)", (double)o->weight_decay, o->decay_all ? "all parameters" : "weight matrices");
     else
         printf("sgd lr %g, momentum %g", (double)o->learning_rate, (double)o->momentum);
     if (o->schedule == NMZ_SCHED_STEP)
         printf(", step schedule (x%g every %d epochs)", (double)o->gamma, o->step_size);
     else if (o->schedule == NMZ_SCHED_COSINE)
         printf(", cosine schedule to %g", (double)o->min_lr);
+    else if (o->schedule == NMZ_SCHED_WARMUP_COSINE)
+        printf(", warm-up %d batches then cosine to %g (per batch)", o->warmup_steps, (double)o->min_lr);
     printf(", batch %d, max epochs %d, target loss %g, shuffle %s", o->batch_size, o->max_epochs, o->target_loss,
            o->shuffle ? "on" : "off");
     if (o->val_fraction > 0) printf(", validation %g%%", 100.0 * o->val_fraction);
@@ -122,6 +126,25 @@ int cli_train_option(int argc, char **argv, int *i, nmz_train_opts *o, unsigned 
     if (!strcmp(a, "--shuffle") || !strcmp(a, "--no-shuffle")) {
         o->shuffle = !strcmp(a, "--shuffle");
         *mask |= CLI_SET_SHUFFLE;
+        return 1;
+    }
+    if (!strcmp(a, "--decay-all")) {
+        o->decay_all = 1;
+        *mask |= CLI_SET_DECAY;
+        return 1;
+    }
+    if (!strcmp(a, "--weight-decay") || !strcmp(a, "--warmup")) {
+        if (!(v = cli_opt_value(argc, argv, i))) return -1;
+        if (!strcmp(a, "--weight-decay")) {
+            if (!cli_parse_double(v, &d) || d < 0 || d >= 10)
+                return -cli_fail("--weight-decay needs a number in [0, 10) (AdamW's lambda), got '%s'", v);
+            o->weight_decay = (float)d;
+            *mask |= CLI_SET_DECAY;
+        } else {
+            if (!cli_parse_int(v, 0, 100000000L, &n)) return -cli_fail("--warmup needs a number of batches >= 0, got '%s'", v);
+            o->warmup_steps = (int)n;
+            *mask |= CLI_SET_WARMUP;
+        }
         return 1;
     }
     if (!strcmp(a, "--carry") || !strcmp(a, "--no-carry")) {

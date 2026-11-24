@@ -396,13 +396,21 @@ void pr_adam_header(const nmz_trace_event *ev) {
     printf("  m%s = m/(1%s%s1^t)   v%s = v/(1%s%s2^t)   %s = %s%s%sm%s/(%sv%s + %s)\n", sym("̂", "_hat"), sym("−", "-"),
            sym("β", "beta"), sym("̂", "_hat"), sym("−", "-"), sym("β", "beta"), sym("Δ", "delta"), sym("−", "-"),
            sym("η", "lr"), DOT, sym("̂", "_hat"), sym("√", "sqrt "), sym("̂", "_hat"), sym("ε", "eps"));
+    if (nmz_trace_scalar_get(ev, "weight_decay", &t))
+        printf("  AdamW: %s = %s%s%s(m%s/(%sv%s + %s) + %s%sw)   (%s = this parameter's weight decay: 0 for biases,\n"
+               "  LayerNorm, embeddings and positions)\n",
+               sym("Δ", "delta"), sym("−", "-"), sym("η", "lr"), DOT, sym("̂", "_hat"), sym("√", "sqrt "),
+               sym("̂", "_hat"), sym("ε", "eps"), sym("λ", "lambda"), DOT, sym("λ", "lambda"));
 }
 
 void pr_adam_update(const nmz_trace_event *ev, const print_opts *o) {
     const nmz_tensor *w = item(ev, "value"), *g = item(ev, "grad"), *m = item(ev, "m"), *v = item(ev, "v"),
                      *mh = item(ev, "m_hat"), *vh = item(ev, "v_hat"), *dl = item(ev, "delta");
     size_t e, n = w->size;
-    printf("\n[layer %d] %s %s  (%zu value%s)\n", ev->layer, ev->layer_type, ev->detail, n, n == 1 ? "" : "s");
+    double wd = 0;
+    printf("\n[layer %d] %s %s  (%zu value%s)", ev->layer, ev->layer_type, ev->detail, n, n == 1 ? "" : "s");
+    if (nmz_trace_scalar_get(ev, "weight_decay", &wd)) printf("   %s = %g", sym("λ", "lambda"), wd);
+    printf("\n");
     printf("  %10s %10s %10s %10s %10s %10s %10s %10s %10s\n", "index", "w old", "grad", "m", "v", "m_hat", "v_hat",
            "delta", "w new");
     for (e = 0; e < n; e++) {

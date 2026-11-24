@@ -8,7 +8,11 @@
  *   compare     the centrepiece of phase 4: for 2+ trained models and the
  *               same text, how much of the LAST character's loss gradient
  *               survives k steps back — side by side, per step, along h
- *               and (for an LSTM) along the cell state c. */
+ *               and (for an LSTM) along the cell state c; for a Transformer
+ *               at the input of its first block (attention's direct path).
+ *   show attention   heatmap of one head and what every head attends to,
+ *               over any text (phase 5)
+ *   show params      parameters per layer and per component */
 #include "cli.h"
 
 #include <math.h>
@@ -16,6 +20,15 @@
 #include <string.h>
 
 #include "neuromz_layer.h"
+
+int net_has_attention(const nmz_net *net) { return seq_attention_layer(net, 1) >= 0; }
+
+int seq_attention_layer(const nmz_net *net, int n) {
+    int i;
+    for (i = 0; net && i < nmz_net_layer_count(net); i++)
+        if (nmz_layer_has_attention(nmz_net_layer((nmz_net *)net, i)) && --n == 0) return i;
+    return -1;
+}
 
 int seq_recurrent_layer(const nmz_net *net, int n) {
     int i;
@@ -338,9 +351,15 @@ static int survival_of(cmp_model *m, const int *ids, int T, int layer_n) {
     const nmz_vocab *v = nmz_net_vocab(m->net);
     nmz_trace_recorder *rec = NULL;
     nmz_tensor x = NMZ_TENSOR_EMPTY, t = NMZ_TENSOR_EMPTY;
-    int xs[2], ts[3], k, V = v->size, layer = seq_recurrent_layer(m->net, layer_n), rc = 1;
-    if (layer < 0) {
+    int xs[2], ts[3], k, V = v->size, layer = seq_recurrent_layer(m->net, layer_n), rc = 1,
+                                       ctx = nmz_net_context_length(m->net);
+    if (layer < 0 && !net_has_attention(m->net)) {
         fprintf(stderr, "error: %s has no recurrent layer number %d\n", m->path, layer_n);
+        return 1;
+    }
+    if (ctx > 0 && T > ctx) {
+        fprintf(stderr, "error: the text has %d steps but %s sees at most %d positions (a shorter --text, or --chars %d with --data)\n", T, m->path,
+                ctx, ctx + 1);
         return 1;
     }
     xs[0] = ts[0] = 1;
@@ -500,7 +519,12 @@ int cmd_compare(cli_state *st, int argc, char **argv) {
         if (i) free(ids);
         if (k) goto out;
         li = ms[i].sv.layer;
-        {
+        if (!strcmp(ms[i].sv.kind, "gpt")) {
+            int nb = 0;
+            while (seq_attention_layer(ms[i].net, nb + 1) >= 0) nb++;
+            snprintf(ms[i].desc, sizeof ms[i].desc, "transformer, %d block%s, %zu parameters", nb, nb == 1 ? "" : "s",
+                     nmz_net_param_count(ms[i].net));
+        } else {
             nmz_layer *l = nmz_net_layer(ms[i].net, li);
             int stacked = seq_recurrent_layer(ms[i].net, 2) >= 0;
             snprintf(ms[i].desc, sizeof ms[i].desc, "%s %d%s, %zu parameters", nmz_layer_type(l),
@@ -512,7 +536,10 @@ int cmd_compare(cli_state *st, int argc, char **argv) {
         series *s = &se[ns++];
         s->m = &ms[i];
         s->v = ms[i].sv.h;
-        snprintf(s->label, sizeof s->label, "%c %s h", ms[i].letter, ms[i].sv.kind);
+        if (!strcmp(ms[i].sv.kind, "gpt"))
+            snprintf(s->label, sizeof s->label, "%c gpt x", ms[i].letter);
+        else
+            snprintf(s->label, sizeof s->label, "%c %s h", ms[i].letter, ms[i].sv.kind);
         if (ms[i].sv.c) {
             s = &se[ns++];
             s->m = &ms[i];
@@ -536,6 +563,12 @@ int cmd_compare(cli_state *st, int argc, char **argv) {
         printf("  %c  %-20s %-36s loss of the last prediction %.3f\n", ms[i].letter, base_name(ms[i].path), ms[i].desc,
                ms[i].loss);
     printf("\n|dL/dh| (and |dL/dc|) k steps back, relative to the last step: 1 = all of it, 0.01 = 1%%.\n");
+    for (i = 0; i < nm; i++)
+        if (!strcmp(ms[i].sv.kind, "gpt")) {
+            printf("gpt x: for a Transformer, |dL/dx_t| at the input of its first block (character + position\n"
+                   "vector): there is no chain of steps, attention reaches every earlier position directly.\n");
+            break;
+        }
     printf("%s f / %s z: the mean product of the forget / update gates over those k steps - what the\n"
            "cell-state (LSTM) or direct (GRU) path alone would pass back.\n\n",
            sym("Π", "prod"), sym("Π", "prod"));
@@ -617,6 +650,13 @@ int cmd_compare(cli_state *st, int argc, char **argv) {
            "  gradient by W_hh%s and tanh' at every step, so it shrinks geometrically; an LSTM's cell state only\n"
            "  multiplies it by f, and a GRU's direct path by z: units whose gate stays near 1 carry it far back.)\n",
            sym("ᵀ", "^T"));
+    for (i = 0; i < nm; i++)
+        if (!strcmp(ms[i].sv.kind, "gpt")) {
+            printf("  (A Transformer has no per-step factor: the last position's query reaches position t in one\n"
+                   "  attention step, so what arrives at t is set by how strongly the layers attend there, not by\n"
+                   "  the distance. The \"x per step\" columns are only a summary of that profile.)\n");
+            break;
+        }
     rc = 0;
 out:
     for (i = 0; i < 6; i++) {
@@ -626,4 +666,176 @@ out:
     free(ids0);
     free(ts.owned);
     return rc;
+}
+
+/* ------------------------------------------------------- show attention */
+
+typedef struct attn_cb {
+    attn_pats *ap;
+    const int *ids; /* the current window */
+    const nmz_vocab *v;
+    int want_layer, want_head, grabbed, oom;
+    nmz_tensor w;   /* the first window's weights of the chosen layer */
+} attn_cb;
+
+static void attn_trace_cb(const nmz_trace_event *ev, void *user) {
+    attn_cb *c = user;
+    if (ev->phase != NMZ_TRACE_FORWARD || strcmp(ev->layer_type, "attention")) return;
+    if (attn_pats_add(c->ap, ev, c->ids, c->v)) c->oom = 1;
+    if (!c->grabbed && ev->layer == c->want_layer) {
+        const nmz_tensor *w = nmz_trace_find(ev, "weights");
+        if (w && nmz_tensor_copy(&c->w, w) != NMZ_OK) c->oom = 1;
+        c->grabbed = 1;
+    }
+}
+
+int show_attention(cli_state *st, int argc, char **argv) {
+    text_src ts;
+    attn_cb cb;
+    nmz_tensor x = NMZ_TENSOR_EMPTY;
+    const nmz_vocab *v;
+    int i, n = 0, *ids = NULL, rc = 1, ctx, W, s0, full = 0, H = 0, from;
+    long layer_n = 1, head_n = 1;
+    double t0 = cli_now();
+    memset(&ts, 0, sizeof ts);
+    memset(&cb, 0, sizeof cb);
+    if (!cli_need_net(st)) return 1;
+    v = nmz_net_vocab(st->net);
+    if (!v || !net_has_attention(st->net))
+        return cli_fail("show attention needs a Transformer text model (e.g. new --preset char-gpt)%s", NULL);
+    for (i = 2; i < argc; i++) {
+        int r = text_src_option(argc, argv, &i, &ts);
+        if (r < 0) return 1;
+        if (r) continue;
+        if (!strcmp(argv[i], "--full")) {
+            full = 1;
+        } else if (!strcmp(argv[i], "--layer") || !strcmp(argv[i], "--head")) {
+            const char *val = cli_opt_value(argc, argv, &i);
+            long *dst = !strcmp(argv[i - 1], "--layer") ? &layer_n : &head_n;
+            if (!val || !cli_parse_int(val, 1, 100000, dst))
+                return val ? cli_fail("--layer/--head need a positive integer (1-based), got '%s'", val) : 1;
+        } else {
+            return cli_fail("show attention takes --text T | --data FILE [--from K] [--chars N], --layer N, --head H, "
+                            "--full; got '%s'", argv[i]);
+        }
+    }
+    cb.want_layer = seq_attention_layer(st->net, (int)layer_n);
+    if (cb.want_layer < 0) return cli_fail("--layer: the model has fewer attention layers (blocks)%s", NULL);
+    if (text_src_load(&ts, 4000)) goto out;
+    if (!(ids = encode(v, ts.s, ts.len, &n, "the model"))) goto out;
+    if (n < 3) {
+        cli_fail("the text needs at least 3 characters%s", NULL);
+        goto out;
+    }
+    if (!(cb.ap = attn_pats_new())) goto oom;
+    cb.v = v;
+    ctx = nmz_net_context_length(st->net);
+    W = ctx > 0 ? ctx : 256;
+    nmz_net_set_carry(st->net, 0);
+    nmz_net_set_trace(st->net, attn_trace_cb, &cb);
+    for (s0 = 0; s0 < n; s0 += W) { /* windows of the context length, each from position 0 */
+        int len = n - s0 < W ? n - s0 : W, shape[2];
+        if (len < 3) break;
+        shape[0] = 1;
+        shape[1] = len;
+        if (nmz_tensor_reshape(&x, 2, shape) != NMZ_OK) goto oom;
+        for (i = 0; i < len; i++) x.data[i] = (float)ids[s0 + i];
+        cb.ids = ids + s0;
+        if (nmz_net_forward(st->net, &x, NULL) != NMZ_OK) {
+            nmz_net_set_trace(st->net, NULL, NULL);
+            cli_lib_fail("show attention");
+            goto out;
+        }
+        if (cb.oom) goto oom;
+    }
+    nmz_net_set_trace(st->net, NULL, NULL);
+    H = cb.w.rank == 4 ? cb.w.shape[1] : 0;
+    if (head_n > H) {
+        fprintf(stderr, "error: --head %ld: layer %ld has %d heads\n", head_n, layer_n, H);
+        goto out;
+    }
+    printf("Attention over %d characters%s%s (%d window%s of up to %d positions, evaluation mode, %.1fs)\n", n,
+           ts.data ? " of " : "", ts.data ? ts.data : "", (n + W - 1) / W, (n + W - 1) / W == 1 ? "" : "s", W,
+           cli_now() - t0);
+    printf("\nHEATMAP   layer %ld, head %ld, the first window\n", layer_n, head_n);
+    {
+        int T = cb.w.shape[2];
+        from = !full && T > 64 ? 0 : 0;
+        attn_heatmap(&cb.w, 0, (int)head_n - 1, ids, v, from, !full && T > 64 ? 64 : T);
+        if (!full && T > 64) printf("  (the first 64 of %d positions; --full shows all)\n", T);
+    }
+    printf("\nWHAT EACH HEAD ATTENDS TO   measured over the whole text\n");
+    attn_pats_print(cb.ap, st->net);
+    rc = 0;
+    goto out;
+oom:
+    nmz_net_set_trace(st->net, NULL, NULL);
+    cli_fail("out of memory%s", NULL);
+out:
+    attn_pats_free(cb.ap);
+    nmz_tensor_free(&cb.w);
+    nmz_tensor_free(&x);
+    free(ids);
+    free(ts.owned);
+    return rc;
+}
+
+/* ---------------------------------------------------------- show params */
+
+static const char *component(const nmz_layer *l, const char *pname) {
+    const char *t = nmz_layer_type(l);
+    if (!strcmp(t, "embedding")) return "embedding";
+    if (!strcmp(t, "posenc")) return "positions";
+    if (!strcmp(t, "layernorm") || !strncmp(pname, "ln", 2)) return "layernorm";
+    if (!strcmp(t, "attention") || !strncmp(pname, "attn.", 5)) return "attention";
+    if (!strcmp(t, "ffn") || !strncmp(pname, "ffn.", 4)) return "feed-forward";
+    if (!strcmp(t, "dense") || !strcmp(t, "tied_output")) return "output";
+    if (nmz_layer_is_recurrent(l)) return "recurrent";
+    if (!strcmp(t, "conv2d")) return "convolution";
+    return "other";
+}
+
+int show_params(cli_state *st) {
+    static const char *const comps[] = {"embedding", "positions", "attention", "feed-forward", "layernorm", "output",
+                                        "recurrent", "convolution", "other"};
+    size_t total = nmz_net_param_count(st->net), sums[9] = {0};
+    const nmz_train_opts *o = nmz_net_train_config(st->net);
+    int i, j, c, tied = -1;
+    printf("Parameters of %s: %zu in total\n\n", st->path ? st->path : "the network", total);
+    printf("  %-5s %-12s %-12s %-14s %10s %7s  %s\n", "layer", "type", "name", "shape", "count", "share",
+           "AdamW decay");
+    for (i = 0; i < nmz_net_layer_count(st->net); i++) {
+        nmz_layer *l = nmz_net_layer(st->net, i);
+        if (!strcmp(nmz_layer_type(l), "tied_output")) tied = i;
+        for (j = 0; j < nmz_layer_param_count(l); j++) {
+            const nmz_tensor *t = nmz_layer_param_value(l, j);
+            const char *name = nmz_layer_param_name(l, j), *comp = component(l, name);
+            char shape[48];
+            int d, w = 0;
+            for (d = 0; d < t->rank; d++) w += snprintf(shape + w, sizeof shape - (size_t)w, d ? "x%d" : "%d", t->shape[d]);
+            for (c = 0; c < 9; c++)
+                if (!strcmp(comps[c], comp)) sums[c] += t->size;
+            printf("  %-5d %-12s %-12s %-14s %10zu %6.1f%%  %s\n", i, nmz_layer_type(l), name, shape, t->size,
+                   100.0 * (double)t->size / (double)(total ? total : 1),
+                   nmz_layer_param_decays(l, j, o->decay_all) ? "yes" : "no");
+        }
+    }
+    printf("\n  by component:\n");
+    for (c = 0; c < 9; c++)
+        if (sums[c]) {
+            int bar = (int)(40.0 * (double)sums[c] / (double)(total ? total : 1) + 0.5), b;
+            printf("  %-13s %10zu %6.1f%%  ", comps[c], sums[c], 100.0 * (double)sums[c] / (double)(total ? total : 1));
+            for (b = 0; b < bar; b++) fputs(sym("█", "#"), stdout);
+            printf("\n");
+        }
+    if (tied >= 0)
+        printf("\n  The output (layer %d) reuses the embedding matrix: its %d x %d weights are counted once, under\n"
+               "  embedding; without tying the output would add another %zu.\n",
+               tied, nmz_layer_param_value(nmz_net_layer(st->net, 0), 0)->shape[0],
+               nmz_layer_param_value(nmz_net_layer(st->net, 0), 0)->shape[1],
+               nmz_layer_param_value(nmz_net_layer(st->net, 0), 0)->size);
+    if (nmz_net_context_length(st->net) > 0)
+        printf("  Context window: %d positions. \"AdamW decay\" = whether weight decay applies (%s).\n",
+               nmz_net_context_length(st->net), o->decay_all ? "--decay-all: every parameter" : "weight matrices only");
+    return 0;
 }

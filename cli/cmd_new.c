@@ -12,6 +12,13 @@
  *            `vocab[:ACT]` = a dense output with one unit per character
  *            (applied at every time step); recurrent layers can be stacked,
  *            with dropout:RATE between them
+ *   transformer (text input):
+ *            pos:learned:CTX | pos:sin:CTX      position encoding, context CTX
+ *            block[:heads=H][:head_dim=K][:ff=F][:gelu|relu][:dropout=R]
+ *                                               pre-LN Transformer block
+ *            attn[:heads=H][:head_dim=K]  ffn[:F][:gelu|relu]  ln
+ *                                               the block's parts on their own
+ *            vocab:tied                         output = embedding matrix, transposed
  * A flatten is inserted automatically before a dense layer that follows
  * conv/pool layers. The last layer must be dense (the output). */
 #include "cli.h"
@@ -24,8 +31,12 @@
 
 #define DEFAULT_SEED 42u
 
-typedef enum { LS_DENSE, LS_CONV, LS_POOL, LS_FLATTEN, LS_DROPOUT, LS_EMBED, LS_RNN, LS_LSTM, LS_GRU } ls_kind;
+typedef enum {
+    LS_DENSE, LS_CONV, LS_POOL, LS_FLATTEN, LS_DROPOUT, LS_EMBED, LS_RNN, LS_LSTM, LS_GRU,
+    LS_POS, LS_BLOCK, LS_ATTN, LS_FFN, LS_LN
+} ls_kind;
 #define IS_RECURRENT(k) ((k) == LS_RNN || (k) == LS_LSTM || (k) == LS_GRU)
+#define IS_TF(k) ((k) >= LS_POS && (k) <= LS_LN)
 #define VOCAB_UNITS (-1) /* dense size = vocabulary size */
 
 typedef struct lspec {
@@ -38,6 +49,8 @@ typedef struct lspec {
     int act_set;
     nmz_init init;
     int init_set;
+    int heads, head_dim, ff, tied; /* transformer: block/attn/ffn sizes; vocab:tied */
+    nmz_posenc posk;
     const char *why; /* preset explanation */
 } lspec;
 
@@ -160,6 +173,56 @@ static const preset k_presets[] = {
      "constant: early stopping decides when to stop", 0.0, "0 = no loss target; the validation loss decides",
      "data/kalila.txt", 0, 64, 1, 3, 0.1f, 5.0f,
      "64 characters (~12 words) of backpropagation through time; h and c are carried across batches"},
+    {"names-gpt", "small Transformer that invents names: the `names-lstm` comparison with attention instead of a state",
+     "text", "characters (Unicode code points) of a list of names; one per line, newline = end of a name",
+     {{"embed:32", "each character gets a learned 32-number vector (also the output matrix: vocab:tied)"},
+      {"pos:learned:32", "context 32 characters: a learned vector per position, so attention knows where things are"},
+      {"block:heads=4:ff=96", "4 heads of 8 look back over the name so far; feed-forward 96 (~24k weights in all = names-lstm)"},
+      {"block:heads=4:ff=96", "a second block can combine what the first found (e.g. 'the letter after the last vowel')"},
+      {"ln", "a final LayerNorm, as in GPT-2 (pre-LN blocks leave the last output unnormalised)"},
+      {"vocab:tied", "next-character scores = h * E^T: the embedding matrix read backwards"},
+      {NULL, NULL}},
+     NMZ_NORM_NONE, "token ids are not scaled", NMZ_OPT_ADAMW, 0.003f,
+     "AdamW: Adam's per-weight steps plus decoupled weight decay (0.1) on the weight matrices",
+     "0.003 peak (measured on the English names, see README), reached after the warm-up", 32,
+     "32 windows of 32 characters per update", 40, "at most 40 passes; early stopping usually ends sooner",
+     NMZ_SCHED_WARMUP_COSINE, "warm-up (5% of the updates), then a cosine down to a tenth of the rate, per batch", 0.0,
+     "0 = no loss target; the validation loss decides (patience)", "examples/names_en.txt", 1, 32, 0, 3, 0.1f, 1.0f,
+     "32 characters = the context window: every position of a window is one prediction"},
+    {"char-gpt", "small Transformer for running text: the `char-lstm` comparison (same number of weights)", "text",
+     "characters (Unicode code points) of a long text",
+     {{"embed:32", "each character gets a learned 32-number vector (also the output matrix: vocab:tied)"},
+      {"pos:learned:128", "context 128 characters (~25 words): attention can look back that far in one step"},
+      {"block:heads=4", "4 heads of 8: each can follow a different relation (previous letter, word start, ...)"},
+      {"block:heads=4", "a second block: 32k weights in all, the same as char-lstm (lstm:64)"},
+      {"ln", "a final LayerNorm, as in GPT-2"},
+      {"vocab:tied", "next-character scores = h * E^T: the embedding matrix read backwards"},
+      {NULL, NULL}},
+     NMZ_NORM_NONE, "token ids are not scaled", NMZ_OPT_ADAMW, 0.003f,
+     "AdamW: Adam's per-weight steps plus decoupled weight decay (0.1) on the weight matrices",
+     "0.003 peak (measured on Alice, see README), reached after the warm-up", 16,
+     "16 windows of 128 characters per update", 30, "at most 30 passes over the book; early stopping may end sooner",
+     NMZ_SCHED_WARMUP_COSINE, "warm-up (5% of the updates), then a cosine down to a tenth of the rate, per batch", 0.0,
+     "0 = no loss target; the validation loss decides", "data/alice.txt", 0, 128, 0, 3, 0.1f, 1.0f,
+     "128 characters = the context window: every position of a window is one prediction"},
+    {"arabic-gpt", "Transformer for Arabic prose (Kalila wa-Dimna, `make data-text`): 3 blocks of 64", "text",
+     "characters (Unicode code points) of an Arabic text: letters, hamza forms, the few vowel marks, punctuation",
+     {{"embed:64", "each character gets a learned 64-number vector (also the output matrix: vocab:tied)"},
+      {"pos:learned:128", "context 128 characters (~25 Arabic words)"},
+      {"block:heads=4:dropout=0.1", "4 heads of 16; 10% dropout on the residual branches against overfitting"},
+      {"block:heads=4:dropout=0.1", "second block"},
+      {"block:heads=4:dropout=0.1", "third block: ~160k weights in all, like arabic-text (two lstm:96)"},
+      {"ln", "a final LayerNorm, as in GPT-2"},
+      {"vocab:tied", "next-character scores = h * E^T: the embedding matrix read backwards"},
+      {NULL, NULL}},
+     NMZ_NORM_NONE, "token ids are not scaled", NMZ_OPT_ADAMW, 0.002f,
+     "AdamW: Adam's per-weight steps plus decoupled weight decay (0.1) on the weight matrices",
+     "0.002 peak: a little below the small models' rate for a deeper, wider net", 16,
+     "16 windows of 128 characters per update", 20,
+     "at most 20 passes over the book; early stopping may end sooner", NMZ_SCHED_WARMUP_COSINE,
+     "warm-up (5% of the updates), then a cosine down to a tenth of the rate, per batch", 0.0,
+     "0 = no loss target; the validation loss decides", "data/kalila.txt", 0, 128, 0, 3, 0.1f, 1.0f,
+     "128 characters = the context window: every position of a window is one prediction"},
 };
 
 static const preset *find_preset(const char *name) {
@@ -225,6 +288,41 @@ static int parse_modifier(const char *tok, lspec *sp, const char *whole) {
         if (!strcmp(eq, "same")) sp->pad = NMZ_PAD_SAME;
         else if (cli_parse_int(eq, 0, 1000, &n)) sp->pad = (int)n;
         else return cli_fail("pad must be a number >= 0 or 'same' in '%s'", whole), 0;
+        return 1;
+    }
+    if (IS_TF(sp->kind)) {
+        nmz_act a;
+        if (eq && (sp->kind == LS_BLOCK || sp->kind == LS_ATTN) && !strcmp(buf, "heads")) {
+            if (!cli_parse_int(eq, 1, 1024, &n)) return cli_fail("heads needs a positive integer in '%s'", whole), 0;
+            sp->heads = (int)n;
+            return 1;
+        }
+        if (eq && (sp->kind == LS_BLOCK || sp->kind == LS_ATTN) && (!strcmp(buf, "head_dim") || !strcmp(buf, "hd"))) {
+            if (!cli_parse_int(eq, 1, 100000, &n)) return cli_fail("head_dim needs a positive integer in '%s'", whole), 0;
+            sp->head_dim = (int)n;
+            return 1;
+        }
+        if (eq && sp->kind == LS_BLOCK && !strcmp(buf, "ff")) {
+            if (!cli_parse_int(eq, 1, 1000000, &n)) return cli_fail("ff needs a positive integer in '%s'", whole), 0;
+            sp->ff = (int)n;
+            return 1;
+        }
+        if (eq && sp->kind == LS_BLOCK && !strcmp(buf, "dropout")) {
+            if (!cli_parse_double(eq, &d) || d < 0 || d >= 1) return cli_fail("dropout needs a rate in [0, 1) in '%s'", whole), 0;
+            sp->rate = (float)d;
+            return 1;
+        }
+        if (!eq && (sp->kind == LS_BLOCK || sp->kind == LS_FFN) && nmz_act_parse(buf, &a) == NMZ_OK &&
+            (a == NMZ_ACT_GELU || a == NMZ_ACT_RELU)) {
+            sp->act = a;
+            sp->act_set = 1;
+            return 1;
+        }
+        return cli_fail("'%s': see `help new` (block:heads=H:head_dim=K:ff=F:gelu|relu:dropout=R, attn:heads=H, "
+                        "ffn:F:gelu|relu, pos:learned|sin:CTX, ln)", whole), 0;
+    }
+    if (sp->kind == LS_DENSE && sp->n == VOCAB_UNITS && !eq && !strcmp(buf, "tied")) {
+        sp->tied = 1;
         return 1;
     }
     if (sp->kind == LS_EMBED || IS_RECURRENT(sp->kind)) {
@@ -318,6 +416,38 @@ static int parse_text_layer(char **tok, int nt, const char *s, lspec *sp, int *f
         *first = 1;
         return 1;
     }
+    if (!strcmp(tok[0], "pos")) {
+        if (nt < 3 || !cli_parse_int(tok[2], 1, 100000, &n) ||
+            (strcmp(tok[1], "learned") && strcmp(tok[1], "sin") && strcmp(tok[1], "sinusoidal")))
+            return cli_fail("pos needs a kind and a context length: pos:learned:128 or pos:sin:128, got '%s'", s), 0;
+        sp->kind = LS_POS;
+        sp->posk = strcmp(tok[1], "learned") ? NMZ_POS_SINUSOIDAL : NMZ_POS_LEARNED;
+        sp->n = (int)n;
+        *first = 3;
+        return 1;
+    }
+    if (!strcmp(tok[0], "block") || !strcmp(tok[0], "attn") || !strcmp(tok[0], "attention")) {
+        sp->kind = tok[0][0] == 'b' ? LS_BLOCK : LS_ATTN;
+        sp->heads = 4;
+        sp->act = NMZ_ACT_GELU;
+        *first = 1;
+        return 1;
+    }
+    if (!strcmp(tok[0], "ffn")) {
+        sp->kind = LS_FFN;
+        sp->act = NMZ_ACT_GELU;
+        *first = 1;
+        if (nt >= 2 && cli_parse_int(tok[1], 1, 1000000, &n)) {
+            sp->ff = (int)n;
+            *first = 2;
+        }
+        return 1;
+    }
+    if (!strcmp(tok[0], "ln") || !strcmp(tok[0], "layernorm")) {
+        sp->kind = LS_LN;
+        *first = 1;
+        return 1;
+    }
     return -1;
 }
 
@@ -380,7 +510,7 @@ static int parse_layer(const char *s, lspec *sp) {
         first = 2;
     } else {
         fprintf(stderr, "error: layer spec must be a positive integer size (e.g. 64:relu) or start with dense:, conv:, pool:, "
-                        "flatten, dropout:, embed:, rnn:, lstm:, gru: or vocab — got '%s'\n", s);
+                        "flatten, dropout:, embed:, rnn:, lstm:, gru:, pos:, block, attn, ffn, ln or vocab — got '%s'\n", s);
         goto out;
     }
 modifiers:
@@ -483,7 +613,8 @@ int cmd_new(cli_state *st, int argc, char **argv) {
     const char *input_text = NULL;
     char buf[160], what[200];
     const nmz_layer *prev;
-    int is_text = 0, items = -1, items_set = 0, has_rnn = 0, V = 0, items_used = 0;
+    int is_text = 0, items = -1, items_set = 0, has_rnn = 0, V = 0, items_used = 0, has_tf = 0, ctx_len = 0, n_blocks = 0;
+    int has_attn = 0, tied = 0;
     const char *data = NULL;
     nmz_vocab *vocab = NULL;
     size_t n_chars = 0, n_bad = 0, n_removed = 0;
@@ -508,7 +639,7 @@ int cmd_new(cli_state *st, int argc, char **argv) {
                 if (!(v = cli_opt_value(argc, argv, &i))) goto out;
                 if (!(pre = find_preset(v))) {
                     cli_fail("unknown preset '%s' (available: mnist-cnn, mnist-mlp, names, char-rnn, names-lstm, char-lstm, "
-                             "arabic-text)", v);
+                             "arabic-text, names-gpt, char-gpt, arabic-gpt)", v);
                     goto out;
                 }
             } else if (!strcmp(a, "--data")) {
@@ -596,6 +727,19 @@ int cmd_new(cli_state *st, int argc, char **argv) {
         goto out;
     }
     for (i = 0; i < n_specs; i++) {
+        if (IS_TF(specs[i].kind) || (specs[i].kind == LS_DENSE && specs[i].tied)) {
+            if (!is_text) {
+                cli_fail("Transformer layers (pos, block, attn, ffn, ln, vocab:tied) need the `text` input (e.g. new text "
+                         "embed:64 pos:learned:128 block block ln vocab:tied --data FILE)%s",
+                         NULL);
+                goto out;
+            }
+            has_tf = 1;
+            has_attn |= specs[i].kind == LS_BLOCK || specs[i].kind == LS_ATTN;
+            n_blocks += specs[i].kind == LS_BLOCK;
+            tied |= specs[i].tied;
+            if (specs[i].kind == LS_POS && (ctx_len == 0 || specs[i].n < ctx_len)) ctx_len = specs[i].n;
+        }
         if (specs[i].kind == LS_EMBED || IS_RECURRENT(specs[i].kind)) {
             if (!is_text) {
                 cli_fail("embed/rnn/lstm/gru layers need the `text` input (e.g. new text embed:32 lstm:64 vocab --data "
@@ -678,6 +822,26 @@ int cmd_new(cli_state *st, int argc, char **argv) {
         o.patience = 3;
         o.shuffle = !o.carry_state;
     }
+    if (is_text && has_tf) { /* Transformer defaults (DESIGN decisions 94-97) */
+        if (!pre) {
+            o.optimizer = NMZ_OPT_ADAMW;
+            o.learning_rate = 0.001f;
+            o.max_epochs = 20;
+            o.schedule = NMZ_SCHED_WARMUP_COSINE;
+            o.batch_size = 32;
+            if (ctx_len) o.seq_len = ctx_len;
+        }
+        o.carry_state = 0; /* attention sees its whole window; nothing to carry between batches */
+        o.shuffle = 1;
+        o.clip_norm = 1.0f;
+        o.weight_decay = 0.1f;
+        o.decay_all = 0;
+    }
+    if ((mask & CLI_SET_CARRY) && user.carry_state && has_attn) {
+        cli_fail("--carry does not apply to attention: a Transformer sees its whole context window in every sequence "
+                 "(the KV cache is only used when generating)%s", NULL);
+        goto out;
+    }
     if (mask & CLI_SET_VAL) o.val_fraction = user.val_fraction;
     if (mask & CLI_SET_CLIP) o.clip_norm = user.clip_norm;
     if (mask & CLI_SET_CARRY) {
@@ -707,6 +871,23 @@ int cmd_new(cli_state *st, int argc, char **argv) {
         o.gamma = user.gamma;
         o.min_lr = user.min_lr;
     }
+    if (mask & CLI_SET_DECAY) {
+        o.weight_decay = user.weight_decay;
+        o.decay_all = user.decay_all;
+    }
+    if (has_tf && o.schedule == NMZ_SCHED_WARMUP_COSINE && !(mask & CLI_SET_SCHEDULE)) o.min_lr = o.learning_rate / 10;
+    if (ctx_len && o.seq_len > ctx_len) {
+        fprintf(stderr, "error: sequence length %d is longer than the context window (pos:...:%d)\n", o.seq_len, ctx_len);
+        goto out;
+    }
+    if (mask & CLI_SET_WARMUP) {
+        o.warmup_steps = user.warmup_steps;
+    } else if (o.schedule == NMZ_SCHED_WARMUP_COSINE && is_text) {
+        /* about 5% of all updates (at least 10): batches per epoch from the text's size */
+        double seqs = (double)n_chars / (o.seq_len > 0 ? o.seq_len : 64) * (1.0 - o.val_fraction);
+        double total = ceil(seqs / o.batch_size) * o.max_epochs;
+        o.warmup_steps = (int)(total / 20 > 10 ? total / 20 : 10);
+    }
 
     /* build, explaining as we go */
     if (nmz_net_create(&net, rank, shape, seed) != NMZ_OK) {
@@ -735,7 +916,12 @@ int cmd_new(cli_state *st, int argc, char **argv) {
             explain(what, "", "[auto]", "dense layers need a flat vector: the maps are laid out in one row");
         }
         switch (sp->kind) {
-        case LS_DENSE: l = nmz_layer_dense(sp->n, sp->init); break;
+        case LS_DENSE: l = sp->tied ? nmz_layer_tied_output(sp->n) : nmz_layer_dense(sp->n, sp->init); break;
+        case LS_POS: l = nmz_layer_posenc(sp->posk, sp->n); break;
+        case LS_BLOCK: l = nmz_layer_block(sp->heads, sp->head_dim, sp->ff, sp->act, sp->rate); break;
+        case LS_ATTN: l = nmz_layer_attention(sp->heads, sp->head_dim); break;
+        case LS_FFN: l = nmz_layer_ffn(sp->ff, sp->act); break;
+        case LS_LN: l = nmz_layer_layernorm(); break;
         case LS_CONV: l = nmz_layer_conv2d(sp->n, sp->kh, sp->kw, sp->stride, sp->pad, sp->init); break;
         case LS_POOL: l = nmz_layer_maxpool2d(sp->n, sp->stride); break;
         case LS_FLATTEN: l = nmz_layer_flatten(); break;
@@ -748,7 +934,8 @@ int cmd_new(cli_state *st, int argc, char **argv) {
         if (nmz_net_add(net, l) != NMZ_OK) goto libfail;
         l = nmz_net_layer(net, nmz_net_layer_count(net) - 1);
         if (sp->kind != LS_FLATTEN && sp->kind != LS_DROPOUT && sp->kind != LS_POOL && sp->kind != LS_EMBED &&
-            !IS_RECURRENT(sp->kind) && sp->act != NMZ_ACT_LINEAR && nmz_net_add(net, nmz_layer_activation(sp->act, sp->alpha)) != NMZ_OK)
+            !IS_RECURRENT(sp->kind) && !IS_TF(sp->kind) && sp->act != NMZ_ACT_LINEAR &&
+            nmz_net_add(net, nmz_layer_activation(sp->act, sp->alpha)) != NMZ_OK)
             goto libfail;
         {
             char in[48], outs[48], val[64];
@@ -758,7 +945,9 @@ int cmd_new(cli_state *st, int argc, char **argv) {
             switch (sp->kind) {
             case LS_DENSE:
                 snprintf(what, sizeof what, "%s %s->%s", is_out ? "output" : "dense", in, outs);
-                snprintf(val, sizeof val, "%s", nmz_act_name(sp->act));
+                snprintf(val, sizeof val, "%s%s", sp->tied ? "tied " : "", nmz_act_name(sp->act));
+                if (!why && sp->tied)
+                    why = "z = h*E^T + b reuses the embedding matrix E: one table for characters in and out";
                 if (!why && is_out && is_text && sp->act == NMZ_ACT_SOFTMAX)
                     why = "applied at every time step: probabilities for the next character";
                 if (!why) why = sp->act_set ? cli_act_reason(sp->act)
@@ -807,8 +996,59 @@ int cmd_new(cli_state *st, int argc, char **argv) {
                 snprintf(val, sizeof val, "z r h~");
                 if (!why) why = "h_t = z*h_{t-1} + (1-z)*h~: an update gate mixes the old state and a candidate";
                 break;
+            case LS_POS:
+                snprintf(what, sizeof what, "pos %s->%s", in, outs);
+                snprintf(val, sizeof val, "%s %d", sp->posk == NMZ_POS_LEARNED ? "learned" : "sin", sp->n);
+                if (!why)
+                    why = sp->posk == NMZ_POS_LEARNED
+                              ? "a learned vector per position 0..CTX-1 is added: attention alone cannot tell order"
+                              : "fixed sin/cos waves of many frequencies are added: attention alone cannot tell order";
+                break;
+            case LS_BLOCK:
+            case LS_ATTN: {
+                int hd = 0, heads = 0;
+                nmz_layer *at = sp->kind == LS_BLOCK ? NULL : l;
+                if (!at) { /* the attention inside the block: read its resolved head size */
+                    char d[160];
+                    nmz_layer_describe(l, d, sizeof d);
+                    sscanf(d, "block %*d (%d heads x %d", &heads, &hd);
+                } else {
+                    char d[160];
+                    nmz_layer_describe(l, d, sizeof d);
+                    sscanf(d, "attention %*d->%*d (%d heads x %d", &heads, &hd);
+                }
+                snprintf(what, sizeof what, "%s %s->%s", sp->kind == LS_BLOCK ? "block" : "attention", in, outs);
+                snprintf(val, sizeof val, "%d heads x %d", heads, hd);
+                if (!why)
+                    why = sp->kind == LS_BLOCK ? "h = x + attn(LN(x)), y = h + ffn(LN(h)): pre-LayerNorm with residual "
+                                                 "connections"
+                                               : "softmax(q k^T / sqrt(d)) v over earlier positions only (causal mask)";
+                break;
+            }
+            case LS_FFN:
+                snprintf(what, sizeof what, "ffn %s->%s", in, outs);
+                snprintf(val, sizeof val, "%d %s", sp->ff ? sp->ff : 4 * l->in_shape[1], nmz_act_name(sp->act));
+                if (!why) why = "act(x W1 + b1) W2 + b2 at every position on its own";
+                break;
+            case LS_LN:
+                snprintf(what, sizeof what, "layernorm %s", in);
+                val[0] = '\0';
+                if (!why) why = "each position's vector -> mean 0, variance 1, then a learned gain and bias";
+                break;
             }
             explain(what, val, tag_of(sp->act_set, sp->why != NULL), why);
+            if (sp->kind == LS_BLOCK) {
+                char fwhy[200];
+                size_t pc = 0;
+                int p;
+                for (p = 0; p < nmz_layer_param_count(l); p++) pc += nmz_layer_param_value(l, p)->size;
+                snprintf(val, sizeof val, "%d %s", sp->ff ? sp->ff : 4 * l->in_shape[1], nmz_act_name(sp->act));
+                snprintf(fwhy, sizeof fwhy, "%s; %zu weights in this block%s",
+                         sp->act == NMZ_ACT_GELU ? "feed-forward x*Phi(x) (a smooth relu); hidden size 4D by default"
+                                                 : "feed-forward with relu; hidden size 4D by default",
+                         pc, sp->rate > 0 ? "; dropout on both residual branches" : "");
+                explain("  feed-forward", val, sp->ff || sp->act_set ? "[yours]" : "[default]", fwhy);
+            }
             if (sp->kind == LS_LSTM) {
                 double fb = sp->fb_set ? sp->forget_bias : NMZ_LSTM_FORGET_BIAS;
                 char fwhy[160];
@@ -837,6 +1077,10 @@ int cmd_new(cli_state *st, int argc, char **argv) {
             explain(what, nmz_init_name((nmz_init)init), "[auto]", cli_init_reason(init));
         }
     }
+    if (has_tf)
+        explain("  init (transformer)", "glorot", "[auto]",
+                "q/k/v/output and feed-forward matrices Glorot uniform (He before relu); LayerNorm g = 1, b = 0; "
+                "learned positions N(0, 0.02^2)");
     explain("loss", nmz_loss_name(loss), tag_of(loss_set, 0),
             loss_set ? (loss == NMZ_LOSS_MSE ? "L = 1/2 sum (y-t)^2, averaged over the batch"
                                              : "L = -sum t*log(p), fused with softmax: delta = p - t")
@@ -850,6 +1094,8 @@ int cmd_new(cli_state *st, int argc, char **argv) {
                                                        : "inputs are used as they are");
     explain("optimizer", nmz_optimizer_name(o.optimizer), tag_of(mask & CLI_SET_OPTIMIZER, pre != NULL),
             pre && !(mask & CLI_SET_OPTIMIZER) ? pre->why_opt
+            : o.optimizer == NMZ_OPT_ADAMW
+                ? "AdamW: Adam plus weight decay that is not mixed into the adaptive step (decoupled)"
             : o.optimizer == NMZ_OPT_ADAM
                 ? (has_conv ? "Adam: per-weight step sizes, robust for conv nets"
                    : is_text ? "Adam: per-weight step sizes; robust for embedding + recurrent weights"
@@ -858,10 +1104,17 @@ int cmd_new(cli_state *st, int argc, char **argv) {
     snprintf(buf, sizeof buf, "%g", (double)o.learning_rate);
     explain("learning rate", buf, tag_of(mask & CLI_SET_LR, pre != NULL),
             pre && !(mask & CLI_SET_LR) ? pre->why_lr
+            : has_tf ? "0.001: the usual peak rate for small Transformers (reached after the warm-up)"
             : o.optimizer == NMZ_OPT_ADAM
                 ? (is_text && o.learning_rate > 0.0015f ? "a bit above Adam's usual 0.001: fine for a small RNN with clipping"
                                                        : "0.001 is Adam's standard step size")
                 : qt.why_learning_rate);
+    if (o.optimizer == NMZ_OPT_ADAMW) {
+        snprintf(buf, sizeof buf, "%g", (double)o.weight_decay);
+        explain("weight decay", buf, tag_of(mask & CLI_SET_DECAY, 0),
+                o.decay_all ? "w <- w - lr*lambda*w for every parameter (--decay-all)"
+                            : "w <- w - lr*lambda*w for weight matrices only; not biases, LayerNorm, embeddings, positions");
+    }
     if (o.optimizer == NMZ_OPT_SGD) {
         snprintf(buf, sizeof buf, "%g", (double)o.momentum);
         explain("momentum", buf, tag_of(mask & CLI_SET_MOMENTUM, 0), qt.why_momentum);
@@ -874,8 +1127,15 @@ int cmd_new(cli_state *st, int argc, char **argv) {
     explain("schedule", buf, tag_of(mask & CLI_SET_SCHEDULE, pre != NULL),
             pre && !(mask & CLI_SET_SCHEDULE) ? pre->why_sched
             : o.schedule == NMZ_SCHED_COSINE ? "cosine decay of the learning rate over the epochs"
+            : o.schedule == NMZ_SCHED_WARMUP_COSINE
+                ? "per batch: rise linearly to the rate, then a cosine down to rate/10 (Transformers need the warm-up)"
             : o.schedule == NMZ_SCHED_STEP   ? "multiply the learning rate by gamma every step-size epochs"
                                              : "the same learning rate in every epoch");
+    if (o.schedule == NMZ_SCHED_WARMUP_COSINE) {
+        snprintf(buf, sizeof buf, "%d", o.warmup_steps);
+        explain("  warm-up batches", buf, tag_of(mask & CLI_SET_WARMUP, 0),
+                "about 5% of all updates: early Adam steps are noisy, and big early updates can stall attention");
+    }
     snprintf(buf, sizeof buf, "%d", o.batch_size);
     explain("batch size", buf, tag_of(mask & CLI_SET_BATCH, pre != NULL),
             pre && !(mask & CLI_SET_BATCH) ? pre->why_batch : qt.why_batch);
@@ -914,11 +1174,13 @@ int cmd_new(cli_state *st, int argc, char **argv) {
         snprintf(buf, sizeof buf, "%d", o.seq_len);
         explain("sequence length", buf, tag_of(mask & CLI_SET_SEQLEN, pre != NULL),
                 pre && !(mask & CLI_SET_SEQLEN) && pre->why_seq ? pre->why_seq
-                                                                 : "characters per training sequence = steps of backpropagation through time");
+                : has_attn ? "characters per training sequence = the context window: every position is a prediction"
+                           : "characters per training sequence = steps of backpropagation through time");
         explain("carry state", o.carry_state ? "on" : "off", tag_of(mask & CLI_SET_CARRY, pre != NULL),
-                o.carry_state ? "batch k+1 continues batch k: the state (h; and c in an LSTM) is carried over "
-                                "(truncated BPTT), no shuffling"
-                              : "every sequence starts from a zero state; sequences are shuffled");
+                has_attn ? "attention sees the whole window of each sequence; sequences are shuffled"
+                : o.carry_state ? "batch k+1 continues batch k: the state (h; and c in an LSTM) is carried over "
+                                  "(truncated BPTT), no shuffling"
+                                : "every sequence starts from a zero state; sequences are shuffled");
         snprintf(buf, sizeof buf, "%g%%", 100.0 * o.val_fraction);
         explain("validation", buf, tag_of(mask & CLI_SET_VAL, pre != NULL),
                 "the last part of the text is held out: train and validation loss are reported every epoch");
@@ -933,6 +1195,20 @@ int cmd_new(cli_state *st, int argc, char **argv) {
     }
     snprintf(buf, sizeof buf, "%llu", (unsigned long long)seed);
     explain("seed", buf, tag_of(seed_set, 0), "same seed => same initial weights and same shuffling, every run");
+    if (has_tf && !ctx_len)
+        printf("note: no position encoding (pos:learned:N or pos:sin:N): attention cannot tell where a character is\n");
+    if (has_tf) {
+        int li, heads = 0, hd = 0;
+        for (li = 0; li < nmz_net_layer_count(net); li++) {
+            char d[160];
+            nmz_layer_describe(nmz_net_layer(net, li), d, sizeof d);
+            if (sscanf(d, "block %*d (%d heads x %d", &heads, &hd) == 2 ||
+                sscanf(d, "attention %*d->%*d (%d heads x %d", &heads, &hd) == 2)
+                break;
+        }
+        printf("Transformer: context %d characters, %d block(s) x %d heads of %d, %zu parameters%s\n", ctx_len, n_blocks,
+               heads, hd, nmz_net_param_count(net), tied ? " (the output shares the embedding)" : "");
+    }
     printf("Created a network with %zu parameters.\n", nmz_net_param_count(net));
     cli_replace_net(st, net, NULL);
     net = NULL;

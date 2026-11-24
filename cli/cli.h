@@ -37,6 +37,8 @@ void cli_free_tokens(char **tok, int n);
 #define CLI_SET_CARRY 2048u
 #define CLI_SET_PATIENCE 4096u
 #define CLI_SET_SEQLEN 8192u
+#define CLI_SET_DECAY 16384u  /* --weight-decay, --decay-all */
+#define CLI_SET_WARMUP 32768u
 int cli_fail(const char *fmt, const char *arg); /* prints "error: ...", returns 1 */
 int cli_lib_fail(const char *what);               /* adds nmz_last_error()          */
 int cli_need_net(cli_state *st);
@@ -136,9 +138,30 @@ double seq_survival_rate(const double *v, int T, double *left);
  * layer); sv (may be NULL) = the vanishing-gradient view */
 void print_seq_trace(const nmz_trace_recorder *rec, const nmz_vocab *v, const print_opts *o, int applied, int unit,
                      int layer, const seq_survival *sv);
+void print_update_section(const nmz_trace_recorder *rec, const print_opts *o, int applied);
+/* print_attn.c: the Transformer's attention, step by step */
+typedef struct attn_pats attn_pats; /* per-head pattern statistics */
+attn_pats *attn_pats_new(void);
+void attn_pats_free(attn_pats *ap);
+/* add one attention event computed over ids (positions from 0); 1 on OOM */
+int attn_pats_add(attn_pats *ap, const nmz_trace_event *ev, const int *ids, const nmz_vocab *v);
+void attn_pats_print(const attn_pats *ap, const nmz_net *net);
+void attn_heatmap(const nmz_tensor *w, int b, int h, const int *ids, const nmz_vocab *v, int from, int to);
+void attn_put_char(const nmz_vocab *v, int id); /* one display column, RTL-safe */
+void attn_line_start(void);
+/* pos, head: 0-based or -1 (last position / the most decisive head);
+ * attn_n: 1-based attention layer; grad_e (may be NULL): |dL/dx_t| of a
+ * last-position-only backward pass */
+void print_attn_trace(const nmz_trace_recorder *rec, const nmz_vocab *v, const print_opts *o, int pos, int attn_n,
+                      int head, const double *grad_e, const nmz_net *net);
 /* cmd_seq.c: commands for sequence models */
 int cmd_compare(cli_state *st, int argc, char **argv);
 int show_gates(cli_state *st, int argc, char **argv);
+int show_attention(cli_state *st, int argc, char **argv);
+int show_params(cli_state *st);
+int net_has_attention(const nmz_net *net);
+/* net layer index of the n-th (1-based) layer with attention, or -1 */
+int seq_attention_layer(const nmz_net *net, int n);
 /* net layer index of the n-th (1-based) recurrent layer, or -1 */
 int seq_recurrent_layer(const nmz_net *net, int n);
 void print_rule(void);
