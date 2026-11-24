@@ -18,6 +18,13 @@ sum, and which max-pool input "won".
   numbers, and `compare` puts side by side how much of a gradient survives
   N steps back in an RNN, an LSTM (along h and along the cell state) and a
   GRU — *why gates fix vanishing gradients*, measured
+* A decoder-only **Transformer** (GPT-style: position encodings, LayerNorm,
+  causal multi-head attention, GELU feed-forward, pre-LN residual blocks,
+  weight tying) with AdamW, warm-up + cosine, and a KV cache for generation;
+  `trace` shows attention at one position with real numbers — the query,
+  every key, the scores, the mask, the softmax weights as bars labelled
+  with the characters — plus heatmaps, what each head attends to (measured)
+  and the residual stream
 * Trains a small CNN on MNIST to 98.8% test accuracy in about 2 minutes on a 2017
   laptop CPU (single thread), and character RNNs that invent English and
   Arabic names or write Alice-in-Wonderland-flavoured text
@@ -38,8 +45,9 @@ make test       # unit tests, gradient checks, convergence tests (~1 s)
 make sanitize   # the same tests + a CLI smoke test under ASan + UBSan
 make examples   # trains XOR, XOR+AND and Iris
 make data       # downloads MNIST (~11 MB) into data/ and verifies checksums
-make data-text  # downloads "Alice's Adventures in Wonderland" (151 KB) into data/
-make bench      # slow: seed sweeps, full MNIST runs, conv benchmark, character RNNs
+make data-text  # downloads "Alice's Adventures in Wonderland" and Kalila wa-Dimna into data/
+make bench      # slow: seed sweeps, MNIST, conv and matmul benchmarks, RNN/LSTM/GRU/Transformer
+make OMP=1      # optional: the same, multi-threaded with OpenMP (into build/omp; same results)
 ```
 
 Requirements: a C11 compiler and `make` (plus `curl` or `wget` and `gunzip`
@@ -575,6 +583,396 @@ The trade-off:
 
 Off is the default: the model learns the text as it is written.
 
+---
+
+## A small Transformer: what attention does
+
+A recurrent network squeezes everything it has read into one state vector
+and carries it forward one character at a time. A Transformer keeps a
+vector for *every* character it has read and lets each position **look
+back** at all of them, choosing with learned weights which ones matter.
+NeuroMZ has a decoder-only Transformer, GPT-style:
+
+```
+embedding → position encoding → block → block → LayerNorm → output (tied to the embedding) → softmax
+block:  h = x + attention(LayerNorm(x))      y = h + feed-forward(LayerNorm(h))
+```
+
+```bash
+./build/neuromz new --preset char-gpt -o gpt.nmz     # 32 043 weights: the size of char-lstm
+./build/neuromz -m gpt.nmz train data/alice.txt -o gpt.nmz
+./build/neuromz -m gpt.nmz generate --prime Alice --temperature 0.7
+```
+
+```
+Preset char-gpt: small Transformer for running text: the `char-lstm` comparison (same number of weights)
+  embed 75 chars->32                       [preset]  each character gets a learned 32-number vector (also the output matrix: vocab:tied)
+  pos Tx32->Tx32           learned 128     [preset]  context 128 characters (~25 words): attention can look back that far in one step
+  block Tx32->Tx32         4 heads x 8     [preset]  4 heads of 8: each can follow a different relation (previous letter, word start, ...)
+    feed-forward           128 gelu        [default] feed-forward x*Phi(x) (a smooth relu); hidden size 4D by default; 12704 weights in this block
+  block Tx32->Tx32         4 heads x 8     [preset]  a second block: 32k weights in all, the same as char-lstm (lstm:64)
+  ...
+  layernorm Tx32                           [preset]  a final LayerNorm, as in GPT-2
+  output Tx32->Tx75        tied softmax    [preset]  next-character scores = h * E^T: the embedding matrix read backwards
+  optimizer                adamw           [preset]  AdamW: Adam's per-weight steps plus decoupled weight decay (0.1) on the weight matrices
+  weight decay             0.1             [default] w <- w - lr*lambda*w for weight matrices only; not biases, LayerNorm, embeddings, positions
+  schedule                 warmup-cosine   [preset]  warm-up (5% of the updates), then a cosine down to a tenth of the rate, per batch
+    warm-up batches        192             [default] about 5% of all updates: early Adam steps are noisy, and big early updates can stall attention
+Transformer: context 128 characters, 2 block(s) x 4 heads of 8, 32043 parameters (the output shares the embedding)
+```
+
+The layers are ordinary NeuroMZ layers — `pos:learned:128`, `block:heads=4`,
+`ln`, `vocab:tied` — so you can build your own (`block:heads=8:head_dim=16:ff=512:relu:dropout=0.1`,
+`pos:sin:256`, or the parts `attn:heads=4`, `ffn:256`, `ln` on their own).
+`show params` breaks the weights down: in char-gpt 52% are feed-forward,
+26% attention, 13% the position table, 7.5% the shared character table
+and 1% LayerNorm.
+
+### How attention works — step by step
+
+`trace` on a Transformer follows one position through one head with every
+number. This is the char-gpt trained above, reading "the Queen said to the "
+(`trace --text "the Queen said to the Q" --layer 1 --head 2`; the input is
+the text without its last character, the target the text shifted by one):
+
+**1. Each character becomes a vector: what it is plus where it is.**
+
+```
+  e_t = W_emb[id_t] (32 numbers);  p_t = learned row t of P
+  t=0   t  e = [0.604, 0.237, 0.450, -0.336, ...]   p = [0.561, 0.145, -0.029, -0.281, ...]
+  t=1   h  e = [-0.463, -0.937, 0.370, -0.737, ...]   p = [0.222, -0.136, -0.052, 0.078, ...]
+  t=2   e  e = [-0.246, -0.446, -0.427, -0.176, ...]   p = [0.283, 0.009, 0.031, 0.380, ...]
+```
+
+The same `e` at t = 2, 6, 7 and 20 has the same character vector; only `p`
+tells them apart. Without it attention could not know what is *previous*:
+a weighted sum does not care where a value came from.
+
+**2. The query asks, every key answers.** Each block LayerNorms the vector
+and projects it three ways: a query q ("what am I looking for?"), a key k
+("what do I offer?") and a value v ("what do I pass on?"), split into 4
+heads of 8 numbers. At the last position, the space after "the":
+
+```
+  query position 21 = '␣' (the model has read up to here and predicts the next character)
+  q = x·W_q + b_q   (8 numbers per head; head 2's part):  q = [0.674, -2.313, 1.011, 3.759, 1.647, -0.461, -0.506, 1.222]
+```
+
+**3. Scores, the causal mask and the softmax.** The score of position j is
+`q·k_j/√8`. Only j ≤ 21 exist for this query — later positions are masked
+(here there are none; at position 5 the 16 positions after it would be
+listed as masked, weight 0). The softmax turns scores into weights that
+sum to 1:
+
+```
+     j  char  k_j (first 3)                     score s_j   weight a_j
+     0  t     [-4.697, 3.565, -4.052, ...]       -17.265   6.21e-06
+     ...
+    13  d     [-2.491, 2.330, -2.078, ...]        -9.192      0.020  █
+    15  t     [-2.483, 3.096, -3.071, ...]        -8.417      0.043  █
+    19  h     [-2.840, 1.318, -1.999, ...]        -7.917      0.071  ██
+    20  e     [-3.347, 2.315, -1.742, ...]        -5.943      0.513  ███████████████  <- largest
+    21  ␣     [-2.116, 3.289, -1.992, ...]        -6.562      0.276  ████████
+
+  why 'e' at 20: q·k = Σ q_d·k_d = -16.810; the largest terms: d=2: -2.313·2.315 = -5.355, d=8: 1.222·-2.110 = -2.579, d=4: 3.759·-0.625 = -2.351
+```
+
+Every score is negative, and that does not matter: the softmax only sees
+*differences*. They fall steadily with distance — −17.3 for the first
+character, about −9 for the last two words, −7.9 for 'h', −5.9 for the
+previous character 'e' — so this head has learned a positional rule, *look
+at the character just before me*, and spends 51% of its attention on 'e'.
+
+**4. The weighted sum.** The head's output is the values mixed by those
+weights; mostly the value of 'e':
+
+```
+  context c = Σ_j a_j·v_j  (the values, mixed by the weights) = [-1.380, 0.323, 0.364, 0.368, -0.564, 0.051, -0.994, -0.004]
+  the largest contributions a_j·v_j:
+    0.513 · v_20 = [-0.887, 0.463, 0.527, 0.930, ...]   (e)
+    0.276 · v_21 = [-0.471, -0.194, -0.150, -0.474, ...]   (␣)
+    0.071 · v_19 = [-0.012, -0.057, 0.108, -0.023, ...]   (h)
+```
+
+**5. Four heads look at different things.** The four contexts are put side
+by side, projected back to 32 numbers (`W_o`) and *added* to the vector:
+
+```
+  head 1:   'e'@20 0.330   '␣'@21 0.228   'h'@19 0.115
+  head 2:   'e'@20 0.513   '␣'@21 0.276   'h'@19 0.071
+  head 3:   'h'@19 0.374   '␣'@21 0.323   'e'@20 0.086
+  head 4:   '␣'@21 0.419   'h'@19 0.276   '␣'@17 0.082
+```
+
+Together, layer 1 sees "the␣" — enough to know a noun is coming.
+
+**6. The whole picture: a heatmap.** Rows are query positions, columns the
+positions they may look at; right of the diagonal is the masked future.
+Head 2 is one bright stripe just left of the diagonal — the previous
+character, at every position:
+
+```
+           0         1         2
+           the␣Queen␣said␣to␣the␣
+     0 t   @
+     1 h   +=
+     2 e   -+:
+     3 ␣    :+:
+     4 Q    .--:
+     5 u      .=:
+     6 e       .*.
+     ...
+    18 t                   .*:
+    19 h                    --.
+    20 e                    ..::
+    21 ␣                      .+:
+```
+
+**7. The residual stream.** A block never replaces the vector, it adds to
+it. At position 21 the first block's attention adds a vector as long as
+the input, the feed-forward net more; in the second block the
+feed-forward net dominates (86% of the change):
+
+```
+  block         |x|    +|attn|      |h|     +|ffn|      |y|   cos(x,y)   attn share
+  1           3.056      3.447    4.036      5.256    6.128      0.474          40%
+  2           6.128      2.935    6.235     17.675   18.902      0.437          14%
+```
+
+**8. The prediction.** After the final LayerNorm, `z = h·Eᵀ + b` scores each
+character by how well the vector matches its *embedding* (weight tying);
+the softmax gives the next character:
+
+```
+  'M'  0.101  ███
+  'D'  0.079  ██
+  'c'  0.074  ██
+  'C'  0.072  ██
+  'w'  0.054  ██
+  the actual next character 'Q': p = 0.045 (rank 7 of 75)
+```
+
+"the M…" (March Hare, Mock Turtle), "the D…" (Duchess, Dormouse): capital
+letters after "the ", as in the book. A 32 k-weight model has not narrowed
+it down to the Queen. The trace then shows the gradient of this loss
+reaching every earlier position directly, and the AdamW update.
+
+### What the heads learned
+
+`show attention` runs any text through the model in windows of the
+context length, draws a heatmap for one head and, for every head,
+measures where its attention goes: on itself, the previous character, two
+back, earlier copies of the same character, the character after such a
+copy (what came next last time), the start of the current word, the last
+space or punctuation, the first position, or more than 16 positions back —
+each against what uniform attention would give. The label is inferred
+from these numbers, not looked up (DESIGN decision 101).
+
+**char-gpt on Alice** (8 000 characters of the validation part,
+`show attention --data data/alice.txt --from 130000 --chars 8000`):
+
+```
+  layer 1 head 1  the character two back: 23% (uniform 3%);  then the previous character 23%
+  layer 1 head 2  the previous character: 50% (uniform 3%);  then itself 23%
+                  span 3.5 positions, top weight 0.56 on average
+  layer 1 head 3  the previous character: 28% (uniform 3%);  then the character two back 21%
+  layer 1 head 4  the previous character: 29% (uniform 3%);  then the character two back 19%
+  layer 2 head 1  spread out: no single kind of position stands out (best: the start of the current word 6%, uniform 2%)
+                  span 13.6 positions, top weight 0.31 on average
+  layer 2 head 3  spread out: no single kind of position stands out (best: the last space or punctuation 9%, uniform 3%)
+  ...
+```
+
+The first layer has become a set of **local n-gram detectors**: every head
+looks at the previous one or two characters (and itself), one of them
+with half of its weight on the previous character alone — the clean
+diagonal of the heatmap above. The second layer's heads spread over ~14
+positions: they mix the word so far rather than point at one place.
+
+**The best model (213 k weights, 4 blocks of 64, below)** has the same
+first layer — a previous-character head (60%, span 3.4), two "two back"
+heads and a head on *itself and the start of the current word* (37% and
+17%) — and three more layers whose heads all spread over 15–22 positions.
+None of them is a "copy" head: the pattern *the character after an earlier
+copy of this one* (an induction head, which lets a model repeat a name it
+has seen) reaches 8% against 6% uniform at best. At this size and data
+those heads did not form.
+
+**arabic-gpt on Kalila wa-Dimna** (3 blocks of 64):
+
+```
+  layer 1 head 1  the previous character: 58% (uniform 3%);  then the last space or punctuation 19%
+  layer 1 head 2  the character two back: 32% (uniform 3%);  then the last space or punctuation 20%
+  layer 1 head 3  itself: 30% (uniform 3%);  then the start of the current word 10%
+  layer 1 head 4  itself: 35% (uniform 3%);  then the previous character 20%
+  layer 2 head 4  the start of the current word: 17% (uniform 2%);  then the character two back 10%
+  (the other 7 heads of layers 2 and 3: spread out)
+```
+
+The same division of labour in Arabic, plus a layer-2 head that watches
+**the start of the current word** — where Arabic puts its prefixes (و، ف،
+ب، ال), which constrain what may follow. Its heatmap with Arabic on both
+axes (one column per letter, `show attention --text "قال دمنة: زعموا أن"
+--layer 1 --head 1`; the previous-character diagonal again):
+
+```
+‎           0         1       
+‎           ق‌‎ا‌‎ل‌‎␣د‌‎م‌‎ن‌‎ة‌‎:␣ز‌‎ع‌‎م‌‎و‌‎ا‌‎␣أ‌‎ن‌‎
+‎     0 ق‌‎   @                 
+‎     1 ا‌‎   @                 
+‎     2 ل‌‎   *:.               
+‎     3 ␣    .*.              
+‎     4 د‌‎     .#.             
+‎     5 م‌‎      --:            
+‎     6 ن‌‎       -+.           
+‎     7 ة‌‎        .==          
+‎     8 :        .:=:         
+‎     9 ␣          :#         
+‎    10 ز‌‎           .=:       
+‎    11 ع‌‎            .*.      
+‎    12 م‌‎             :+.     
+‎    13 و‌‎             ..+.    
+‎    14 ا‌‎               :*.   
+‎    15 ␣                --:  
+‎    16 أ‌‎                 .+. 
+‎    17 ن‌‎                  :+.
+```
+
+### Attention vs recurrence: the gradient path
+
+`compare` accepts Transformers next to RNNs, LSTMs and GRUs. The same
+experiment as in phase 4 — only the last character's loss, followed back —
+measured for a Transformer at the input of its first block:
+
+```
+$ neuromz compare alice-lstm.nmz alice-gru.nmz alice-gpt.nmz --data data/alice.txt --from 140000 --chars 65
+
+text (64 steps; the models predict the last character from all before it):
+  re!” said the King triumphantly, pointing to the
+tarts on the tab
+
+  A  alice-lstm5.nmz      lstm 64, 32107 parameters            loss of the last prediction 2.327
+  B  alice-gru5.nmz       gru 75, 32400 parameters             loss of the last prediction 1.161
+  C  alice-gpt.nmz        transformer, 2 blocks, 32043 parameters loss of the last prediction 1.384
+
+  back  char    A lstm h   A lstm c      A Π f    B gru h      B Π z    C gpt x
+     0  a          1.000      1.000      1.000      1.000      1.000      1.000
+     1  t          0.460      1.015      0.777      0.835      0.159      0.542
+     2  ␣          0.315      0.929      0.591      0.444      0.013      0.284
+     3  e          0.073      0.476      0.580      0.290    6.6e-03      0.129
+     4  h          0.072      0.411      0.578      0.198    4.4e-03      0.466
+     5  t          0.037      0.072      0.539      0.125    3.7e-03      0.090
+    10  s        3.6e-03      0.010      0.466      0.019    5.9e-05      0.022
+    16  e        5.0e-04    1.2e-03      0.428    6.7e-03    9.6e-06      0.072
+    24  n        4.7e-05    1.5e-04      0.397    4.7e-04    2.3e-07      0.021
+    32  ,        2.0e-05    1.1e-04      0.352    7.4e-05    3.2e-10      0.062
+    48  i        6.8e-06    8.8e-05      0.300    9.2e-06    1.6e-11    4.8e-03
+    63  r        2.0e-05    7.1e-05      0.183    4.6e-07    9.4e-21    8.6e-03
+
+the same on a log scale, one column per step back (0 at the left; '█' = 1, empty = below 1e-06):
+  A lstm h   ███▇▇▇▆▆▆▆▅▅▅▅▄▅▄▄▄▄▃▃▃▃▃▃▃▂▂▂▂▃▂▄▃▃▃▃▃▃▃▃▂▂▂▂▂▂▂▂▃▂▂▂▂▂▂▁▂▂▂▂▁▂
+  A lstm c   █████▇▇▆▆▆▆▅▆▅▅▅▅▄▅▄▄▄▄▃▃▃▃▃▃▃▃▃▃▄▄▄▄▄▃▄▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃
+  B gru h    █████▇▇▇▆▆▆▆▆▆▆▆▆▅▅▅▅▄▄▄▄▄▄▄▄▄▄▃▃▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▁▁▁▁▁
+  C gpt x    ███▇█▇▇▇▇▇▆▇▇▆▇▇▇▇▆▇▆▆▆▇▆▆▆▆▆▇▇▇▇▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▅▇▅▆▆▆▆▆▅▆▅▆▆▆▆▆
+
+               x per step    x/step k>=       left at       left at    < 1% after
+                    (all)            16          k=10         k=end
+  A lstm h         x0.842        x0.934        0.0036         2e-05       8 steps
+  A lstm c         x0.859        x0.942          0.01       7.1e-05      11 steps
+  B gru h          x0.793        x0.815         0.019       4.6e-07      15 steps
+  C gpt x          x0.927        x0.956         0.022        0.0086      27 steps
+```
+
+How to read it:
+
+* **Same size, very different profiles.** 63 characters back the
+  Transformer still receives 0.86% of the last prediction's gradient —
+  120× more than the LSTM's cell state, 400× more than its h and 18 000×
+  more than the GRU. Its sparkline stays at the same height while the
+  recurrent ones slope down: there is no chain of steps to shrink along.
+* **It is not monotonic.** 4 characters back the Transformer's gradient
+  *rises* to 0.47 — that is the 'h' of "the", which the previous-character
+  and two-back heads point at; 3 back ('e') gets 0.13. What reaches a
+  position is decided by where the heads look, not by how far away it is.
+* **It is still small far away.** "Directly connected" does not mean
+  "used": at this size the layer-2 heads spread their weight over ~14
+  positions and the model leans on the last few characters, like the
+  recurrent ones (decision 90). The larger model (213 k, four blocks; see
+  Results) keeps 7.2% of the gradient 63 characters back and never drops
+  below 1% — its deeper heads spread over 15–22 positions. The difference is that a Transformer
+  *could* use a character 100 positions back at the same cost as the
+  previous one; an RNN would first have to keep it alive for 100 steps.
+* The "x per step" columns are only a summary for the Transformer (its
+  gradient is not multiplied step by step). The context window is the
+  hard limit: past 128 characters a Transformer sees nothing at all, a
+  recurrent model a faint trace.
+
+### Generating with a KV cache
+
+Generation feeds one new character per step. A Transformer would
+recompute the keys and values of the whole window every time; with a **KV
+cache** each attention layer keeps them (its carried state, like an RNN's
+h) and computes only the new row. The text is bit-identical either way —
+`generate --no-cache` recomputes everything and is the reference the tests
+compare against. When the text outgrows the context window, the newest
+half is kept and re-encoded from position 0 (positions are absolute, so a
+cached key cannot be moved to a new position), and single steps continue.
+
+On the trained char-gpt, 20 texts of 300 characters (`benchmark_transformer.sh`):
+
+| | time | text |
+|---|---|---|
+| with the KV cache | **228 ms** | — |
+| recomputing the window every step (`--no-cache`) | 8 469 ms (37×) | identical |
+
+Each text outgrows the 128-position window after 127 characters and then
+every 64, so it slides three times; a slide costs one full pass over the
+64 characters it keeps.
+
+### Training a Transformer: AdamW and warm-up
+
+* **AdamW** (`--optimizer adamw --weight-decay 0.1`) adds `λ·w` to the Adam
+  step instead of to the gradient, so every weight decays at the same
+  relative rate whatever its gradient history. Only weight matrices decay;
+  biases, LayerNorm gains, the character table and the position table do
+  not (`--decay-all` changes that; `show params` lists who decays).
+* **Warm-up + cosine, per batch** (`--schedule warmup-cosine --warmup N`):
+  the rate rises linearly over the first ~5% of the updates, then follows a
+  cosine down to a tenth. `trace`/`step` show the AdamW formula and the λ
+  of each parameter.
+* Tiny Transformers want **large** steps. On Alice, char-gpt's peak rate
+  0.001 / 0.002 / 0.003 / 0.005 / 0.01 / 0.02 gave validation loss 2.30 /
+  2.02 / 1.82 / 1.72 / 1.67 / 1.66 after 30 epochs (batch 16); batch 8 (twice the
+  updates) 1.633; sinusoidal positions 1.637; dropout 0.1 1.70 (worse: at
+  32 k weights the model underfits rather than overfits).
+
+### Speed: the matrix product
+
+Attention and the feed-forward net are matrix products; `nmz_matmul`
+computes them cache-blocked, keeping a 1 × 32 tile of the result in
+registers. It gives **bit-identical** results to the three-loop
+reference (same sum order; tested), which is also what makes the KV cache
+exact. `build/bench_matmul`, one core of the i7-7500U:
+
+| product (M × N × K), as in a D = 64 model | naive loops | blocked, 1 thread | speedup | GFLOP/s | 2 threads (`OMP=1`) |
+|---|---|---|---|---|---|
+| `x·W_qkv` 4096 × 192 × 64 | 40.5 ms | 5.75 ms | 7.0× | 17.5 | 3.20 ms (31.5 GFLOP/s) |
+| `a·W2` 4096 × 64 × 256 | 71.7 ms | 6.80 ms | 10.5× | 19.8 | 5.97 ms (22.5) |
+| `x·W1` 4096 × 256 × 64 | 59.9 ms | 8.98 ms | 6.7× | 14.9 | 4.71 ms (28.5) |
+| `dW1 = xᵀ·dz` 64 × 256 × 4096 | 488 ms | 13.5 ms | 36× | 9.9 | 7.01 ms (19.1) |
+| `dx = dz·W1ᵀ` 4096 × 64 × 256 | 64.5 ms | 6.93 ms | 9.3× | 19.4 | 3.45 ms (38.9) |
+
+(The naive weight-gradient loop reads A by columns; the blocked version
+copies Aᵀ once.) A 4 × 8 register tile, the textbook choice, came out at
+4–6 GFLOP/s — GCC kept it on the stack — and the plain row loop at 11–12.
+
+`make OMP=1` builds with OpenMP (off by default; the library stays
+dependency-free): the row blocks of each product and the (row, head) pairs
+of attention are shared among threads, each number is still computed by
+one thread in the same order, so results stay bit-identical (all tests
+pass in both builds). One training epoch of a 113 k-weight model: 16.2 s
+on one thread, 11.2 s on 2 threads; 4 threads (hyper-threads) 14.6 s.
+
 ## The advanced path
 
 Every layer is one argument, every training knob is an option. What you set
@@ -593,24 +991,26 @@ is marked `[yours]`; the rest is still explained.
 | dense | `N[:ACT][:INIT]` (or `dense:N:...`) |
 | conv | `conv:FILTERS:K[:ACT][:INIT][:stride=S][:pad=P\|same]`, `K` = `3` or `3x5` |
 | pooling, other | `pool:K[:stride=S]`, `flatten` (automatic before dense), `dropout:RATE` |
-| activations | `linear`, `sigmoid`, `tanh`, `relu`, `leaky_relu[=ALPHA]`, `softmax` |
+| activations | `linear`, `sigmoid`, `tanh`, `relu`, `leaky_relu[=ALPHA]`, `softmax`, `gelu` |
 | init | `auto` (He before relu and for conv, Xavier otherwise; orthogonal for recurrent layers), `xavier`, `he`, `orthogonal` (recurrent layers only) |
 | loss | `mse` (½·squared error), `cross_entropy`/`ce` (fused with a softmax output) |
-| optimizer | `--optimizer sgd` (`--momentum`) or `adam` (`--beta1 --beta2 --eps`), `--lr` |
-| schedule | `--schedule constant\|step\|cosine`, `--step-size N --gamma X`, `--min-lr X` |
+| optimizer | `--optimizer sgd` (`--momentum`), `adam` (`--beta1 --beta2 --eps`) or `adamw` (`--weight-decay X`, `--decay-all`), `--lr` |
+| schedule | `--schedule constant\|step\|cosine\|warmup-cosine`, `--step-size N --gamma X`, `--min-lr X`, `--warmup N` (batches) |
 | data | `--normalize none\|minmax\|zscore` (fitted at the first `train`, saved) |
 | text | input `text` with `--data FILE` (vocabulary), `embed:D`, `rnn:H`, `lstm:H[:forget_bias=F]`, `gru:H`, `vocab[:ACT]` (one output per character); stack recurrent layers with `dropout:R` between them; `--items`/`--no-items`; `--strip-diacritics`, `--unify-alef` (Arabic) |
 | training | `--batch`, `--epochs`, `--target-loss`, `--no-shuffle`, `--seed` |
 | validation, stopping | `--val FRACTION` (the last part of the data is held out) or, for `train`, `--val-file FILE` (a separate set), `--patience N` (early stopping, keeps the best weights) |
 | recurrent | `--seq-len N` (BPTT window), `--carry`/`--no-carry` (hidden state carried between batches), `--clip NORM` |
+| transformer | `pos:learned:CTX`, `pos:sin:CTX` (position encoding; CTX = context window), `block[:heads=H][:head_dim=K][:ff=F][:gelu\|relu][:dropout=R]` (pre-LN block), the parts `attn[:heads=H][:head_dim=K]`, `ffn[:F][:gelu\|relu]`, `ln`; `vocab:tied` (output = embedding matrix); presets `names-gpt`, `char-gpt`, `arabic-gpt` |
 
 * `train DATA [options]` overrides the stored settings for one run;
   `set --optimizer adam --lr 0.001 ...` changes the settings saved with the model.
   `DATA` is a CSV file, `mnist` (training set for `train`, test set for
   `test`), `mnist:train`/`mnist:test`, or an IDX images file.
-* `show` / `show weights` / `show filters` / `show vocab` / `show gates
-  --data FILE` / `show sample N [--data SPEC]`, `compare A.nmz B.nmz ...
-  --text TEXT`, `generate`,
+* `show` / `show weights` / `show filters` / `show vocab` / `show params` /
+  `show gates --data FILE` / `show attention --data FILE [--layer N --head H]` /
+  `show sample N [--data SPEC]`, `compare A.nmz B.nmz ... --text TEXT`,
+  `generate [--context N] [--no-cache]`,
   `test DATA`, `predict X... | --sample N`, `reinit [SEED]`,
   `save [FILE] [--no-optimizer]`, `load FILE`, `clear`, `help [COMMAND]`.
 * One-shot use composes in shell scripts: `-m FILE` loads a model before the
@@ -864,6 +1264,106 @@ correctly attached prefixes (و، ف، ب، ال), but invented words in between
 (أشراوز، تنطعم) and no syntax beyond a few words. A character model of this
 size learns spelling and the shape of phrases, not meaning.
 
+**Transformer vs LSTM vs GRU** (`sh examples/benchmark_transformer.sh`,
+part of `make bench`): the phase-4 LSTM and GRU against a Transformer with
+the same number of weights (char-gpt: 2 blocks of 32, 4 heads, context
+128, tied output), seed 42, one core of the same i7-7500U. The LSTM and
+GRU numbers reproduce phase 4 exactly (training is deterministic; the
+times are this run's). Validation loss in nats per character:
+
+| data | LSTM (lstm:64) | GRU (gru:75) | Transformer (char-gpt / names-gpt) |
+|---|---|---|---|
+| English names | **2.028** · ppl 7.60 · 28 s | 2.056 · ppl 7.81 · 19 s | 2.097 · ppl 8.14 · 33 s |
+| Arabic names | **2.460** · ppl 11.70 · 3 s | 2.464 · ppl 11.75 · 2 s | 2.770 · ppl 15.96 · 1 s |
+| Alice | 1.614 · ppl 5.03 · 243 s | **1.580** · ppl 4.86 · 174 s | 1.633 · ppl 5.12 · 285 s |
+| Kalila wa-Dimna | 1.951 · ppl 7.03 · 333 s | **1.938** · ppl 6.95 · 149 s | 1.940 · ppl 6.96 · 588 s |
+| parameters (names / Alice / Kalila) | 25.0 k / 32.1 k / 30.0 k | 25.6 k / 32.4 k / 30.0 k | 24.1 k / 32.0 k / 31.3 k |
+
+Larger models, each trained once, within about 20–25 minutes of one core:
+
+| model | parameters | validation | time |
+|---|---|---|---|
+| Alice: 4 blocks of 64, 4 heads, dropout 0.2, context 128 | 213 k | **1.564** · ppl 4.78 | 1 346 s (22 min, 30 epochs) |
+| Kalila: `--preset arabic-gpt` (3 blocks of 64, dropout 0.1) | 162 k | **1.883** · ppl 6.57 | 979 s (20 epochs) |
+| Kalila: `--preset arabic-text` (two LSTMs of 96, phase 4) | 130 k | **1.863** · ppl 6.44 | 865 s |
+
+The "best Transformer in reasonable CPU time" budget was about half an
+hour of one core for Alice. Three larger configurations were tried; the
+one above won. 4 blocks of 96 (467 k weights, dropout 0.1, 22 epochs, 27
+min) reached 1.627 but overfitted hard (training loss 1.07 against 1.63
+on validation): Alice's 130 k training characters are too few for it; the
+same size with dropout 0.3 was behind (1.688 after 18 epochs) and was
+stopped.
+
+Honest summary:
+
+* **At equal size the Transformer does not win.** On the books it lands
+  next to the recurrent models — on Alice behind both (1.633 vs 1.614 /
+  1.580), on Kalila level with the GRU (1.940 vs 1.938) — and it takes
+  1.2–4× longer to train (every position attends to every earlier one, and
+  each epoch also re-evaluates the training set). On the names it is
+  behind, and on the 504 Arabic names clearly worse (2.77 vs 2.46): with
+  2.7 k characters it overfits after 9 epochs, before attention has learned
+  much. A recurrent model's built-in bias — read in order, remember
+  recent things — is worth a lot when data is small.
+* **With more capacity it wins on Alice**: 213 k weights with dropout give
+  1.564, better than every 32 k model. On Kalila the larger recurrent model
+  is still slightly ahead (phase 4's two stacked LSTMs, 130 k: 1.863;
+  arabic-gpt, 162 k: 1.883).
+* **Tiny Transformers need large learning rates**, ten times Adam's usual
+  0.001 (decision 106), and a warm-up.
+* What the comparison does show clearly is the *gradient path*
+  ("Attention vs recurrence" above): the Transformer's gradient 63
+  characters back is 120× the LSTM cell's and 18 000× the GRU's. At this
+  scale, next-character prediction does not need that reach.
+
+Generated with `--seed 1`, `--temperature 0.7` for the books (unedited):
+
+* **English names**, names-gpt: Darria, Corinette, Telenink, Sandie
+  *(in the data)*, Fantter, Lathalin, Tateny, Jeissa, Tamima, Danusta.
+* **Arabic names**, names-gpt: د، جنى *(in the data)*، نسد، ناسراسسسن، زة،
+  فالك، ن، سغامم، دياماكة، لمسعكياريه — one-letter "names" and runs of س:
+  the weak model of the table above.
+* **Alice**, char-gpt (32 k):
+
+  > Alice broud the had grearer again, so not the Queen short the went once
+  > looked of you nead. “Well that way be with tick I urong, this a lef at
+  > sterying in good-assoon to as all course.
+
+  The 213 k model:
+
+  > Alice angoing the exectly, and to little for the hedgehog to dready to
+  > childen they dish as woment had the baby a down a but, and story see at
+  > so sitting to of as something about the could for thing minute were as is
+  > the fancy, and this the was she was she cament her sing had could
+* **Kalila wa-Dimna**, the matched Transformer (31 k):
+
+  > قال الملك وأنا ألا يجد على القيام من التي عن العمري. فلما الملك من غير من
+  > ذلك إليك تعاص، فيه من الأحدية. فأخرج بذلك فلا يدنو من الملك في أحسن من سوء
+  > الصيادانة والملك. … قال كليلة: فإنما ولا على الملك …
+
+  arabic-gpt (162 k):
+
+  > قال إلى الماء والصديق الذي لا يستعمل لي من كان له من الصور به لا يقول له في
+  > الأسود في المخيل ولا يجاءه ولا ينبغي من قد أن يدعه لهم لا يحتاجه لي تكون
+  > على السمك … فلما جماعلم أن يحشر عليه عند سرار الصياده من قد أحسن على
+  > المنزلة، وقال: أيها ال
+
+Judged honestly: the English names are as name-like as the LSTM's
+(Corinette, Lathalin, Jeissa, Tamima) — the loss difference is not
+visible in ten samples. The Arabic names are the worst output of the
+project. The 32 k Alice text has the book's shape (dialogue, "the Queen")
+but more broken words than the GRU's; the 213 k model has fewer broken words and the book's
+vocabulary (the hedgehog, the baby, "sitting", "something about") but
+still no sentence that means anything — 0.07 nats are not a different kind
+of text. On Kalila the
+matched Transformer writes mostly real words (الملك، القيام، فلما، أحسن،
+كليلة), the book's frame ("قال كليلة:") and correct prefixes, like the
+recurrent models — and arabic-gpt's is the most fluent Arabic of the project: long runs of
+real words and phrases (الذي لا يستعمل، ولا ينبغي، أن يدعه، أحسن على المنزلة،
+"وقال: أيها"), the fable's water and fish (الماء، السمك، الصياد), few invented
+words (جماعلم), and still no meaning beyond a phrase.
+
 **Small datasets** (`sh examples/benchmark.sh ./build/neuromz 20`, seeds 1–20,
 defaults unless shown). Iris: 120 training rows, accuracy on the 30 held-out
 rows of `examples/iris_test.csv`.
@@ -885,7 +1385,7 @@ MSE, 0.07 for cross-entropy) before 5000 epochs.
 
 ## Tests
 
-`make test` runs 72 tests (~105 000 checks) in a few seconds:
+`make test` runs 86 tests (~106 000 checks) in a few seconds:
 
 * **numerical gradient checks** for Dense, every activation (incl. the softmax
   Jacobian), MSE, fused softmax+cross-entropy, a deep mixed network, batch
@@ -927,15 +1427,34 @@ MSE, 0.07 for cross-entropy) before 5000 epochs.
   generation row by row, a separate validation set, and **a character RNN
   written by the last phase-3 commit still loads and generates exactly the
   same names**;
+* **Transformer**: the blocked matrix product bit-identical to the naive
+  loops (36 shapes × transposition/accumulation flags); LayerNorm, the
+  sinusoidal position table and one attention head against hand-computed
+  values; gradient checks of every building block (LayerNorm, learned and
+  sinusoidal positions, attention with E = D and E ≠ D, GELU and ReLU
+  feed-forward, the block with dropout in evaluation and training mode),
+  of whole two-block models (tied and untied output, learned and
+  sinusoidal positions, a loss on the last position only); **the causal
+  mask** (the output at t is bit-identical when later inputs change, and
+  ∂L/∂x_j = 0 exactly for j > t); **weight tying** (one matrix, both
+  gradients, save/load keeps the tie); **the KV cache equals recomputing
+  the window** for small windows, slides, long primes, items and batches;
+  **AdamW and warm-up + cosine against hand-computed steps** (and which
+  parameters decay); save/load of a Transformer; the attention trace
+  events; and **a model written by the last phase-4 commit still loads and
+  generates exactly the same names**;
 * CSV and IDX parsing errors; every API entry point with `NULL`/bad input.
 
-`make sanitize` runs all of that plus `tests/cli_smoke.sh` (168 CLI cases,
+`make sanitize` runs all of that plus `tests/cli_smoke.sh` (212 CLI cases,
 including image layers on a generated dataset, English and Arabic name
 models, generation determinism, traces in UTF-8 and ASCII, invalid UTF-8,
 LSTM/GRU traces, `show gates`, `compare`, stacked models, Arabic
-normalisation, no-network commands, malformed input, a 300 KB line and random
+normalisation, Transformer specs and presets, attention traces in UTF-8 and
+ASCII (Arabic included), `show attention`, `show params`, KV-cache and
+no-cache generation, no-network commands, malformed input, a 300 KB line and random
 binary input, and MNIST, Alice and Kalila wa-Dimna when present) under
-ASan + UBSan with leak detection. The slow benchmarks are in `make bench`.
+ASan + UBSan with leak detection. `make test OMP=1` and `make sanitize
+OMP=1` run the same in the OpenMP build. The slow benchmarks are in `make bench`.
 
 ## Layout
 
@@ -960,6 +1479,7 @@ schedules, normalization and MNIST (phase 2); text, embeddings, a vanilla RNN
 with truncated BPTT, clipping, validation/early stopping and generation
 (phase 3); LSTM, GRU, orthogonal initialisation, stacking, gate traces, the
 gradient-survival comparison, Arabic prose and batch generation (phase 4 —
-added with no change to the engine, as DESIGN §3.1 planned). Next: attention
-and a tiny Transformer trained on text, and a GUI that consumes the trace
-events.
+added with no change to the engine, as DESIGN §3.1 planned); a decoder-only
+Transformer with AdamW, warm-up, a blocked matrix product, a KV cache and
+attention traces (phase 5 — DESIGN §3.2). Next: a GUI that consumes the
+trace events.

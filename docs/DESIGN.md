@@ -13,7 +13,9 @@ Phase 1 (dense networks) added decisions 27–33; phase 2 (CNN, Adam,
 normalization, MNIST) added decisions 34–50; phase 3 (text, Embedding,
 RNN, generation) added decisions 51–70; phase 4 (LSTM, GRU, orthogonal
 init, gate traces, gradient-survival comparison, Arabic prose) added
-decisions 71–90.
+decisions 71–90; phase 5 (a decoder-only Transformer, AdamW, warm-up,
+the blocked matrix product, the KV cache, attention traces) added
+decisions 91–110.
 
 ---
 
@@ -45,7 +47,13 @@ src/                   libneuromz — platform-independent C11, libc + libm only
   lstm.c               LSTM (gates i f g o, cell state c, BPTT along h and c)
   gru.c                GRU (Cho et al. 2014: gates z r, candidate h~)
   generate.c           sampling text: temperature, top-k, seeded PCG32,
-                       batches of rows (finished rows leave the batch)
+                       batches of rows (finished rows leave the batch);
+                       Transformers: KV cache, context window, sliding
+  matmul.c             C = A·B, cache-blocked with a register tile, the
+                       naive reference, optional OpenMP (make OMP=1)
+  attention.c          causal multi-head self-attention (+ KV cache)
+  transformer.c        position encoding, LayerNorm, feed-forward, the
+                       pre-LN block (composite layer), tied output
   defaults.c           "quick mode" defaults and the reasons for them
   internal.h           private helpers shared by the library sources
 cli/                   the `neuromz` program (may use POSIX/terminal code)
@@ -58,7 +66,10 @@ cli/                   the `neuromz` program (may use POSIX/terminal code)
   print_conv.c         conv/pool/flatten/dropout/normalize/Adam printers, heatmaps
   print_seq.c          a character rnn/lstm/gru unrolled through time: every gate,
                        gate heatmaps, BPTT, vanishing gradients along h and c
-  cmd_seq.c            `compare` (gradient survival side by side), `show gates`
+  print_attn.c         a Transformer's attention at one position with real
+                       numbers, heatmaps, head patterns, the residual stream
+  cmd_seq.c            `compare` (gradient survival side by side), `show gates`,
+                       `show attention`, `show params`
   line.c               dynamic line reader and tokenizer (no fixed buffers)
 tests/                 test_*.c (unit, gradient checks, convergence, I/O),
                        cli_smoke.sh (CLI abuse test); all run under sanitizers
@@ -66,7 +77,8 @@ examples/              xor.csv, xor_and.csv, iris.csv (+ 120/30 train/test
                        split), names_en.txt, names_ar.txt, DATASETS.md,
                        api_xor.c, run_examples.sh, benchmark.sh,
                        benchmark_mnist.sh,
-                       benchmark_gated.sh, bench_conv.c
+                       benchmark_gated.sh, benchmark_transformer.sh,
+                       bench_conv.c, bench_matmul.c
 scripts/get_mnist.sh   downloads MNIST into data/ (gitignored), verifies MD5
 scripts/get_text.sh    downloads Alice (Gutenberg #11) and Kalila wa-Dimna
                        (Arabic Wikisource, fixed revisions) into data/,
@@ -77,7 +89,8 @@ Makefile               lib, cli, test, sanitize, examples, data, bench, clean
 ```
 
 Build products go to `build/` (`build/libneuromz.a`, `build/neuromz`,
-`build/test_neuromz`); the sanitizer build goes to `build/san/`.
+`build/test_neuromz`); the sanitizer build goes to `build/san/`; `make
+OMP=1 …` builds with OpenMP into `build/omp/` (and `build/san-omp/`).
 
 The library never includes POSIX headers, never touches the terminal, never
 prints, and never calls `exit()`/`abort()`. The CLI is the only place allowed
@@ -246,6 +259,57 @@ Dropout is element-wise. Two things outside the layer files did change:
   one row per stream (`[B, …]`), which all three recurrent layers follow;
   it does not need to know what the row contains.
 
+### 3.2 The Transformer (implemented in phase 5)
+
+A decoder-only, GPT-style character model is a stack the engine already
+knows how to run:
+
+```
+embedding → posenc → block → block → … → layernorm → tied_output (or dense) → softmax
+```
+
+| layer | shapes | parameters | what it does |
+|---|---|---|---|
+| `posenc` | `[T, D]` → `[T, D]` | learned: `P [max_len, D]`; sinusoidal: none | `y_t = x_t + P[offset + t]`; `max_len` is the context window |
+| `layernorm` | any → same | `g`, `b` `[D]` | per row: `(x − μ)/√(σ² + ε) ⊙ g + b` |
+| `attention` | `[T, D]` → `[T, D]` | `W_qkv [D, 3E]`, `b_qkv`, `W_o [E, D]`, `b_o` | causal multi-head self-attention, E = heads × head_dim |
+| `ffn` | `[T, D]` → `[T, D]` | `W1 [D, F]`, `b1`, `W2 [F, D]`, `b2` | `act(x·W1 + b1)·W2 + b2`, act = gelu or relu |
+| `block` | `[T, D]` → `[T, D]` | the 12 of its parts, named `ln1.g`, `attn.W_qkv`, … | `h = x + drop(attn(LN1(x)))`, `y = h + drop(ffn(LN2(h)))` |
+| `tied_output` | `[T, D]` → `[T, V]` | `b [V]` (+ the embedding's `W`, shared) | `z = x·Eᵀ + b` |
+
+**The block is a composite layer** (decision 6 had planned residual wiring
+this way): it owns four ordinary layers (`layernorm`, `attention`,
+`layernorm`, `ffn`), calls them through their ops tables with its own
+buffers, adds the residual connections and exposes their parameters under
+prefixed names. Each part is also a layer of its own, so each has its own
+gradient check, and the CLI can build an attention or feed-forward layer
+alone. Trace events of the parts reach the net's callback with `detail` set
+to their role (`ln1`, `attn`, `ln2`, `ffn`); the block adds its own event
+with the residual stream (`x`, `attn_out`, `h`, `ffn_out`, `y`).
+
+**What changed outside the new layer files**, each the smallest change that
+does the job:
+
+* One optional vtable field, `bind(layer, layers, n, index)`, called when
+  the net is built (and after loading). Weight tying needs one layer to use
+  another layer's parameter; `setup` only sees shapes and `init_params`
+  only the next layer. The tied output finds the nearest embedding before
+  it and keeps pointers to its `W` and gradient. The engine's rule "zero
+  every gradient, then layers add" makes the shared gradient right with no
+  special case: the output adds `∂L/∂zᵀ·x` and the embedding adds its rows.
+* One layer flag, `NMZ_LAYER_NO_DECAY` (position tables), and AdamW in the
+  optimizer (decision 94).
+* A per-batch learning rate in the training loop (decision 95); per-epoch
+  schedules are unchanged.
+* `nmz_net_activation_grad` (∂L/∂ of any layer's output), a read-only
+  accessor like `nmz_net_activation`.
+* Gradcheck's kink detector also looks at the ReLU inside a feed-forward
+  layer (decision 45 extended).
+
+`net.c`'s forward/backward loops, the dataset/batching code, early
+stopping, clipping, the file format's structure and the trace mechanism did
+not change. The KV cache is the carried state of phase 3 (decision 98).
+
 ## 4. Trace system
 
 Goal: show every number the math produces, at near-zero cost when unused.
@@ -311,10 +375,16 @@ Item names are a fixed, documented vocabulary (tensors are `[B, …]`):
 | lstm (time_step t) | forward `x_t`, `h_prev`, `c_prev`, `i`, `f`, `g`, `o`, `c_t`, `h_t`; backward `dL/dh_out`, `dL/dh_next`, `dL/dh`, `dL/dc_next` (from step t+1, already × f_{t+1}), `dL/dc`, `dL/da` ([B,4H], the gate inputs), `dL/dh_prev`, `dL/dc_prev` (= dL/dc ⊙ f) |
 | gru (time_step −1) | forward `x`, `h0`, `W_x`, `W_h`, `b`, `gates` ([B,T,3H], order z r h~), `h`; backward as lstm |
 | gru (time_step t) | forward `x_t`, `h_prev`, `z`, `r`, `h~`, `h_t`; backward `dL/dh_out`, `dL/dh_next`, `dL/dh`, `dL/da` ([B,3H]), `dL/dh_direct` (= dL/dh ⊙ z, the direct path), `dL/dh_prev` |
+| posenc | forward `x`, `P` (the rows used, `[T, D]`), `y`; scalars `offset`, `max_len`; `detail` = learned / sinusoidal; backward `dL/dy`, `dL/dP`, `dL/dx` |
+| layernorm | forward `x`, `mean`, `rstd` (1/√(σ²+ε), per row), `x_hat`, `g`, `b`, `y`; scalar `epsilon`; backward `dL/dy`, `dL/dx_hat`, `dL/dg`, `dL/db`, `dL/dx` |
+| attention | forward `x`, `W_qkv`, `q` `[B,T,E]`, `k`, `v` `[B,Tk,E]` (Tk = cached + new positions), `scores` `[B,H,T,Tk]` (q·k/√d; 0 where masked), `weights` (softmax; 0 where masked), `context` `[B,T,E]`, `W_o`, `y`; scalars `heads`, `head_dim`, `past`; backward `dL/dy`, `dL/dcontext`, `dL/dscores`, `dL/dq`, `dL/dk`, `dL/dv`, `dL/dx` |
+| ffn | forward `x`, `W1`, `z`, `a`, `W2`, `y`; backward `dL/dy`, `dL/da`, then `dL/dz`, `dL/dx` |
+| block | forward `x`, `attn_out` (after dropout: what is added), `h`, `ffn_out`, `y`; scalar `dropout`; backward `dL/dy`, `dL/dh`, `dL/dx`. Its parts emit their own events with `detail` = `ln1`/`attn`/`ln2`/`ffn` |
+| tied_output | forward `x`, `W` (the embedding's matrix), `b`, `z`; scalar `embedding_layer`; backward `dL/dz`, `dL/dW` (the shared gradient so far), `dL/dx` |
 | clip (update phase, layer −1) | scalars `norm` (before), `max_norm`, `scale`; `detail` = clipped / unchanged |
 | dropout | forward `x`, `y`, `mask` (training only); backward `dL/dy`, `dL/dx`, `mask`; scalars `rate`, `training` |
 | update, SGD (per param) | `value` (before), `grad`, `velocity_prev`, `delta` (= new velocity); scalars `lr`, `momentum`; `detail` = param name |
-| update, Adam (per param) | `value` (before), `grad`, `m`, `v` (new moments), `m_hat`, `v_hat`, `delta`; scalars `lr`, `beta1`, `beta2`, `epsilon`, `t` |
+| update, Adam (per param) | `value` (before), `grad`, `m`, `v` (new moments), `m_hat`, `v_hat`, `delta`; scalars `lr`, `beta1`, `beta2`, `epsilon`, `t`; AdamW adds `weight_decay` (the λ applied to that parameter, 0 when excluded) |
 
 The CLI's `trace`/`step` commands turn these into tables with formulas, e.g.
 `z_j = Σ_i x_i·W_ij + b_j`. A future GUI consumes the same events (live via the
@@ -339,6 +409,11 @@ All names use the `nmz_` / `NMZ_` prefix. The full header is
                   nmz_layer_embedding(V, D, init); nmz_layer_rnn(H, init)
                   nmz_layer_lstm(H, init, forget_bias); nmz_layer_gru(H, init)
                   (NMZ_INIT_ORTHOGONAL: recurrent layers only; AUTO = it)
+                  nmz_layer_posenc(LEARNED|SINUSOIDAL, max_len); nmz_layer_layernorm()
+                  nmz_layer_attention(heads, head_dim); nmz_layer_ffn(F, act)
+                  nmz_layer_block(heads, head_dim, F, act, dropout)
+                  nmz_layer_tied_output(V); nmz_layer_has_attention
+                  nmz_net_context_length; NMZ_ACT_GELU
                   nmz_net_set_normalization(net, NMZ_NORM_ZSCORE|MINMAX|NONE)
                   nmz_net_add(net, layer)             /* takes ownership      */
                   nmz_net_add_dense(net, units, act, init) /* Dense+Activation */
@@ -352,18 +427,21 @@ All names use the `nmz_` / `NMZ_` prefix. The full header is
 /* compute */     nmz_net_forward(net, x, &y); nmz_net_predict(net, x, y);
                   nmz_net_backward(net, t, &loss); nmz_net_update(net, lr, mu);
                   nmz_net_preview_update(net, lr, mu) /* trace only, no change */
-                  nmz_net_optimizer_step(net, &opts, lr)  /* SGD or Adam */
+                  nmz_net_optimizer_step(net, &opts, lr)  /* SGD, Adam or AdamW */
                   nmz_net_optimizer_preview(net, &opts, lr)
                   nmz_net_forward_mode(net, x, training, &y)
                   nmz_net_compute_loss(net, t, &loss)
 /* text */        nmz_utf8_decode/encode, nmz_vocab_*, nmz_text_normalize (flags
                   NMZ_TEXT_STRIP_DIACRITICS | NMZ_TEXT_UNIFY_ALEF),
                   nmz_dataset_load_text, nmz_net_set_vocab/vocab,
-                  nmz_net_generate, nmz_net_generate_batch (row r = seed + r)
+                  nmz_net_generate, nmz_net_generate_batch (row r = seed + r;
+                  gen opts context, no_cache for Transformers)
 /* train */       nmz_train_opts (max_epochs, batch_size, learning_rate, momentum,
                   shuffle, target_loss, optimizer, beta1/beta2/epsilon,
-                  schedule/step_size/gamma/min_lr, on_epoch/on_batch callbacks);
-                  nmz_schedule_lr(&opts, epoch); nmz_net_fit_normalization
+                  schedule/step_size/gamma/min_lr, weight_decay/decay_all,
+                  warmup_steps, on_epoch/on_batch callbacks);
+                  nmz_schedule_lr(&opts, epoch); nmz_schedule_lr_step(&opts,
+                  batch, total, per_epoch); nmz_net_fit_normalization
                   nmz_net_train(net, ds, &opts, &result);
                   nmz_net_train_val(net, ds, val, &opts, &result) /* separate validation set */
                   nmz_net_evaluate(net, ds, &loss, &accuracy);
@@ -374,6 +452,9 @@ All names use the `nmz_` / `NMZ_` prefix. The full header is
 /* io */          nmz_net_save(net, path); nmz_net_save_ex(net, path, flags);
                   nmz_net_load(&net, path)
 /* trace */       nmz_net_set_trace; nmz_trace_recorder_*; nmz_trace_event_write_json
+/* inspect */     nmz_net_activation_grad(net, i); nmz_layer_param_decays(l, i, all)
+/* matmul */      nmz_matmul / nmz_matmul_naive(M, N, K, A, B, C, TRANS_A|TRANS_B|
+                  ACCUMULATE); nmz_threads()
 /* teaching */    nmz_net_gradcheck(net, x, t, eps, atol, rtol, &result);
                   nmz_net_gradcheck_mode(..., training, &result)
 ```
@@ -426,7 +507,9 @@ offset  field
         u32          layer count N, then per layer:
                        string   type ("dense", "activation", "conv2d",
                                 "maxpool2d", "flatten", "dropout",
-                                "embedding", "rnn", "lstm", "gru")
+                                "embedding", "rnn", "lstm", "gru",
+                                "posenc", "layernorm", "attention",
+                                "ffn", "block", "tied_output")
                        u32      config byte length, then config bytes
                        u32      parameter count P, then per parameter:
                                 string name, u32 rank, rank × u32 dims,
@@ -444,6 +527,10 @@ offset  field
                                   u32 carry_state, u32 seq_len, u32 patience
                      "text_norm": u32 NMZ_TEXT_* flags (written only when
                                   non-zero, after "vocab")
+                     "train_ext2": f32 weight_decay, u32 decay_all,
+                                  u32 warmup_steps (written only when one
+                                  is non-zero, so older models stay
+                                  byte-identical)
 end     u32          CRC-32 (IEEE, reflected 0xEDB88320) of every byte above
 ```
 
@@ -455,6 +542,11 @@ length, and the CRC. Unknown section tags are skipped, so later versions can
 add sections without breaking this reader. A version-2 file loads with SGD,
 a constant schedule, no normalization and no optimizer state
 (`tests/data/v2_xor.nmz` is a real phase-1 file used as a fixture).
+Phase 5 added values, not structure: optimizer 2 = AdamW (its section
+stores m and v like Adam), schedule 3 = warm-up + cosine, the layer types
+above and the `train_ext2` section. `tests/data/v3_phase3_names_ar.nmz` and
+`tests/data/v3_phase4_names_en.nmz` (written by the last phase-3 and
+phase-4 commits) must load and generate the same text.
 
 ---
 
@@ -492,6 +584,15 @@ draws a recurrent layer unrolled through time with every gate;
 `show gates` summarises the gates over a text; `compare A.nmz B.nmz …`
 puts the gradient survival of several trained models side by side;
 `train --val-file FILE` validates on a separate set.
+
+Transformers use the same style: `pos:learned:CTX` / `pos:sin:CTX`,
+`block[:heads=H][:head_dim=K][:ff=F][:gelu|relu][:dropout=R]`, the parts
+`attn[:heads=H][:head_dim=K]`, `ffn[:F][:gelu|relu]`, `ln`, and
+`vocab:tied`. Presets `names-gpt`, `char-gpt`, `arabic-gpt`. `trace --text
+T [--pos P] [--layer N] [--head H]` shows attention at one position with
+real numbers; `show attention` a heatmap and the head patterns over any
+text; `show params` the parameters per component; `generate --context N
+--no-cache`; `compare` accepts Transformers.
 
 ---
 
@@ -916,3 +1017,203 @@ Added in phase 4 (LSTM, GRU, gate traces, gradient survival, Arabic prose):
     Next-character prediction depends mostly on the last few characters;
     the long-range gradient the cell state preserves is visible in
     `compare` but worth little loss at this scale.
+
+Added in phase 5 (a decoder-only Transformer, AdamW, warm-up, the KV cache,
+attention traces):
+
+91. **Every Transformer building block is an ordinary layer, and the block
+    is a composite of them** (§3.2). The alternative, one monolithic
+    "transformer" layer, would hide LayerNorm, attention and the
+    feed-forward net from the gradient check and from the CLI. The engine
+    changes are listed in §3.2; each is an optional field, a flag or an
+    accessor that old layers and old files never see.
+92. **A blocked matrix product that is bit-identical to the naive loops.**
+    `nmz_matmul` keeps the sum order of `c_ij = Σ_k a_ik·b_kj` (increasing
+    k, one float addition at a time) and only changes which c_ij is worked
+    on when: blocks of B stay in the cache, and a 1 × 32 tile of C stays in
+    registers across a block of k (32 sums = 8 SSE registers; GCC
+    vectorises it at -O3 without -ffast-math). Transposed operands are
+    copied once into row order. Measured on one core of an i7-7500U
+    (`bench_matmul`, the shapes of a D = 64 model): 15–19 GFLOP/s against
+    1.7–1.9 for the naive loops (7–10×; 35× for the weight gradient, where
+    the naive loop reads A by columns). A 4 × 8 tile came out at 4–6
+    GFLOP/s (GCC kept it on the stack), the plain row loop at 11–12. Bit
+    equality is what makes the KV cache test exact (decision 98): a row of
+    C depends only on that row of A, never on how many rows are computed
+    together. The sums are in float, as in the im2col convolution
+    (decision 46); softmax, LayerNorm statistics and the attention scores'
+    dot products stay in double (decision 1).
+93. **Pre-LayerNorm blocks, `h = x + attn(LN(x))`, not post-LN
+    `h = LN(x + attn(x))`** (the original Transformer). With pre-LN the
+    residual path from the output back to the embedding is the identity:
+    `∂L/∂x = ∂L/∂h + (the sub-layer's contribution)` at every block, so
+    the gradient reaches the first block unchanged whatever the sub-layers
+    do. Post-LN puts a normalisation on that path at every block; its
+    gradients near the output are larger at initialisation and it needs a
+    careful warm-up to train at all (Xiong et al. 2020). GPT-2 and most
+    later models use pre-LN; the price is a final LayerNorm before the
+    output, because the last block's output is never normalised.
+94. **AdamW with decoupled weight decay, on weight matrices only by
+    default.** `Δ = −η·(m̂/(√v̂ + ε) + λ·w)`: the decay is not divided by
+    √v̂, so every weight shrinks at the same relative rate (Loshchilov &
+    Hutter 2019); L2 regularisation inside Adam's gradient would decay
+    weights with large gradients less. Excluded: vectors (biases,
+    LayerNorm gains and biases: decaying a gain towards 0 fights the
+    normalisation) and lookup tables (embedding rows and position rows are
+    selected, not multiplied; decay would pull rarely seen characters
+    towards 0 between their updates). The rule is generic — "rank ≥ 2 and
+    the layer is not discrete-input or NO_DECAY" — so no layer has to list
+    its parameters. `--decay-all` decays everything; λ defaults to 0.1 for
+    Transformers. Tested against a hand-computed step, with an unused
+    embedding row staying put.
+95. **Warm-up + cosine per batch** (decision 38 had deferred it). Batch s of
+    S: `η·s/W` during the W warm-up batches, then a cosine from η towards
+    η_min; the last batch uses a rate one step above η_min, so no update is
+    wasted at 0. W defaults to 5% of all updates (at least 10), computed by
+    `new` from the text's length, the batch size and the epochs. Early
+    Adam steps are noisy (v̂ rests on a few gradients), and in a fresh
+    Transformer large early steps can saturate the attention softmax; a
+    short ramp avoids both. The epoch schedules are unchanged.
+96. **GELU is the exact x·Φ(x) with `erf`**, not GPT-2's tanh
+    approximation: one libm call either way, and the formula a student
+    looks up. It is also an ordinary activation (`dense:64:gelu`).
+97. **Attention: q, k, v side by side in one W_qkv** (as the LSTM gates,
+    decision 71), biases on all projections, Glorot initialisation (each of
+    q, k, v is a D → E projection), scores scaled by 1/√d. The causal mask
+    is the loop bound `j ≤ t`, not an added −∞ matrix: masked weights are
+    exactly 0 and no gradient reaches the future (tested bit-exactly: the
+    output at t does not change when later inputs do). The weights
+    `[B, H, T, T]` are kept for backward and the trace: memory grows with
+    T² (16 × 4 × 128 × 128 floats = 4 MB for the presets).
+98. **The KV cache is the carried state of phase 3.** An attention layer's
+    state is `[B, Tc, 2E]` (keys | values of every position seen), the
+    position encoding's state is its offset; `nmz_net_reset_state`,
+    gradcheck's snapshot and the batch generator's row compaction work on
+    them unchanged. One new position per step costs one row of every layer
+    instead of the whole window. Because every query is computed by the same
+    code over the same keys, and the matrix product of a row does not
+    depend on the other rows (decision 92), cached generation is
+    bit-identical to recomputing the window at every step (`no_cache`,
+    tested with slides, small windows, long primes, items and batches).
+    Positions are absolute, so a cached key cannot be shifted when the text
+    outgrows the window: the window then slides by half (the newest
+    context/2 characters are re-encoded from position 0, one full pass),
+    and single steps continue — a sliding-by-one window would need a full
+    pass at every step. Training never carries a cache: an attention layer
+    refuses carry in training mode, and `new` refuses `--carry`.
+99. **Positions: learned (default) or sinusoidal.** Learned rows start at
+    N(0, 0.02²), small next to the character vectors (Glorot, ≈ 0.1), as in
+    GPT-2: position is a hint the model strengthens as it needs. The
+    sinusoidal table is the original Transformer's, fixed, with no
+    parameters. `max_len` is the context window (`nmz_net_context_length`);
+    longer inputs are an error, and generation slides (decision 98).
+100. **Weight tying through `bind`, one parameter for two uses.** `vocab:tied`
+    replaces the V × D output matrix by the embedding's transpose: 2 400 of
+    char-gpt's 32 043 weights would otherwise be a second table, and a
+    character's input vector and output direction are learned together
+    (Press & Wolf 2017). The shared matrix counts once, is saved once and
+    follows the embedding's AdamW rule (not decayed by default). Tested:
+    the output side adds into the embedding gradient (a row for a token
+    absent from the batch gets a gradient), save/load keeps the tie, and
+    the whole tied model passes the gradient check.
+101. **Head patterns are inferred from the measured weights, never from a
+    label table.** For every head and query (positions ≥ 2) the weight
+    falling on eight kinds of earlier position is summed — itself, the
+    previous character, two back, earlier copies of the same character,
+    the start of the current word, the last space or punctuation, the
+    first position, more than 16 back — and compared with what uniform
+    attention over the visible positions would give. The label is the kind
+    with the largest excess (≥ 10 points; otherwise "spread out"), shown
+    with its share, the uniform share, the runner-up, the span e^entropy
+    (how many positions the head effectively looks at) and the mean top
+    weight. Categories overlap (the previous character can be the word
+    start); the excess over uniform keeps short windows from flattering
+    "the first position".
+102. **The attention trace answers "which characters, and why" at one
+    position**: q, every k, the raw scores, the mask, the weights as bars
+    labelled with the characters, the three largest terms of q·k for the
+    winner, the weighted sum and its three largest contributions. Default
+    position: the last; default head: the one with the largest single
+    weight there (the most decisive). The residual stream table gives the
+    length of the vector before and after each block and of what attention
+    and the feed-forward net added. The gradient-path view and `compare`
+    use |∂L/∂x_t| at the embedding output from a backward pass with only
+    the last position's loss — the same measurement as for the recurrent
+    models, which for a Transformer follows the attention weights, not the
+    distance.
+103. **Arabic on heatmap axes: one column per character.** Terminals that
+    apply the Unicode bidirectional algorithm reverse runs of Arabic
+    letters and join them, which would scramble an axis. Each Arabic
+    letter is followed by ZWNJ (no joining) and LRM (left-to-right), each
+    line starts with LRM, combining marks get a dotted circle — all
+    zero-width, so the columns stay aligned in terminals with and without
+    bidi support. `--ascii` prints `.` for every non-ASCII character (and
+    `_`/`~` for space/newline); the row labels keep the position numbers.
+104. **Transformer training defaults**: no carried state (each window is
+    complete), shuffled windows, sequence length = the context window
+    (every position of a window is one prediction), clipping at 1 (Adam
+    with a warm-up rarely needs it; it guards the first steps), AdamW
+    λ = 0.1, warm-up + cosine to a tenth of the peak rate.
+105. **OpenMP is optional and changes no result.** `make OMP=1` splits the
+    row blocks of every matrix product and the (row, head) pairs of
+    attention among threads; each number is still computed by one thread
+    in the same order, so the OpenMP build gives bit-identical results
+    (all tests pass in both builds, including the KV-cache equality).
+    Small products stay single-threaded (an `if` clause), so generation
+    does not pay thread start-up per character. Measured on the 2-core /
+    4-thread i7-7500U: matrix products 1.1–2× faster with 2 threads, a
+    training epoch of a 113 k-parameter model 16.2 s → 11.2 s; 4 threads
+    (hyper-threads) were slower than 2 (14.6 s).
+106. **The Transformer presets match the phase-4 parameter budgets, and
+    their rates were swept.** `names-gpt` (24 085 weights) sits next to
+    `names-lstm` (25 029), `char-gpt` (32 043) next to `char-lstm`
+    (32 107): two blocks of 32 with 4 heads, tied output. The learning rate
+    was the decisive knob: on Alice the peak rate 0.001 / 0.002 / 0.003 /
+    0.005 / 0.01 / 0.02 gave validation loss 2.30 / 2.02 / 1.82 / 1.72 /
+    1.67 / 1.66 after 30 epochs (batch 16) — tiny Transformers want
+    large steps, ten times Adam's usual 0.001. Batch 8 (twice the updates
+    per epoch) gave 1.633, sinusoidal positions 1.637, dropout 0.1 1.70
+    (worse: at this size the model underfits). On the English names 0.01
+    with batch 16 was best (2.109; 0.003 2.166–2.176), and dropout 0.1
+    helped there (2.097), as that list is small enough to overfit within
+    20 epochs. Hence names-gpt: 0.01, batch 16, dropout 0.1; char-gpt: 0.01,
+    batch 8, no dropout.
+107. **A file written by the last phase-4 commit (348bcaf) is a fixture**:
+    an embed → lstm → dropout → gru → dense names model with Adam state. It
+    must load, keep its optimizer state and generate exactly the strings
+    the phase-4 library generated (recorded with the phase-4 build). All
+    phase-5 additions to the format are values and an optional section, so
+    the older files are read unchanged; files that use AdamW, the new
+    schedule or the new layers are not readable by a phase-4 build (as in
+    decision 74).
+108. **The results are reported as measured** (README "Results"): at equal
+    size the Transformer does not beat the recurrent models on these
+    texts — Alice 1.633 against the LSTM's 1.614 and the GRU's 1.580,
+    Kalila 1.940 against 1.951 and 1.938, the English names 2.097 against
+    2.028 / 2.056 — and it is clearly worse on the 504 Arabic names (2.77
+    against 2.46), where it overfits after nine epochs. It also trains
+    1.2–4× more slowly per run. With more capacity and dropout it wins on
+    Alice (213 k weights, 1.564); on Kalila the 162 k arabic-gpt (1.883)
+    stays slightly behind phase 4's two stacked LSTMs (130 k, 1.863). The
+    gradient path is the clear difference: 63 characters back the
+    Transformer receives 0.86% (Alice) / 0.29% (Kalila) of the last
+    prediction's gradient, against 7.1e-5 / 4.9e-7 along an LSTM's cell
+    state and 4.6e-7 / 1.8e-5 for the GRU. At character level and this
+    scale the next character depends mostly on the last few, so that reach
+    buys little loss — the same conclusion as decision 90, one step
+    further.
+109. **The heads found are reported, not hoped for.** Every trained model's
+    first layer turned into local n-gram detectors (previous character,
+    two back, itself, the start of the word), the clearest a head with
+    50–64% of its weight on the previous character; the deeper layers'
+    heads spread over 14–22 positions. A word-start head appeared in the
+    Arabic model's second layer (where Arabic attaches its prefixes). No
+    induction ("what came next last time") head formed at these sizes —
+    the pattern is measured for every head and stayed within 2 points of
+    uniform.
+110. **The benchmark is deterministic and was run once, sequentially**, so
+    the times are uncontended and the losses reproducible to every digit
+    (the LSTM and GRU reproduced phase 4 exactly). The exploration runs
+    behind the presets (learning rates, batch, dropout, positions, larger
+    configurations) were run two at a time and are reported in decisions
+    106 and README, not as benchmark times.
