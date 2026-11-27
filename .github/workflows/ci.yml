@@ -123,7 +123,7 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNMZ_CUDA=ON -DCMAKE_CUDA_COMPILER="$CUDA/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA"
       - name: Build
         run: cmake --build build -j 4
-      - name: Test (no GPU here: the CPU tests pass, auto falls back to the CPU, gpu tests skipped)
+      - name: "Test (no GPU here: the CPU tests pass, auto falls back to the CPU, gpu tests skipped)"
         run: ctest --test-dir build --output-on-failure
 
   cuda-windows:
@@ -157,5 +157,5 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNMZ_CUDA=ON "-DCMAKE_CUDA_COMPILER=$env:CUDA/bin/nvcc.exe" "-DCUDAToolkit_ROOT=$env:CUDA"
       - name: Build
         run: cmake --build build -j 4
-      - name: Test (no GPU here: the CPU tests pass, auto falls back to the CPU, gpu tests skipped)
+      - name: "Test (no GPU here: the CPU tests pass, auto falls back to the CPU, gpu tests skipped)"
         run: ctest --test-dir build --output-on-failure
