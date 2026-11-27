@@ -16,7 +16,9 @@ New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 $Utf8 = New-Object Text.UTF8Encoding($false, $true) # no BOM; throw on invalid bytes
 $Agent = "neuromz-get-text/1.0"
 
-function Sha-Of([string]$Path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLower() }
+# .NET, not Get-FileHash (a script function of Windows PowerShell 5.1 that
+# does not load when 5.1 is started from PowerShell 7)
+function Sha-Of([string]$Path) { Sha-OfBytes ([IO.File]::ReadAllBytes($Path)) }
 function Sha-OfBytes([byte[]]$Bytes) {
     $h = [Security.Cryptography.SHA256]::Create()
     ([BitConverter]::ToString($h.ComputeHash($Bytes)) -replace '-', '').ToLower()

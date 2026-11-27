@@ -137,8 +137,9 @@ endif()
 # Downloads go to data/ in the source tree (gitignored); sh on Unix-like
 # systems, PowerShell on Windows — both verify the same checksums.
 if(WIN32)
-  set(NMZ_DATA_MNIST powershell -NoProfile -ExecutionPolicy Bypass -File scripts/get_mnist.ps1 data)
-  set(NMZ_DATA_TEXT powershell -NoProfile -ExecutionPolicy Bypass -File scripts/get_text.ps1 data)
+  find_program(NMZ_POWERSHELL NAMES pwsh powershell) # PowerShell 7 if installed, else Windows PowerShell 5.1
+  set(NMZ_DATA_MNIST ${NMZ_POWERSHELL} -NoProfile -ExecutionPolicy Bypass -File scripts/get_mnist.ps1 data)
+  set(NMZ_DATA_TEXT ${NMZ_POWERSHELL} -NoProfile -ExecutionPolicy Bypass -File scripts/get_text.ps1 data)
 else()
   set(NMZ_DATA_MNIST sh scripts/get_mnist.sh data)
   set(NMZ_DATA_TEXT sh scripts/get_text.sh data)

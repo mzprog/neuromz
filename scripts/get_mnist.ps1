@@ -20,7 +20,13 @@ $Files = @(
 $Dir = [IO.Path]::GetFullPath((Join-Path (Get-Location) $Dir))
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
-function Hash-Of([string]$Path, [string]$Algo) { (Get-FileHash -Algorithm $Algo -LiteralPath $Path).Hash.ToLower() }
+# .NET, not Get-FileHash: that is a script function of Windows PowerShell 5.1
+# which does not load when 5.1 is started from PowerShell 7
+function Hash-Of([string]$Path, [string]$Algo) {
+    $h = if ($Algo -eq "MD5") { [Security.Cryptography.MD5]::Create() } else { [Security.Cryptography.SHA256]::Create() }
+    $s = [IO.File]::OpenRead($Path)
+    try { ([BitConverter]::ToString($h.ComputeHash($s)) -replace '-', '').ToLower() } finally { $s.Close(); $h.Dispose() }
+}
 
 foreach ($f in $Files) {
     $name, $md5, $sha = $f

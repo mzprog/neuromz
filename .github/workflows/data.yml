@@ -27,3 +27,8 @@ jobs:
       - run: cmake --build build --target data --config Release
       - run: cmake --build build --target data-text --config Release
       - run: cmake --build build --config Release -j 4; ctest --test-dir build -C Release -R example_mnist --output-on-failure
+      - name: The same scripts in Windows PowerShell 5.1 (a fresh directory)
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/get_mnist.ps1 data51
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/get_text.ps1 data51
