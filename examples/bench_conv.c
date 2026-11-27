@@ -1,7 +1,6 @@
 /* bench_conv.c — naive loops vs im2col for the mnist-cnn architecture.
- * Build/run: make bench   (needs `make data`). Prints seconds per epoch.
- * Usage: bench_conv [N_SAMPLES] */
-#define _POSIX_C_SOURCE 200809L
+ * Build/run: cmake --build build --target bench   (needs `--target data`).
+ * Prints seconds per epoch. Usage: bench_conv [N_SAMPLES] */
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -10,7 +9,7 @@
 
 static double now(void) {
     struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
+    timespec_get(&t, TIME_UTC); /* C11: every compiler, Windows included */
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }
 
