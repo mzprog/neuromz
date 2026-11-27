@@ -115,7 +115,7 @@ function Get-Kalila {
     $t = $Utf8.GetString($all.ToArray())
     if (-not $t.EndsWith("`n")) { $t += "`n" }
     do { $before = $t; $t = [regex]::Replace($t, '\{\{[^{}]*\}\}', '') } while ($t -ne $before)
-    $t = [regex]::Replace($t, '\[\[(ملف|صورة|تصنيف|File|Image|Category):[^\]\n]*\]\]', '')
+    $t = [regex]::Replace($t, '\[\[(\u0645\u0644\u0641|\u0635\u0648\u0631\u0629|\u062A\u0635\u0646\u064A\u0641|File|Image|Category):[^\]\n]*\]\]', '')
     $t = [regex]::Replace($t, '\[\[[^\]|\n]*\|', '')
     $t = [regex]::Replace($t, '\[\[|\]\]', '')
     $t = [regex]::Replace($t, "'''|''", '')

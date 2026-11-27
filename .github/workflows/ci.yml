@@ -26,6 +26,8 @@ jobs:
             openmp: ON # Ubuntu's clang needs libomp-dev; GCC covers the OpenMP build
     steps:
       - uses: actions/checkout@v5
+      - name: PowerShell scripts are ASCII-only (Windows PowerShell 5.1 reads them in the ANSI code page)
+        run: "! grep -nP '[^\\x00-\\x7F]' scripts/*.ps1"
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.cc }} -DNMZ_OPENMP=${{ matrix.openmp }}
       - name: Build
