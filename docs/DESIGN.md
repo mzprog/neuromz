@@ -16,7 +16,7 @@ init, gate traces, gradient-survival comparison, Arabic prose) added
 decisions 71–90; phase 5 (a decoder-only Transformer, AdamW, warm-up,
 the blocked matrix product, the KV cache, attention traces) added
 decisions 91–110. Release 2.1 (device backends: the backend layer, the
-CPU and CUDA backends) added §11 and decisions 127–.
+CPU and CUDA backends) added §11 and decisions 127–153.
 
 ---
 
@@ -1510,6 +1510,209 @@ attention traces):
     layer emits the same events, with the same numbers, after the loop.
     The fake device's traced numbers equal cpu-generic's.
 
+### Release 2.1, Steps B and C: the CUDA backend and its tests
+
+138. **The CUDA backend is a build option and one CUDA file behind a C
+    ABI.** `-DNMZ_CUDA=ON` (off by default) compiles
+    `src/cuda/backend_cuda.cu` with nvcc. The C sources see one function,
+    `nmz__cuda_backend()`, declared `extern "C"`, which returns the filled
+    table; nothing of CUDA appears in a public header (`nmz_device_info` is
+    a plain struct), so a program using the library is still plain C and
+    needs no CUDA header. The file is CUDA C++ only as far as nvcc needs it
+    (kernel launches, `__global__`); it uses no C++ library. Rejected: the
+    driver API with PTX loaded by hand (no `<<< >>>`, a lot of loading code
+    for nothing) and NVRTC (a JIT compiler as a run-time dependency).
+139. **Architectures: the building machine's GPU by default, machine code
+    plus PTX for each listed one.** `NMZ_CUDA_ARCHITECTURES` defaults to
+    what `nvidia-smi --query-gpu=compute_cap` reports, else 75 (Turing,
+    the oldest architecture CUDA 13 compiles for). Every entry is compiled
+    to SASS and PTX, so a newer GPU runs the library through the driver's
+    JIT (a slower first start, then full speed). A binary for others:
+    `-DNMZ_CUDA_ARCHITECTURES="75;86;89;120"` (Turing, Ampere, Ada,
+    consumer Blackwell; add 80 and 90 for data-centre parts). The lowest
+    entry is compiled in as `NMZ_CUDA_MIN_CC`; `init` refuses an older GPU
+    with a message naming the option, and launches a probe kernel, so a GPU
+    the binary has no code for is found at selection rather than in the
+    first training step.
+140. **A CUDA build starts on any machine, and selection never crashes.**
+    The CUDA runtime is linked statically (it finds the driver at run time
+    and reports a missing or old one as an error code); cuBLAS is loaded
+    with `LoadLibrary`/`dlopen` when the backend initialises
+    (`cublas64_13.dll` / `libcublas.so.13`, the toolkit's major version;
+    on Windows also from `%CUDA_PATH%\bin\x64` and `\bin`), so the program
+    has no load-time dependency on the driver or on cuBLAS. The few cuBLAS
+    declarations used (a handle, an operation enum, a status, three
+    functions) are written out instead of including `cublas_v2.h`, so
+    building needs only nvcc and the runtime — the CI jobs install exactly
+    those. Initialisation is lazy (the first `select` or `query` of
+    "cuda") and checks, in order: driver present, driver new enough, a
+    device, its compute capability, the probe kernel, cuBLAS, then creates
+    the stream, cuBLAS handle and pinned buffers. Any failure becomes the
+    reason ("no NVIDIA driver is installed", "the NVIDIA driver supports
+    CUDA 12.4, this library needs 13.0: update the driver", "the cuBLAS
+    library (cublas64_13.dll) was not found: …"), is remembered, and is
+    what "cuda" fails with and what "auto" prints when it falls back.
+    Tested on the CI runners, which have no GPU: the CUDA builds pass the
+    CPU suite, the `gpu` tests report "skipped" (exit 77), and
+    `unit_no_gpu` (the same build with `CUDA_VISIBLE_DEVICES=-1`) checks
+    the fallback and its note.
+141. **The CUDA backend is tested against the CPU at three levels, with
+    stated tolerances.** `test_gpu` (ctest `gpu`, label `gpu`): every
+    required op on random inputs and many shapes — sizes 1, odd, prime,
+    above the block and warp sizes, row strides, every GEMM flag; every
+    layer type's forward and backward against the CPU; the gradient checks
+    of every layer type on the GPU; traces (the same events, the values
+    within tolerance); the KV cache; moving nets between devices; two GPU
+    runs giving the same bits; running out of memory. `test_gpu --parity`
+    (ctest `gpu_parity`): XOR, Iris, the MNIST CNN, the names RNN, the
+    Alice LSTM and a small Transformer trained on both devices reach the
+    same quality. Without a usable GPU both exit 77 and CTest reports them
+    skipped. Tolerances, as largest |gpu − cpu| over largest |cpu| of a
+    result: 0 for data movement, element-wise +, ×, gathers, one-hot,
+    im2col, pooling, normalisation and counts (the same float operations
+    in the same order); 1e-6 for reductions and the optimizers (both sum
+    in double, in different orders); 2e-6 for transcendental functions,
+    softmax, losses, LayerNorm and the recurrent cells (CUDA's `expf`,
+    `tanhf`, `erff` are float functions within 2 ulp; the CPU computes in
+    double and rounds once) and col2im (another summation order); 1e-5 for
+    matrix products and attention (cuBLAS accumulates in its own order and
+    blocking); 1e-4 for whole layers and models, where all of these
+    compound. The largest errors measured: GEMM 1.2·10⁻⁶, GELU backward
+    3.4·10⁻⁷, attention backward 3·10⁻⁷, any layer ≤ 1·10⁻⁶. Results:
+    15 tests and 1369 checks pass; parity in the README.
+142. **The library caps its device memory at what was free when the device
+    was initialised.** On Windows the display driver (WDDM) lets
+    `cudaMalloc` succeed far beyond the card — 16 GB on this 6 GB GTX 1660
+    Ti — by paging device memory to the host, and training then slows
+    to a crawl instead of failing. So `alloc` refuses
+    beyond a cap with `NMZ_ERR_NOMEM` and a message (what was needed, what
+    is held, the cap, "try a smaller batch size"); the cap defaults to the
+    free memory at initialisation and is changed with
+    `nmz_backend_memory_limit(bytes)` or `NMZ_CUDA_MEMORY` (MiB) at start.
+    Every allocation is recorded in a hash table (pointer → size), which
+    gives `mem_used` and `mem_peak` in `nmz_device_info`; these are the
+    VRAM numbers in the README. On Linux the cap only makes the error
+    message friendlier: the driver fails by itself.
+143. **One stream, no waiting until a number is needed.** Kernels, cuBLAS
+    calls and copies go to one stream, in order. An op that produces a
+    scalar for the host (a loss, a squared norm, a count) queues a copy
+    into pinned host memory and records where the value belongs; the value
+    is valid after `sync`, which the engine calls when it reads one (up to
+    64 may be pending; a 65th syncs first). A training step therefore
+    waits for the batch loss and, with clipping, the gradient norm, and
+    nothing else; evaluation queues the results of all its chunks and
+    waits once per data set.
+144. **GEMMs in cuBLAS, everything else in the library's own kernels, all
+    of it deterministic.** Row-major products are cuBLAS's column-major
+    products with the operands swapped (Cᵀ = Bᵀ·Aᵀ), in FP32 (Turing has
+    no TF32 or BF16 tensor cores to tempt anyone). Reductions are two
+    passes in double: each block writes a partial sum, one block adds the
+    partials in a fixed order, so the same run gives the same bits every
+    time. Atomics, whose order varies, appear in two places only: the
+    embedding gradient when vocabulary × tokens exceeds 2²⁴ (a
+    deterministic version would need a sort; for the models here the
+    deterministic kernel runs), and the positional-encoding gradient when
+    the rows of a batch start at different positions (generation, not
+    training). The test of decision 141 checks that two GPU trainings
+    write identical model files.
+145. **No fused multiply-add in the kernels (`--fmad=false`)**, as on the
+    CPU (decision 120). The optimizer updates then round exactly as the
+    CPU's (the op tests find the momentum step bit-identical and Adam,
+    computed in double on both, within 1e-6), and the element-wise ops differ
+    from the CPU only where CUDA's math library does. cuBLAS keeps its own
+    FMA, which is why products get 1e-5.
+146. **On CUDA a recurrent sequence is one kernel launch.** The
+    composition (decision 127) launches a recurrent GEMM and one to three
+    cell kernels per time step; at the sizes of the presets (H = 64,
+    batches of 32) each launch does almost nothing and costs 10–15 µs on
+    Windows, so the Alice LSTM spent its time in launches. The CUDA
+    backend implements the fused sequence kernels: the input product of
+    all steps is one cuBLAS GEMM, then one thread block per batch row walks
+    all T steps with its state in shared memory, reading W_h from global
+    memory (cached in L2), and the backward pass is the mirror image with
+    the weight gradients as single GEMMs after the loop. A block holds at
+    most 1024 threads, one per gate unit, so the kernels serve RNN with
+    H ≤ 1024, GRU with H ≤ 512 and LSTM with H ≤ 256. For larger layers
+    they decline (`NMZ_ERR_UNSUPPORTED` before touching anything, a rule
+    added to the table's contract) and the layer composes the step-by-step
+    version, where the per-step GEMMs are large enough to keep the GPU
+    busy. Both paths are tested on the GPU.
+147. **Attention uses batched cuBLAS products for training, warp kernels
+    for generation.** For query blocks of 16 positions or more, for each
+    batch row, the scores of all heads are one strided batched GEMM
+    (S = Q·Kᵀ/√d over all keys), a kernel applies the causal softmax
+    (zeroing the future), and a second batched GEMM gives P·V; the
+    backward pass is four batched GEMMs around a softmax-backward kernel.
+    The masked half of S is computed and discarded. Each batched call
+    covers one head for all rows (or one row for all heads, when there are
+    more heads than rows): a first version made one call per row, which
+    at batch 32 meant about 190 launches per layer and step and made the
+    small models slower than with the warp kernels. Measured against
+    warp kernels for every length: about even for the small models (0.53
+    vs 0.47 s per epoch for the 32k Transformer at T = 128, 1.04 vs 1.10 s
+    for the 213k one) and 1.7× faster for the 25M one at T = 256 (8.9 vs
+    15.2 s of updates per epoch), so the products start at T = 16. Short
+    blocks — generation with the KV cache, one new position at a time —
+    run one warp per query row in a single launch.
+148. **Dropout masks on a device come from a counter-based generator keyed
+    by the net's PRNG.** Each mask takes two numbers from the net's PCG32
+    and hashes key + element index (SplitMix64's finaliser) in parallel,
+    so a run on the GPU is reproducible and the net's random stream
+    advances the same way per mask; but the masks are not the CPU's (which
+    draws one PCG32 number per element, in order). With dropout the two
+    devices therefore train along different random paths of the same
+    distribution: parity compares quality, not bits.
+149. **On a device, evaluation chunks are no larger than the training
+    batch.** A host evaluation runs 64 rows at a time; on the GPU the
+    largest Transformer trained at batch 16 and then ran out of memory in
+    evaluation, because 64 rows of activations (attention weights grow
+    with T²) did not fit beside the optimizer state. Evaluation now uses at
+    most the training batch, so what trained also evaluates.
+150. **Model files do not know the device.** Saving brings the parameters
+    and optimizer moments to the host; loading creates host tensors that
+    move to a device on first use. Tested: a model trained on the GPU,
+    saved, loaded on the CPU, predicts what the GPU predicts (within 1e-5)
+    and continues training on the CPU from the GPU's optimizer state; the
+    same loaded net, moved to the GPU, predicts the same. Loading never
+    touches a device, so a CPU-trained file is the same case.
+151. **CI compiles the CUDA backend on Linux (GCC) and Windows (MSVC,
+    Ninja)** with CUDA 13.5's redistributable archives (nvcc, NVVM, the
+    runtime, CCCL headers — no installer), with warnings as errors in the
+    CUDA code too, and runs the whole test suite there without a GPU
+    (decision 140). The GPU tests run on the one machine with a GPU, before
+    a release.
+152. **What the GPU is worth here, measured, including where it is not.**
+    Intel Core i5-8500 (6 cores) and a GTX 1660 Ti (6 GB, Turing, no
+    tensor cores), Windows 11, MSVC 19.52, CUDA 13.5, driver 621.40;
+    `bench_device`, time per epoch (updates and the evaluation of the
+    training and validation sets), README "On the GPU". The GPU is 10× on
+    the MNIST CNN (24.3 → 2.35 s), 9.5× on the Alice LSTM (6.67 → 0.70 s),
+    16× on the 32k Transformer (8.55 → 0.54 s; 7.6× against 6 OpenMP
+    threads), 33× on the 213k one (33.9 → 1.04 s; 13× against 6 threads),
+    and about 240× on a 25M-parameter Transformer (8 blocks of 512,
+    context 256, batch 16, 3.5 GB of the 6 GB at its peak): 8.9 s of
+    updates per epoch against an extrapolated 36 min on one core and
+    8.7 min on six. Where it does not help: XOR trains in 0.00 s on the CPU
+    and 0.15 s on the GPU, Iris in 0.01 s and 0.42 s — the device's start
+    and one launch per op cost more than the arithmetic of such nets, so
+    they belong on the CPU (the library's default; "auto" is a choice).
+    The small models are launch-bound on the GPU too: the LSTM's 0.70 s
+    epoch is 0.12 s of updates and 0.58 s of evaluation, which runs the
+    16 text streams step by step (the fused kernel serves training; the
+    evaluation passes are short and many), and the 32k Transformer's
+    0.54 s is near the floor of a few hundred launches per batch at
+    10–15 µs each under WDDM. OpenMP speeds up only what goes through the
+    blocked product and the attention heads: the Transformers (2.1–2.5×
+    on six threads) but not the CNN or the LSTM, whose CPU kernels are
+    single-threaded loops.
+153. **Release 2.1.0 for both repositories.** A minor version: everything
+    of 2.0 still compiles and behaves the same on the CPU, and the
+    additions are the device API, `neuromz_backend.h` and the optional
+    layer-table entry. `nmz_tensor`, `nmz_ctx` and `nmz_layer_ops` grew
+    by a pointer each, so code built against 2.0 must be recompiled (the
+    library is a static library by default, which a program rebuilds with
+    it anyway). The CLI 2.1.0 pins `v2.1.0` and adds `--device`.
+
 ---
 
 ## 11. Device backends (release 2.1)
@@ -1578,3 +1781,35 @@ device, and per batch only the loss (and the clipping norm) come back.
    training parity. The engine, the layers and the file format need no
    change; `nmz_backend_register` also adds a backend from outside the
    library (the test suite's fake device is one).
+
+### 11.7 The CUDA backend
+
+```
+ nmz__cuda_backend()            src/cuda/backend_cuda.cu, behind extern "C"
+   init      driver → device → compute capability → probe kernel →
+             cuBLAS (loaded at run time) → stream, handle, pinned slots
+   memory    cudaMalloc under a cap, every block in a table (used, peak)
+   GEMM      cuBLAS SGEMM; attention: strided batched SGEMM per batch row
+   the rest  grid-stride kernels (element-wise), one warp per row
+             (softmax, LayerNorm, losses, short attention), two-pass
+             double reductions, one block per row for whole sequences
+             (rnn, lstm, gru)
+   scalars   queued into pinned memory, valid after sync
+```
+
+Building and choosing it: `-DNMZ_CUDA=ON`, `NMZ_CUDA_ARCHITECTURES`
+(decision 139), `nmz_backend_select("cuda" | "auto")`. What runs where:
+the dense and convolution layers compose cuBLAS products with bias and
+activation kernels (im2col over the whole batch and one GEMM per pass);
+the recurrent layers use the fused sequence kernels (decision 146);
+attention uses batched products for training and warp kernels for
+generation (decision 147); the optimizers, clipping, normalisation and the
+training loop's gathers are kernels; nothing in an epoch moves to the host
+but the batch loss (decision 136). Tests: decision 141. Memory: decision
+142. Determinism: decision 144.
+
+Deferred (not in 2.1): half precision and tensor cores (the GTX 1660 Ti
+has none); several GPUs; a persistent kernel for whole recurrent stacks;
+cuDNN (another large run-time dependency, for convolutions that are
+already cuBLAS-bound here); CUDA graphs to cut the remaining launch cost of
+short batches.
