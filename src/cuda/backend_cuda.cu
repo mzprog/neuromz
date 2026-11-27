@@ -25,7 +25,6 @@
  *     an allocation that fails says what was asked, what is held and what
  *     is free, and to try a smaller batch. */
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
 
 #include <math.h>
 #include <stdint.h>
@@ -43,6 +42,23 @@
 #include "neuromz_backend.h"
 
 extern "C" nmz_status nmz__op_failed(void);
+
+/* The few cuBLAS declarations used here (stable ABI values from
+ * cublas_api.h), so building needs only nvcc and the CUDA runtime: the
+ * library itself is loaded at run time (cu_init). Its major version is the
+ * toolkit's (cublas64_13.dll / libcublas.so.13 for CUDA 13). */
+typedef struct nmz_cublas_context *cublasHandle_t;
+typedef int cublasStatus_t;
+typedef int cublasOperation_t;
+#define CUBLAS_STATUS_SUCCESS 0
+#define CUBLAS_OP_N 0
+#define CUBLAS_OP_T 1
+#ifdef _WIN32
+#define CUBLASWINAPI __stdcall
+#else
+#define CUBLASWINAPI
+#endif
+#define CUBLAS_VER_MAJOR (CUDART_VERSION / 1000)
 
 #ifndef NMZ_CUDA_MIN_CC
 #define NMZ_CUDA_MIN_CC 75 /* the lowest architecture compiled (CMake passes the real value) */
@@ -1968,13 +1984,16 @@ static void *symbol(void *lib, const char *name) {
 #endif
 }
 
-#define STR_(x) #x
-#define STR(x) STR_(x)
+static const char *cublas_lib(void) {
+    static char name[32];
 #ifdef _WIN32
-#define CUBLAS_LIB "cublas64_" STR(CUBLAS_VER_MAJOR) ".dll"
+    snprintf(name, sizeof name, "cublas64_%d.dll", CUBLAS_VER_MAJOR);
 #else
-#define CUBLAS_LIB "libcublas.so." STR(CUBLAS_VER_MAJOR)
+    snprintf(name, sizeof name, "libcublas.so.%d", CUBLAS_VER_MAJOR);
 #endif
+    return name;
+}
+#define CUBLAS_LIB cublas_lib()
 
 static nmz_status cu_init(const nmz_backend *be, char *why, size_t n) {
     int count = 0, *probe = NULL, got = 0, runtime = 0, driver = 0;
