@@ -1217,3 +1217,80 @@ attention traces):
     behind the presets (learning rates, batch, dropout, positions, larger
     configurations) were run two at a time and are reported in decisions
     106 and README, not as benchmark times.
+
+### Phase 6: first public release (v2.0.0)
+
+111. **A model remembers what it was trained on.** `train FILE` stores the
+    absolute path of FILE and, for line-per-item text (names), the set of
+    training items as sorted 64-bit FNV-1a hashes (`nmz_net_set_data_source`,
+    a new optional `data_source` section of the file). `generate --new-only`
+    and the "(in the training data)" note then work without `--data`, and
+    `show gates` / `show attention` without a text use a 2000-character
+    excerpt of the file. Hashes rather than the items keep a model file
+    small (8 bytes per name) and do not copy the data into it; a false
+    "known" needs a 64-bit collision (about 10⁻¹¹ for 20 000 names). Items
+    are compared after the model's own text normalisation and with the
+    `--prime` included (before, a primed name was compared without its
+    prime and never matched). `--data FILE` still overrides. Older readers
+    skip the section (decision 13), and older files load with no source.
+112. **`--optimizer adamw` chosen by hand gets Adam's learning rate (0.001)
+    and weight decay 0.01** (PyTorch's default) instead of SGD's 0.5 and no
+    decay; the Transformer defaults (0.1, decision 94) are unchanged.
+113. **The operating system is reached from two places only.**
+    `cli/platform.c` holds everything the program needs: terminal detection
+    (`isatty` / `_isatty`), terminal width, UTF-8 console output and UTF-8
+    `argv` on Windows (`SetConsoleOutputCP(CP_UTF8)`, `CommandLineToArgvW`),
+    file names (`_wfopen`), absolute paths (`realpath` / `_wfullpath`) and a
+    monotonic clock (`clock_gettime` / `QueryPerformanceCounter`). The
+    library stays plain C11 except for file names: on Windows `fopen` reads
+    a `char *` name in the ANSI code page, so `nmz__fopen`, `nmz__rename`
+    and `nmz__remove` convert the UTF-8 name to UTF-16 with the library's
+    own decoder and call `_wfopen` / `_wrename` / `_wremove` — no
+    `<windows.h>` in the library. Names are UTF-8 on every system.
+114. **CMake 3.21 replaces the Makefile.** 3.21 is the first version that
+    passes `/std:c11` to MSVC; everything else (presets, FetchContent,
+    `PROJECT_IS_TOP_LEVEL`) is older. The old `make` targets are CMake
+    targets: `test` (CTest; a `build` fixture brings the tree up to date
+    first, so `--target test` never runs stale binaries), `sanitize` (a
+    second tree `build-san/` with ASan + UBSan, then its tests), `bench`,
+    `data`, `data-text`. OpenMP is the option `NMZ_OPENMP` on every compiler
+    (a compiler without OpenMP gives a warning and a single-threaded
+    build); sanitizers are `NMZ_SANITIZE`.
+115. **One warning set per compiler family, errors on by default.**
+    GCC/Clang: the Makefile's set plus `-Wvla` (MSVC has no VLAs; the code
+    had none). MSVC: `/W4 /WX /utf-8` without C4244/C4267/C4305, the
+    implicit-narrowing warnings that GCC and Clang only give under
+    `-Wconversion`, which was never enabled; `_CRT_SECURE_NO_WARNINGS`
+    because the "secure" `fopen_s` family is not portable C11. `/utf-8`
+    because the CLI's sources contain Greek letters and Arabic.
+116. **The data scripts exist twice, with the same checksums.**
+    `get_mnist.sh` / `get_text.sh` for Unix-like systems, `get_mnist.ps1` /
+    `get_text.ps1` for Windows (PowerShell 5.1 and 7, built-in cmdlets and
+    .NET only); `--target data` picks the right one. Both now also check
+    the SHA-256 of what they produce (the decompressed IDX files, the
+    prepared `alice.txt` and `kalila.txt`), so a different awk or a
+    different port cannot silently change the data the results in README
+    were measured on. The PowerShell port of `strip_wikitext.awk` was
+    checked against the awk output with a regex port in Python (same
+    backtracking semantics as .NET); it runs in the manual `data` workflow,
+    not in CI.
+117. **Training output says what each number is.** The epoch line labels
+    its accuracy `train accuracy` or `val accuracy` (with validation the
+    column was the validation accuracy, while the final line reported the
+    training accuracy — the "37.7% vs 33.5%" of manual testing). A note
+    under the header says that epoch lines re-evaluate whole sets after
+    the epoch's updates and that the live bar shows the last batch's loss;
+    the final line says "on the training set" and, after early stopping,
+    "re-evaluated with the kept weights". The live bar is never wider than
+    the terminal and is erased exactly (its drawn width is remembered):
+    an 83-column bar erased with 79 spaces left "…0.0s     .0s" behind.
+    The training header prints only the active optimizer's settings.
+118. **Weight-update tables show the 8 largest |Δ| by default**, largest
+    first, after one summary line per matrix (count, mean |Δ|, max |Δ| and
+    where); `--full` lists every weight in index order. Δ (an update) is
+    now distinct from δ (a backpropagated error) in these tables.
+119. **Preset descriptions quote measured times** (one core of the
+    i7-7500U, two epochs each): mnist-cnn ~30 s per epoch (the "about a
+    minute (naive convolution)" predates im2col), mnist-mlp ~20 s, names /
+    names-lstm ~2 s, names-gpt ~1.5 s, char-rnn / char-lstm / char-gpt
+    ~9–10 s, arabic-text ~1 min, arabic-gpt ~50 s.

@@ -1,0 +1,29 @@
+# The dataset scripts, run by hand (Actions → data → Run workflow): they
+# download about 75 MB from public mirrors, so they are not part of CI.
+# Each job runs the platform's script; both check the same SHA-256 sums,
+# then the MNIST regression runs on the downloaded data.
+name: data
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build --target data
+      - run: cmake --build build --target data-text
+      - run: cmake --build build -j 4 && ctest --test-dir build -R example_mnist --output-on-failure
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+      - run: cmake --build build --target data --config Release
+      - run: cmake --build build --target data-text --config Release
+      - run: cmake --build build --config Release -j 4; ctest --test-dir build -C Release -R example_mnist --output-on-failure
