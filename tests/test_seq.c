@@ -540,6 +540,7 @@ static void test_generate_arabic(void) {
             nl += cp[i] == '\n';
         }
         CHECK(strlen(txt) > n); /* multi-byte */
+        CHECK(nl < n);           /* letters, not only ends of names */
         free(cp);
         free(txt);
     }

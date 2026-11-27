@@ -23,7 +23,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+      - run: cmake -S . -B build
       - run: cmake --build build --target data --config Release
       - run: cmake --build build --target data-text --config Release
       - run: cmake --build build --config Release -j 4; ctest --test-dir build -C Release -R example_mnist --output-on-failure
