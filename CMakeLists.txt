@@ -112,7 +112,7 @@ endif()
 
 # ---------------------------------------------------------- examples, bench
 if(NMZ_BUILD_EXAMPLES)
-  foreach(ex api_xor api_mnist bench_conv bench_matmul)
+  foreach(ex api_xor api_mnist bench_conv bench_matmul bench_device)
     add_executable(${ex} examples/${ex}.c)
     set_target_properties(${ex} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
     target_link_libraries(${ex} PRIVATE neuromz nmz_warnings)
