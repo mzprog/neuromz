@@ -1,7 +1,7 @@
 /* bench_matmul.c — the blocked matrix product against the naive loops, on
  * the shapes a small character Transformer uses (rows = batch x context,
  * D = 64, feed-forward 256). Prints milliseconds and GFLOP/s.
- * Usage: build/bench_matmul [repeats]   (make bench runs it) */
+ * Usage: build/bench_matmul [repeats]   (--target bench runs it) */
 #include "neuromz.h"
 
 #include <stdio.h>

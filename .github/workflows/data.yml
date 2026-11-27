@@ -13,7 +13,7 @@ jobs:
   unix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build --target data
       - run: cmake --build build --target data-text
@@ -22,7 +22,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: cmake -S . -B build
       - run: cmake --build build --target data --config Release
       - run: cmake --build build --target data-text --config Release

@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
     nmz_dataset *ds = NULL;
     double times[2], losses[2];
     if (nmz_dataset_load_idx(&ds, "data/train-images-idx3-ubyte", "data/train-labels-idx1-ubyte", n) != NMZ_OK) {
-        fprintf(stderr, "%s (run make data)\n", nmz_last_error());
+        fprintf(stderr, "%s (cmake --build build --target data)\n", nmz_last_error());
         return 1;
     }
     for (a = 0; a < 2; a++) {

@@ -25,7 +25,7 @@ jobs:
           - cc: clang
             openmp: ON # Ubuntu's clang needs libomp-dev; GCC covers the OpenMP build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.cc }} -DNMZ_OPENMP=${{ matrix.openmp }}
       - name: Build
@@ -47,7 +47,7 @@ jobs:
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DNMZ_SANITIZE=ON -DCMAKE_C_COMPILER=${{ matrix.cc }}
       - name: Build
@@ -63,7 +63,7 @@ jobs:
       matrix:
         openmp: [OFF, ON]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         run: cmake -S . -B build -DNMZ_OPENMP=${{ matrix.openmp }} # the newest Visual Studio, x64
       - name: Build
@@ -82,7 +82,7 @@ jobs:
     name: macOS Apple Clang
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build

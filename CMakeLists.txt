@@ -9,7 +9,7 @@
 #   cmake --build build --target data-text download the texts (Alice; Kalila wa-Dimna) into data/
 #   cmake --install build --prefix DIR     headers, library and a CMake package: find_package(neuromz)
 #
-# Options: NMZ_OPENMP (multi-threaded matmul/attention, off), NMZ_WERROR (on),
+# Options: NMZ_OPENMP (multi-threaded matmul/attention, off), NMZ_WERROR (on when top-level),
 # NMZ_SANITIZE (ASan + UBSan, off), NMZ_BUILD_TESTS / NMZ_BUILD_EXAMPLES (on
 # when this is the top-level project).
 #
@@ -20,7 +20,7 @@ project(neuromz VERSION 2.0.0 DESCRIPTION "Educational neural-network engine" LA
 
 set(NMZ_TOP ${PROJECT_IS_TOP_LEVEL})
 option(NMZ_OPENMP "Multi-threaded matrix products and attention heads (OpenMP)" OFF)
-option(NMZ_WERROR "Treat compiler warnings as errors" ON)
+option(NMZ_WERROR "Treat compiler warnings as errors (default: only when this is the top-level project)" ${NMZ_TOP})
 option(NMZ_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer (GCC/Clang)" OFF)
 option(NMZ_BUILD_TESTS "Build the test suite" ${NMZ_TOP})
 option(NMZ_BUILD_EXAMPLES "Build the C examples and benchmarks" ${NMZ_TOP})
@@ -131,22 +131,6 @@ if(NMZ_BUILD_EXAMPLES)
       WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
       USES_TERMINAL
       COMMENT "Benchmarks of the C API (slow)")
-endif()
-
-# ---------------------------------------------------- the CLI (temporary)
-if(NMZ_TOP AND EXISTS ${PROJECT_SOURCE_DIR}/cli/main.c)
-  file(GLOB NMZ_CLI_SOURCES ${PROJECT_SOURCE_DIR}/cli/*.c)
-  add_executable(neuromz_cli ${NMZ_CLI_SOURCES})
-  set_target_properties(neuromz_cli PROPERTIES OUTPUT_NAME neuromz C_STANDARD 11 C_STANDARD_REQUIRED ON
-                                               C_EXTENSIONS OFF)
-  target_link_libraries(neuromz_cli PRIVATE neuromz nmz_warnings)
-  if(WIN32)
-    target_link_libraries(neuromz_cli PRIVATE shell32)
-  endif()
-  if(NMZ_BUILD_TESTS AND NOT WIN32)
-    add_test(NAME cli_smoke COMMAND sh tests/cli_smoke.sh $<TARGET_FILE:neuromz_cli> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-    set_tests_properties(cli_smoke PROPERTIES FIXTURES_REQUIRED built)
-  endif()
 endif()
 
 # ------------------------------------------------------------ data, sanitize
