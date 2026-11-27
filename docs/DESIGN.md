@@ -605,8 +605,9 @@ real numbers; `show attention` a heatmap and the head patterns over any
 text; `show params` the parameters per component; `generate --context N
 --no-cache`; `compare` accepts Transformers.
 
-Remote mode (2.2, decisions 161–165): profiles in `client.conf`
-(`--profile NAME`, `--host`, `--token`); the same commands against a
+Remote mode (2.2, decisions 161–165; protocol 2 since program 2.3,
+decisions 166–168): profiles in `client.conf` (`--profile NAME`, `--host`,
+`--token`); the same commands against a
 [neuromz-server](https://github.com/mzprog/neuromz-server) over the
 [NeuroMZ protocol](https://github.com/mzprog/neuromz-protocol).
 
@@ -1851,6 +1852,37 @@ attention traces):
     in ways the protocol 1.0 does not cover; in remote mode they say so
     and suggest `save FILE` and a local profile. Plain HTTP only: TLS is
     a reverse proxy's job (the server's README).
+
+### Program 2.3: the remote mode over protocol 2
+
+The protocol's owner replaced HTTP with a binary protocol of its own
+(neuromz-protocol 2.0.0, its decisions P18–P37); neuromz-server 0.2.0
+speaks only that. The program follows; the library does not change.
+
+166. **The remote mode speaks protocol 2 through `nmzp`; nothing else
+    changes for its user.** The same profiles, flags, commands, messages
+    and outputs: a request is a MessagePack map instead of a JSON body, a
+    file goes in DATA frames with its SHA-256 instead of an HTTP body, and
+    `train` follows the job through a subscription on the same connection
+    instead of a second HTTP stream (decision 164 otherwise stands). One
+    connection serves a whole run of the program (a shell session keeps
+    it, and reconnects if the server closed it as idle). `host` is
+    `HOST[:PORT]`; a URL (`http://…`, a protocol 1 address) is refused with
+    a message that says so. The token is proved in the handshake and
+    never sent; the server's proof is checked, and a program that holds a
+    token refuses a server that offers no authentication, since an
+    attacker on the path could otherwise pose as the server.
+
+167. **The program has its own version from 2.3.** Until 2.2 the program
+    and the library shared version numbers (decision 122). A change of the program alone — its remote mode — should
+    not release a library whose code did not change, so the program is
+    2.3.0 against library 2.2.0; `neuromz --version` names the program,
+    the library and the protocol (`neuromz 2.3.0 (library 2.2.0, remote
+    protocol 2.0)`), and `NMZ_LIBRARY_TAG` still pins the library.
+
+168. **Local mode stays byte for byte.** The commands that run locally are
+    untouched; their output and the model files they write are compared
+    with 2.2.0's in the release checks (the same text, the same bytes).
 
 ---
 

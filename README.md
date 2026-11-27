@@ -41,8 +41,11 @@ results are in [its README](https://github.com/mzprog/neuromz-cli#readme).
 **Over the network:** [`neuromz-server`](https://github.com/mzprog/neuromz-server)
 hosts models and runs training and inference jobs on the CPU or a GPU, and
 [`neuromz-protocol`](https://github.com/mzprog/neuromz-protocol) is its
-HTTP + JSON API (OpenAPI, a C wire library, a conformance suite); the
-program's remote mode and the planned `neuromz-web` use it.
+protocol — protocol 2, a binary protocol of its own over TCP (frames, a
+MessagePack subset, an HMAC challenge, pushed progress; its C library
+`nmzp`, shared test vectors and a conformance suite). The program's remote
+mode speaks it; a pure-PHP client library (`neuromz-php`, planned) will
+let web applications use a server.
 
 NeuroMZ started in 2017 as a beginner's project. That code is preserved in
 [`legacy/`](legacy/) (git tag `v1-legacy`); v2 is a rewrite. The design and
@@ -441,11 +444,13 @@ product, a KV cache and attention traces (phase 5); CMake, native Windows,
 CI, the first public release and the split into repositories (v2.0.0);
 device backends with CUDA (v2.1.0); threads and models described in
 words (v2.2.0), with
-[`neuromz-protocol`](https://github.com/mzprog/neuromz-protocol) v1.0.0 and
-[`neuromz-server`](https://github.com/mzprog/neuromz-server) v0.1.0 in their
-own repositories and the program's remote mode. Next: `neuromz-web` (a GUI
-that consumes the protocol and the trace events); in this repository, more
-backends (HIP, Vulkan) on the same table of ops.
+[`neuromz-protocol`](https://github.com/mzprog/neuromz-protocol) and
+[`neuromz-server`](https://github.com/mzprog/neuromz-server) in their own
+repositories and the program's remote mode — over HTTP at first (protocol
+1.0.0, server 0.1.0), then over a binary protocol of its own (protocol
+2.0.0, server 0.2.0, program 2.3.0). Next: `neuromz-php` (a PHP client of
+the protocol, for web applications and a web viewer of the trace events);
+in this repository, more backends (HIP, Vulkan) on the same table of ops.
 
 ## License
 
