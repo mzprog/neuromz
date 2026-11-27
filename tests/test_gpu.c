@@ -80,15 +80,16 @@ static void note_worst(int cls, const char *name, double e) {
     if (e > g_worst[cls]) g_worst[cls] = e, g_class[cls] = name;
 }
 
-#define SAME(name, cpu_buf, gpu_dev, n, tol, cls)                                                                     \
-    do {                                                                                                             \
-        float *h_ = malloc(((n) ? (n) : 1) * sizeof(float));                                                         \
-        double e_;                                                                                                   \
-        from_gpu(h_, gpu_dev, n);                                                                                    \
-        e_ = rel(cpu_buf, h_, n);                                                                                    \
-        note_worst(cls, name, e_);                                                                                   \
-        CHECK_MSG(e_ <= (tol), "%s: relative difference %.3g > %.1g (n = %zu)", name, e_, (double)(tol), (size_t)(n)); \
-        free(h_);                                                                                                    \
+#define SAME(name, cpu_buf, gpu_dev, n, tol, cls)                                                                      \
+    do {                                                                                                               \
+        size_t n_ = (n); /* once, and not as a condition (GCC: -Wint-in-bool-context) */                               \
+        float *h_ = malloc((n_ > 0 ? n_ : 1) * sizeof(float));                                                         \
+        double e_;                                                                                                     \
+        from_gpu(h_, gpu_dev, n_);                                                                                     \
+        e_ = rel(cpu_buf, h_, n_);                                                                                     \
+        note_worst(cls, name, e_);                                                                                     \
+        CHECK_MSG(e_ <= (tol), "%s: relative difference %.3g > %.1g (n = %zu)", name, e_, (double)(tol), n_);          \
+        free(h_);                                                                                                      \
     } while (0)
 
 static void report_worst(void) {
