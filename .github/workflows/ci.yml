@@ -1,0 +1,91 @@
+# CI for the library: Linux (GCC, Clang; Release and sanitizers), Windows
+# (MSVC), macOS (Apple Clang). No dataset downloads and no benchmarks here:
+# the MNIST regression is skipped when data/ is absent (see data.yml).
+name: CI
+on:
+  push:
+    branches: [master, v2]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.cc }} ${{ matrix.openmp == 'ON' && '+ OpenMP' || '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        openmp: [OFF, ON]
+        exclude:
+          - cc: clang
+            openmp: ON # Ubuntu's clang needs libomp-dev; GCC covers the OpenMP build
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.cc }} -DNMZ_OPENMP=${{ matrix.openmp }}
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Install and use the package
+        run: |
+          cmake --install build --prefix "$PWD/stage"
+          cmake -S tests/package -B build-pkg -DCMAKE_PREFIX_PATH="$PWD/stage" -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          cmake --build build-pkg
+          ./build-pkg/use_neuromz
+
+  sanitize:
+    name: Linux ${{ matrix.cc }} ASan + UBSan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DNMZ_SANITIZE=ON -DCMAKE_C_COMPILER=${{ matrix.cc }}
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    name: Windows MSVC ${{ matrix.openmp == 'ON' && '+ OpenMP' || '' }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        openmp: [OFF, ON]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -S . -B build -DNMZ_OPENMP=${{ matrix.openmp }} # the newest Visual Studio, x64
+      - name: Build
+        run: cmake --build build --config Release -j 4
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Install and use the package
+        shell: bash
+        run: |
+          cmake --install build --config Release --prefix "$PWD/stage"
+          cmake -S tests/package -B build-pkg -DCMAKE_PREFIX_PATH="$PWD/stage"
+          cmake --build build-pkg --config Release
+          ./build-pkg/Release/use_neuromz.exe
+
+  macos:
+    name: macOS Apple Clang
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j 3
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

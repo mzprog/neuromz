@@ -1,0 +1,11 @@
+# neuromzConfig.cmake — find_package(neuromz) support.
+#   find_package(neuromz 2 REQUIRED)
+#   target_link_libraries(app PRIVATE neuromz::neuromz)
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+if(@NMZ_OPENMP_LINKED@)
+  find_dependency(OpenMP COMPONENTS C)
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/neuromzTargets.cmake")
+check_required_components(neuromz)

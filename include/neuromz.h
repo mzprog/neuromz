@@ -1,0 +1,788 @@
+/*
+ * neuromz.h — NeuroMZ v2 public API.
+ *
+ * An educational neural-network engine in C11. Every public name starts with
+ * nmz_ / NMZ_. The library never prints, never exits, and keeps no global
+ * state apart from a thread-local "last error" message.
+ *
+ * See docs/DESIGN.md for the design and README.md for a tutorial.
+ */
+#ifndef NEUROMZ_H
+#define NEUROMZ_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define NMZ_VERSION_MAJOR 2
+#define NMZ_VERSION_MINOR 0
+#define NMZ_VERSION_PATCH 0
+#define NMZ_VERSION_STRING "2.0.0"
+
+#define NMZ_MAX_RANK 4
+/* A per-sample dimension of 0 (first dimension only) means "any length":
+ * sequence nets are created with input shape [NMZ_ANY_LENGTH] and accept
+ * [B, T] batches for any T (64 in training, 1 when generating). */
+#define NMZ_ANY_LENGTH 0
+#define NMZ_TRACE_MAX_ITEMS 12
+
+/* ------------------------------------------------------------------ errors */
+
+typedef enum nmz_status {
+    NMZ_OK = 0,
+    NMZ_ERR_NOMEM = -1,       /* allocation failed                         */
+    NMZ_ERR_ARG = -2,         /* invalid argument (NULL, out of range, ...) */
+    NMZ_ERR_SHAPE = -3,       /* tensor/layer shapes do not fit together   */
+    NMZ_ERR_STATE = -4,       /* call not valid in the current state       */
+    NMZ_ERR_IO = -5,          /* file could not be opened/read/written     */
+    NMZ_ERR_FORMAT = -6,      /* file or CSV content is malformed          */
+    NMZ_ERR_UNSUPPORTED = -7, /* valid request the engine cannot do yet    */
+    NMZ_ERR_NUMERIC = -8      /* NaN/Inf appeared (e.g. learning rate too high) */
+} nmz_status;
+
+/* Short constant name of a status, e.g. "NMZ_ERR_SHAPE". */
+const char *nmz_status_str(nmz_status s);
+/* Human-readable message for the most recent failure on this thread
+ * ("" if none). Valid until the next failing call on the same thread. */
+const char *nmz_last_error(void);
+
+/* ----------------------------------------------------------------- tensors */
+
+/* Contiguous row-major float tensor. shape[0] is the batch dimension when
+ * the tensor holds a batch. */
+typedef struct nmz_tensor {
+    int rank;
+    int shape[NMZ_MAX_RANK];
+    size_t size;     /* product of shape (1 for rank 0) */
+    size_t capacity; /* allocated floats                */
+    float *data;
+} nmz_tensor;
+
+#define NMZ_TENSOR_EMPTY {0, {0, 0, 0, 0}, 0, 0, NULL}
+
+/* Allocate a zero-filled tensor. `t` must be empty or previously freed. */
+nmz_status nmz_tensor_init(nmz_tensor *t, int rank, const int *shape);
+/* Change shape; reallocates only if the new size exceeds capacity. New
+ * contents are unspecified. Works on an empty tensor too. */
+nmz_status nmz_tensor_reshape(nmz_tensor *t, int rank, const int *shape);
+/* Make `dst` a deep copy of `src` (reusing dst's allocation when possible). */
+nmz_status nmz_tensor_copy(nmz_tensor *dst, const nmz_tensor *src);
+void nmz_tensor_zero(nmz_tensor *t);
+void nmz_tensor_free(nmz_tensor *t);
+/* Number of rows when the last dimension is treated as features. */
+size_t nmz_tensor_rows(const nmz_tensor *t);
+/* Size of the last dimension (1 for rank 0). */
+int nmz_tensor_cols(const nmz_tensor *t);
+
+/* --------------------------------------------------------------------- rng */
+
+/* PCG32 (O'Neill 2014): small, fast, identical output on every platform. */
+typedef struct nmz_rng {
+    uint64_t state;
+    uint64_t inc;
+} nmz_rng;
+
+void nmz_rng_seed(nmz_rng *r, uint64_t seed, uint64_t stream);
+uint32_t nmz_rng_u32(nmz_rng *r);
+uint32_t nmz_rng_below(nmz_rng *r, uint32_t bound); /* uniform in [0, bound) */
+double nmz_rng_uniform(nmz_rng *r);                 /* uniform in [0, 1)     */
+double nmz_rng_normal(nmz_rng *r);                  /* standard normal       */
+
+/* ------------------------------------------------------------------- enums */
+
+typedef enum nmz_act {
+    NMZ_ACT_LINEAR = 0,
+    NMZ_ACT_SIGMOID,
+    NMZ_ACT_TANH,
+    NMZ_ACT_RELU,
+    NMZ_ACT_LEAKY_RELU,
+    NMZ_ACT_SOFTMAX,
+    NMZ_ACT_GELU, /* x·Φ(x), Φ = standard normal CDF (exact, with erf) */
+    NMZ_ACT_COUNT
+} nmz_act;
+
+typedef enum nmz_init {
+    NMZ_INIT_AUTO = 0, /* He before relu/leaky_relu, Xavier otherwise */
+    NMZ_INIT_XAVIER,   /* Glorot uniform: ±sqrt(6/(fan_in+fan_out))  */
+    NMZ_INIT_HE,       /* He uniform:     ±sqrt(6/fan_in)            */
+    NMZ_INIT_ORTHOGONAL, /* recurrent layers only: the recurrent matrix
+                            (each gate's block) is a random orthogonal
+                            matrix, the input matrix Glorot              */
+    NMZ_INIT_COUNT
+} nmz_init;
+
+typedef enum nmz_loss {
+    NMZ_LOSS_MSE = 0,       /* L = (1/rows) Σ_rows ½ Σ_k (y_k − t_k)²          */
+    NMZ_LOSS_CROSS_ENTROPY, /* L = −(1/rows) Σ_rows Σ_k t_k log p_k (softmax)  */
+    NMZ_LOSS_COUNT
+} nmz_loss;
+
+const char *nmz_act_name(nmz_act a);
+const char *nmz_init_name(nmz_init i);
+const char *nmz_loss_name(nmz_loss l);
+/* Parse names (case-sensitive, a few aliases such as "ce", "lrelu"). */
+nmz_status nmz_act_parse(const char *s, nmz_act *out);
+nmz_status nmz_init_parse(const char *s, nmz_init *out);
+nmz_status nmz_loss_parse(const char *s, nmz_loss *out);
+
+/* Scalar activation and its derivative w.r.t. its input z (not softmax). */
+float nmz_act_apply(nmz_act a, float z, float alpha);
+float nmz_act_derivative(nmz_act a, float z, float alpha);
+
+/* ------------------------------------------------------------------ layers */
+
+typedef struct nmz_layer nmz_layer; /* see neuromz_layer.h */
+
+/* Factories return NULL on failure (see nmz_last_error()). */
+nmz_layer *nmz_layer_dense(int units, nmz_init init);
+/* alpha is the negative slope for NMZ_ACT_LEAKY_RELU (ignored otherwise;
+ * pass 0 to use the default 0.01). */
+nmz_layer *nmz_layer_activation(nmz_act act, float alpha);
+/* Convolution over per-sample [C, H, W] input: `filters` kernels of
+ * kh × kw, zero padding `pad` (or NMZ_PAD_SAME: output keeps H×W; needs
+ * stride 1 and an odd kernel). NMZ_INIT_AUTO = He unless a tanh/sigmoid
+ * activation follows. Output [filters, OH, OW], OH = (H + 2·pad − kh)/stride + 1. */
+#define NMZ_PAD_SAME (-1)
+nmz_layer *nmz_layer_conv2d(int filters, int kh, int kw, int stride, int pad, nmz_init init);
+/* How conv2d computes (same results up to float rounding): im2col (default;
+ * receptive fields copied into a matrix, then matrix products) or the naive
+ * nested loops that mirror the formula. Not saved in model files. */
+typedef enum nmz_conv_algo { NMZ_CONV_IM2COL = 0, NMZ_CONV_NAIVE } nmz_conv_algo;
+nmz_status nmz_layer_conv2d_set_algo(nmz_layer *l, nmz_conv_algo algo);
+/* Max pooling over size × size windows (stride 0 = size), no padding. */
+nmz_layer *nmz_layer_maxpool2d(int size, int stride);
+/* [d1, d2, ...] → [d1·d2·...] (needed between conv/pool and dense layers). */
+nmz_layer *nmz_layer_flatten(void);
+/* Inverted dropout: in training each value is zeroed with probability `rate`
+ * and the rest scaled by 1/(1−rate); identity in evaluation. */
+nmz_layer *nmz_layer_dropout(float rate);
+/* Token ids [steps] → vectors [steps, dim] (W is [vocab, dim]). Its input is
+ * discrete: no input gradient. The weight gradient is sparse (only rows of
+ * tokens that occur are written); optimizers still update the full matrix,
+ * so Adam/momentum behave exactly as for a dense parameter. */
+nmz_layer *nmz_layer_embedding(int vocab, int dim, nmz_init init);
+/* Vanilla RNN over [steps, features] → [steps, units]:
+ * h_t = tanh(x_t·W_xh + h_{t−1}·W_hh + b); BPTT inside the layer. With
+ * carry on (nmz_net_set_carry / train opts carry_state) h_{−1} is the last
+ * hidden state of the previous forward pass, else zeros. AUTO = orthogonal
+ * (W_hh orthogonal, W_xh Glorot); XAVIER = Glorot for both (phase 3). */
+nmz_layer *nmz_layer_rnn(int units, nmz_init init);
+/* LSTM over [steps, features] → [steps, units]. Gates side by side in
+ * W_x [D, 4H], W_h [H, 4H], b [4H], in the order i, f, g, o:
+ *   i, f, o = σ(·)   g = tanh(·)   of  x_t·W_x + h_{t−1}·W_h + b
+ *   c_t = f ⊙ c_{t−1} + i ⊙ g      h_t = o ⊙ tanh(c_t)
+ * The forget-gate bias starts at `forget_bias` (1 is the usual choice: the
+ * cell remembers by default). The carried state holds h and c ([B, 2H]).
+ * AUTO = orthogonal. */
+#define NMZ_LSTM_FORGET_BIAS 1.0f
+nmz_layer *nmz_layer_lstm(int units, nmz_init init, float forget_bias);
+/* GRU (Cho et al. 2014, reset gate applied to h_{t−1} before the product),
+ * gates z, r, n side by side in W_x [D, 3H], W_h [H, 3H], b [3H]:
+ *   z = σ(x_t·W_xz + h_{t−1}·W_hz + b_z)      update gate
+ *   r = σ(x_t·W_xr + h_{t−1}·W_hr + b_r)      reset gate
+ *   ĥ = tanh(x_t·W_xn + (r ⊙ h_{t−1})·W_hn + b_n)   candidate
+ *   h_t = z ⊙ h_{t−1} + (1 − z) ⊙ ĥ
+ * AUTO = orthogonal. */
+nmz_layer *nmz_layer_gru(int units, nmz_init init);
+/* 1 for rnn/lstm/gru layers. */
+int nmz_layer_is_recurrent(const nmz_layer *l);
+
+/* ---- Transformer building blocks (decoder-only, GPT-style). All work on
+ * [steps, D] per sample, i.e. [B, T, D] batches; see DESIGN §3.2. */
+/* Position encoding: y_t = x_t + P[offset + t]. LEARNED: P [max_len, D] is a
+ * parameter; SINUSOIDAL: P[t][2i] = sin(t/10000^(2i/D)), P[t][2i+1] = cos(…),
+ * fixed. max_len is the context window. With carry on (generation) the
+ * offset continues from the previous forward pass. */
+typedef enum nmz_posenc { NMZ_POS_LEARNED = 0, NMZ_POS_SINUSOIDAL, NMZ_POS_COUNT } nmz_posenc;
+nmz_layer *nmz_layer_posenc(nmz_posenc kind, int max_len);
+const char *nmz_posenc_name(nmz_posenc k);
+/* LayerNorm over the last dimension: y = g ⊙ (x − μ)/√(σ² + ε) + b, with
+ * learnable gain g (starts at 1) and bias b (starts at 0); ε = 1e-5. */
+#define NMZ_LAYERNORM_EPS 1e-5f
+nmz_layer *nmz_layer_layernorm(void);
+/* Causal multi-head self-attention, `heads` heads of `head_dim` numbers
+ * (E = heads·head_dim):  [q | k | v] = x·W_qkv + b_qkv   (W_qkv [D, 3E])
+ *   per head: weights = softmax(q·kᵀ/√head_dim) over earlier positions only
+ *             (the causal mask), context = weights·v
+ *   y = context·W_o + b_o   (W_o [E, D]).
+ * head_dim 0 = D/heads. With carry on (generation) the keys and values of
+ * earlier forward passes are kept (the KV cache, the layer's state). */
+nmz_layer *nmz_layer_attention(int heads, int head_dim);
+/* Position-wise feed-forward: y = act(x·W1 + b1)·W2 + b2, act gelu or relu. */
+nmz_layer *nmz_layer_ffn(int hidden, nmz_act act);
+/* Pre-LayerNorm Transformer block (one composite layer):
+ *   h = x + dropout(attention(LN1(x)))     y = h + dropout(ffn(LN2(h)))
+ * hidden 0 = 4·D; dropout 0 = none. */
+nmz_layer *nmz_layer_block(int heads, int head_dim, int ff_hidden, nmz_act act, float dropout);
+/* Output projection tied to the net's embedding: z = x·Eᵀ + b, E = the
+ * embedding matrix [vocab, D] (shared: one parameter, two uses). The
+ * embedding is found when the net is built (the nearest embedding layer
+ * before this one); `vocab` must match it. */
+nmz_layer *nmz_layer_tied_output(int vocab);
+/* 1 for attention layers and blocks (they hold a KV cache when carrying). */
+int nmz_layer_has_attention(const nmz_layer *l);
+/* Free a layer that was NOT added to a net. */
+void nmz_layer_free(nmz_layer *l);
+
+const char *nmz_layer_type(const nmz_layer *l);
+/* One-line description, e.g. "dense 2→4 (xavier)". */
+void nmz_layer_describe(const nmz_layer *l, char *buf, size_t n);
+int nmz_layer_param_count(const nmz_layer *l);
+/* Parameter i: name ("W", "b"), value and gradient tensors. */
+const char *nmz_layer_param_name(const nmz_layer *l, int i);
+nmz_tensor *nmz_layer_param_value(nmz_layer *l, int i);
+nmz_tensor *nmz_layer_param_grad(nmz_layer *l, int i);
+/* For activation layers: which function (else -1). */
+int nmz_layer_activation_kind(const nmz_layer *l);
+/* For dense layers: the init actually used (AUTO resolved after build), else -1. */
+int nmz_layer_dense_init(const nmz_layer *l);
+/* Same for any layer with initialised weights (dense, conv2d), else -1. */
+int nmz_layer_init_used(const nmz_layer *l);
+/* Output size per sample (product of the per-sample output shape). */
+int nmz_layer_output_size(const nmz_layer *l);
+int nmz_layer_input_size(const nmz_layer *l);
+
+/* --------------------------------------------------------------- the net */
+
+typedef struct nmz_net nmz_net;
+typedef struct nmz_dataset nmz_dataset; /* defined below */
+typedef struct nmz_vocab nmz_vocab;     /* defined below */
+
+/* Training configuration (also stored inside each model). */
+typedef struct nmz_epoch_info {
+    int epoch;           /* 1-based                                  */
+    double loss;         /* loss over the whole training set          */
+    double accuracy;     /* NaN when not meaningful (see DESIGN §10.23) */
+    float learning_rate; /* η used in this epoch (after the schedule) */
+    double val_loss;     /* loss on the validation split (NaN without one) */
+    double val_accuracy;
+    int clipped_batches; /* batches whose gradients were clipped this epoch */
+    int improved;        /* 1 if this is the best validation loss so far */
+} nmz_epoch_info;
+
+typedef struct nmz_batch_info {
+    int epoch;        /* 1-based                               */
+    int batch;        /* 1-based index within the epoch        */
+    int n_batches;    /* mini-batches per epoch                */
+    double loss;      /* loss of this mini-batch (before update) */
+    double grad_norm; /* global gradient norm before clipping (NaN if clipping is off) */
+    int clipped;      /* 1 if the gradients were scaled down    */
+    float learning_rate; /* η used for this batch's update      */
+} nmz_batch_info;
+
+/* Return non-zero from a callback to stop training early. */
+typedef int (*nmz_epoch_fn)(const nmz_epoch_info *info, void *user);
+typedef int (*nmz_batch_fn)(const nmz_batch_info *info, void *user);
+
+typedef enum nmz_optimizer {
+    NMZ_OPT_SGD = 0, /* v ← μ·v − η·g ; w ← w + v                                 */
+    NMZ_OPT_ADAM,    /* m ← β1·m + (1−β1)·g ; v ← β2·v + (1−β2)·g²
+                        w ← w − η·m̂/(√v̂ + ε), m̂ = m/(1−β1^t), v̂ = v/(1−β2^t)      */
+    NMZ_OPT_ADAMW,   /* Adam + decoupled weight decay (Loshchilov & Hutter 2019):
+                        w ← w − η·(m̂/(√v̂ + ε) + λ·w), λ = weight_decay, applied
+                        only to weight matrices unless decay_all is set      */
+    NMZ_OPT_COUNT
+} nmz_optimizer;
+
+typedef enum nmz_schedule {
+    NMZ_SCHED_CONSTANT = 0, /* η_e = η                                               */
+    NMZ_SCHED_STEP,         /* η_e = η · γ^floor((e−1)/step_size)                     */
+    NMZ_SCHED_COSINE,       /* η_e = η_min + ½(η − η_min)(1 + cos(π·(e−1)/max_epochs)) */
+    NMZ_SCHED_WARMUP_COSINE, /* per BATCH s = 1..S (S = max_epochs · batches per epoch),
+                                W = warmup_steps:  s ≤ W: η·s/W
+                                else η_min + ½(η − η_min)(1 + cos(π·(s−W−1)/(S−W))) */
+    NMZ_SCHED_COUNT
+} nmz_schedule;
+
+typedef struct nmz_train_opts {
+    int max_epochs;      /* hard limit                                  */
+    int batch_size;      /* 1 = online SGD, >= n = full batch           */
+    float learning_rate; /* η (initial value when a schedule is used)   */
+    float momentum;      /* μ in [0, 1); 0 = plain SGD (SGD only)       */
+    int shuffle;         /* reshuffle samples every epoch (1/0)         */
+    double target_loss;  /* stop when whole-set loss <= this            */
+    nmz_optimizer optimizer;
+    float beta1, beta2, epsilon; /* Adam (defaults 0.9, 0.999, 1e-8)    */
+    nmz_schedule schedule;
+    int step_size;       /* NMZ_SCHED_STEP: epochs between decays       */
+    float gamma;         /* NMZ_SCHED_STEP: decay factor                */
+    float min_lr;        /* NMZ_SCHED_COSINE: final learning rate       */
+    float val_fraction;  /* hold out the LAST fraction of the samples for
+                            validation (0 = none); reported every epoch   */
+    float clip_norm;     /* > 0: scale all gradients down so their global
+                            L2 norm is at most this (0 = off)             */
+    int carry_state;     /* recurrent nets: consecutive batches continue
+                            the same streams and the hidden state is
+                            carried over (truncated BPTT); no shuffling   */
+    int seq_len;         /* text: time steps per training sequence (used
+                            by the loaders/CLI, stored with the model)   */
+    int patience;        /* > 0 with a validation split: stop after this
+                            many epochs without a new best validation
+                            loss and restore the best weights (early
+                            stopping); 0 = off                            */
+    float weight_decay;  /* NMZ_OPT_ADAMW: λ (0 = plain Adam)           */
+    int decay_all;       /* AdamW: 1 = decay every parameter; 0 (default) =
+                            only weight matrices — not biases, LayerNorm
+                            gains/biases, embeddings or position tables  */
+    int warmup_steps;    /* NMZ_SCHED_WARMUP_COSINE: batches of linear
+                            warm-up from 0 to the learning rate          */
+    nmz_epoch_fn on_epoch;
+    nmz_batch_fn on_batch;
+    void *user;          /* passed to both callbacks                    */
+} nmz_train_opts;
+
+typedef struct nmz_train_result {
+    int epochs;      /* epochs actually run                          */
+    double loss;     /* final whole-set loss                          */
+    double accuracy; /* final accuracy, NaN when not meaningful       */
+    int converged;   /* 1 if loss <= target_loss                      */
+    int stopped;     /* 1 if the on_epoch callback asked to stop      */
+    double val_loss; /* final validation loss (NaN without a split)   */
+    double val_accuracy;
+    int best_epoch;  /* epoch whose weights were kept (patience), else 0 */
+} nmz_train_result;
+
+/* Library defaults (not tuned for any dataset). */
+nmz_train_opts nmz_train_defaults(void);
+/* Learning rate for epoch e (1-based) under o's schedule (for the per-batch
+ * NMZ_SCHED_WARMUP_COSINE: the base rate η). */
+float nmz_schedule_lr(const nmz_train_opts *o, int epoch);
+/* Learning rate for batch `step` (1-based) of `total` batches in the whole
+ * run: NMZ_SCHED_WARMUP_COSINE per batch; other schedules give
+ * nmz_schedule_lr of the epoch that batch falls in (`per_epoch` batches). */
+float nmz_schedule_lr_step(const nmz_train_opts *o, long step, long total, long per_epoch);
+const char *nmz_optimizer_name(nmz_optimizer o);
+const char *nmz_schedule_name(nmz_schedule s);
+nmz_status nmz_optimizer_parse(const char *s, nmz_optimizer *out);
+nmz_status nmz_schedule_parse(const char *s, nmz_schedule *out);
+
+/* Input normalization, fitted on training data and stored with the model:
+ * x' = (x − offset_g) · scale_g, one (offset, scale) per group g: per
+ * channel for [C,H,W] inputs, per feature otherwise.
+ *   min-max: offset = min, scale = 1/(max − min)   → values in [0, 1]
+ *   z-score: offset = mean, scale = 1/std          → mean 0, std 1
+ * (scale = 1 when max = min or std = 0). */
+typedef enum nmz_norm { NMZ_NORM_NONE = 0, NMZ_NORM_MINMAX, NMZ_NORM_ZSCORE, NMZ_NORM_COUNT } nmz_norm;
+const char *nmz_norm_name(nmz_norm n);
+nmz_status nmz_norm_parse(const char *s, nmz_norm *out);
+
+/* Create an empty network for samples of the given per-sample shape. */
+nmz_status nmz_net_create(nmz_net **out, int input_rank, const int *input_shape,
+                          uint64_t seed);
+void nmz_net_free(nmz_net *net);
+
+/* Append a layer. The net ALWAYS takes ownership, also on failure. */
+nmz_status nmz_net_add(nmz_net *net, nmz_layer *layer);
+/* Convenience: Dense(units, init) followed by Activation(act) (no activation
+ * layer is added for NMZ_ACT_LINEAR). */
+nmz_status nmz_net_add_dense(nmz_net *net, int units, nmz_act act, nmz_init init);
+nmz_status nmz_net_set_loss(nmz_net *net, nmz_loss loss);
+/* Freeze the architecture, validate it and initialise parameters. Called
+ * implicitly by forward/train/save; explicit calls are allowed. */
+nmz_status nmz_net_build(nmz_net *net);
+/* Re-initialise all parameters (new random weights) with a new seed. */
+nmz_status nmz_net_reinit(nmz_net *net, uint64_t seed);
+
+int nmz_net_layer_count(const nmz_net *net);
+nmz_layer *nmz_net_layer(nmz_net *net, int i);
+int nmz_net_input_size(const nmz_net *net);  /* per sample */
+int nmz_net_output_size(const nmz_net *net); /* per sample */
+nmz_loss nmz_net_loss_kind(const nmz_net *net);
+size_t nmz_net_param_count(const nmz_net *net); /* total scalar parameters */
+int nmz_net_is_built(const nmz_net *net);
+long nmz_net_step(const nmz_net *net); /* number of backward passes so far */
+/* Stored training configuration (saved with the model); never NULL for a
+ * valid net. Callbacks in it are not saved. */
+nmz_train_opts *nmz_net_train_config(nmz_net *net);
+
+/* Request a normalization; it is fitted by the next nmz_net_train (or
+ * explicitly with nmz_net_fit_normalization) and then frozen. Forward and
+ * predict apply it automatically. NMZ_NORM_NONE removes it. */
+nmz_status nmz_net_set_normalization(nmz_net *net, nmz_norm kind);
+nmz_status nmz_net_fit_normalization(nmz_net *net, const nmz_dataset *ds);
+/* Kind, whether fitted, and the per-group parameters (NULL if not fitted). */
+nmz_norm nmz_net_normalization(const nmz_net *net, int *fitted, int *groups, const float **offset,
+                               const float **scale);
+
+/* Class names for classification outputs (copied). */
+nmz_status nmz_net_set_class_names(nmz_net *net, int n, const char *const *names);
+int nmz_net_class_count(const nmz_net *net);
+const char *nmz_net_class_name(const nmz_net *net, int i);
+
+/* ----------------------------------------------------------------- compute */
+
+/* Forward a batch x of shape [B, input_shape...]. *y points to the net's
+ * output buffer (valid until the next forward). */
+nmz_status nmz_net_forward(nmz_net *net, const nmz_tensor *x, const nmz_tensor **y);
+/* Same with an explicit mode: training = 1 activates dropout (and consumes
+ * the net's PRNG); nmz_net_forward uses evaluation mode (training = 0). */
+nmz_status nmz_net_forward_mode(nmz_net *net, const nmz_tensor *x, int training, const nmz_tensor **y);
+/* Single sample convenience: x has input_size floats, y receives output_size. */
+nmz_status nmz_net_predict(nmz_net *net, const float *x, float *y);
+/* Loss of the last forward pass against target t (same shape as output). */
+nmz_status nmz_net_compute_loss(nmz_net *net, const nmz_tensor *t, double *loss);
+/* Backward pass for the last forward: zeroes all gradients, then computes
+ * every gradient (nothing is updated). Optionally returns the loss. */
+nmz_status nmz_net_backward(nmz_net *net, const nmz_tensor *t, double *loss);
+/* Apply one SGD/momentum step using the current gradients:
+ *   v ← μ·v − η·g ;  w ← w + v */
+nmz_status nmz_net_update(nmz_net *net, float learning_rate, float momentum);
+/* Emit the UPDATE trace events nmz_net_update would emit, without changing
+ * any weight or velocity (for "what would this step do?" teaching views). */
+nmz_status nmz_net_preview_update(nmz_net *net, float learning_rate, float momentum);
+/* One optimizer step with o's optimizer (SGD+momentum or Adam) at the given
+ * learning rate. Optimizer state (velocity or Adam moments and step t) is
+ * kept in the net; switching optimizer resets it. */
+nmz_status nmz_net_optimizer_step(nmz_net *net, const nmz_train_opts *o, float learning_rate);
+nmz_status nmz_net_optimizer_preview(nmz_net *net, const nmz_train_opts *o, float learning_rate);
+/* Which optimizer the stored state belongs to (-1: none yet) and Adam's t. */
+int nmz_net_optimizer_state(const nmz_net *net, long *t);
+/* Scale all gradients so that their global L2 norm sqrt(Σ g²) is at most
+ * max_norm (no change if it already is). *norm receives the norm before
+ * clipping, *scale the factor applied (1 = unchanged). Traced as an
+ * update-phase event of type "clip". */
+nmz_status nmz_net_clip_gradients(nmz_net *net, double max_norm, double *norm, double *scale);
+
+/* Recurrent state: with carry on, recurrent layers start every forward pass
+ * from the state the previous one ended in; reset forgets it (zeros). */
+void nmz_net_set_carry(nmz_net *net, int on);
+void nmz_net_reset_state(nmz_net *net);
+/* 1 if the input has a NMZ_ANY_LENGTH time dimension. */
+int nmz_net_is_sequence(const nmz_net *net);
+/* Context window (positions) of a Transformer: the smallest max_len of its
+ * position-encoding layers; 0 if it has none (no limit). */
+int nmz_net_context_length(const nmz_net *net);
+/* Text generation from a character model (embedding input + vocabulary). */
+typedef struct nmz_gen_opts {
+    const char *prime;  /* UTF-8 text fed first; NULL/"" = the end-of-item
+                           token '\n' (or the most frequent character)   */
+    int length;         /* characters to generate (an upper bound with
+                           stop_at_end)                                    */
+    float temperature;  /* > 0: <1 sharper/safer, >1 flatter/wilder       */
+    int top_k;          /* sample only among the k most likely (0 = all)  */
+    uint64_t seed;      /* same seed + same model = same text             */
+    int stop_at_end;    /* stop after generating '\n' (one item)          */
+    int context;        /* Transformers: positions the model sees (0 = its
+                           context length). When the text outgrows it the
+                           window slides: the newest context/2 characters
+                           are kept and re-encoded from position 0        */
+    int no_cache;       /* Transformers: 1 = recompute the whole window at
+                           every step instead of using the KV cache (the
+                           reference; the text is bit-identical)         */
+} nmz_gen_opts;
+nmz_gen_opts nmz_gen_defaults(void);
+/* *out receives malloc'd UTF-8 (free with free()); the prime is not
+ * included. *n_chars (may be NULL) = characters generated. */
+nmz_status nmz_net_generate(nmz_net *net, const nmz_gen_opts *opts, char **out, size_t *n_chars);
+/* `count` texts at once (one forward pass per step for the whole batch).
+ * Text r uses seed opts->seed + r and equals nmz_net_generate with that
+ * seed. outs[0..count) receive malloc'd strings; n_chars may be NULL. */
+nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int count, char **outs, size_t *n_chars);
+
+/* Text models: the character vocabulary, saved with the model (copied). */
+nmz_status nmz_net_set_vocab(nmz_net *net, const nmz_vocab *v);
+const nmz_vocab *nmz_net_vocab(const nmz_net *net);
+/* Where the model was trained from, saved with it (DESIGN decision 111):
+ * a path (may be NULL) and, for line-per-item data such as names, the set
+ * of training items as 64-bit FNV-1a hashes (items may be NULL / n = 0).
+ * Items are compared byte for byte; duplicates are kept once. Replaces any
+ * earlier source. */
+nmz_status nmz_net_set_data_source(nmz_net *net, const char *path, const char *const *items, int n_items);
+const char *nmz_net_data_path(const nmz_net *net); /* NULL when none */
+int nmz_net_item_count(const nmz_net *net);        /* distinct items stored */
+/* 1 if `item` was a training item, 0 if not, -1 when no items are stored. */
+int nmz_net_knows_item(const nmz_net *net, const char *item);
+/* ∂L/∂input of the last backward pass ([B, input_shape...]). */
+const nmz_tensor *nmz_net_input_grad(const nmz_net *net);
+/* Output of layer i from the last forward (i = -1: the input copy). */
+const nmz_tensor *nmz_net_activation(const nmz_net *net, int i);
+/* ∂L/∂(output of layer i) from the last backward pass (i = -1: ∂L/∂input). */
+const nmz_tensor *nmz_net_activation_grad(const nmz_net *net, int i);
+/* Is parameter i of layer l decayed by AdamW? Weight matrices yes; biases,
+ * gains, embeddings and position tables no — unless decay_all. */
+int nmz_layer_param_decays(const nmz_layer *l, int i, int decay_all);
+
+/* ----------------------------------------------------------------- dataset */
+
+/* ------------------------------------------------------------------- text */
+
+/* Character vocabulary over Unicode code points (not bytes). */
+typedef struct nmz_vocab {
+    int size;
+    uint32_t *codepoints; /* sorted ascending; id = position */
+    uint64_t *counts;     /* occurrences in the text it was built from */
+    int items;            /* 1: line-per-item text; '\n' ends an item */
+    unsigned normalize;   /* NMZ_TEXT_* flags applied to every text the
+                             model reads (training data, prime, trace) */
+} nmz_vocab;
+
+/* Optional Arabic normalisation (off by default; stored with the model):
+ * STRIP_DIACRITICS removes the tashkeel (harakat U+064B–U+0652: fathatan,
+ * dammatan, kasratan, fatha, damma, kasra, shadda, sukun; superscript alef
+ * U+0670) and the tatweel U+0640; UNIFY_ALEF writes أ إ آ ٱ as ا. */
+#define NMZ_TEXT_STRIP_DIACRITICS 1u
+#define NMZ_TEXT_UNIFY_ALEF 2u
+#define NMZ_TEXT_NORMALIZE_ALL (NMZ_TEXT_STRIP_DIACRITICS | NMZ_TEXT_UNIFY_ALEF)
+/* Apply NMZ_TEXT_* flags in place; returns the new length. */
+size_t nmz_text_normalize(uint32_t *cps, size_t n, unsigned flags);
+
+#define NMZ_REPLACEMENT_CHAR 0xFFFDu
+/* Decode UTF-8 (RFC 3629: no overlong forms, surrogates or values above
+ * U+10FFFF). Each invalid byte becomes U+FFFD and is counted in *invalid.
+ * *out is malloc'd (free with free()). */
+nmz_status nmz_utf8_decode(const char *s, size_t n, uint32_t **out, size_t *out_n, size_t *invalid);
+/* Encode one code point; writes up to 4 bytes + NUL, returns the byte count
+ * (0 for an invalid code point). */
+int nmz_utf8_encode(uint32_t cp, char out[5]);
+/* Vocabulary of the distinct code points in cps[0..n) with their counts. */
+nmz_status nmz_vocab_build(nmz_vocab **out, const uint32_t *cps, size_t n);
+nmz_status nmz_vocab_create(nmz_vocab **out, int size, const uint32_t *codepoints, const uint64_t *counts,
+                            int items);
+nmz_status nmz_vocab_copy(nmz_vocab **out, const nmz_vocab *v);
+int nmz_vocab_index(const nmz_vocab *v, uint32_t cp); /* -1 if absent */
+void nmz_vocab_free(nmz_vocab *v);
+
+typedef struct nmz_dataset {
+    int n_samples;
+    int n_inputs;
+    int n_outputs;
+    float *x;           /* n_samples × n_inputs, row-major  */
+    float *y;           /* n_samples × n_outputs, row-major — or, when
+                           y_index is set, n_samples × time_steps class ids */
+    int n_classes;      /* > 0 when targets were one-hot encoded from labels */
+    char **class_names; /* n_classes strings, or NULL      */
+    int sample_rank;    /* shape of one input sample, e.g. [1,28,28] for */
+    int sample_shape[NMZ_MAX_RANK]; /* images; 0 = flat (n_inputs) */
+    /* sequences (text): x holds token ids [n_samples × time_steps], y the ids
+     * of the next tokens; n_outputs is the vocabulary size and targets are
+     * expanded to one-hot rows only when a batch is assembled */
+    int time_steps; /* 0 for non-sequence data */
+    int y_index;    /* 1: y holds class ids, one per time step (or sample) */
+    nmz_vocab *vocab;
+    size_t n_tokens;    /* characters in the text after normalisation */
+    size_t invalid_utf8; /* bytes replaced by U+FFFD while decoding */
+    size_t n_removed;    /* characters removed by the text normalisation */
+} nmz_dataset;
+
+typedef struct nmz_text_opts {
+    int seq_len;            /* time steps per training sequence (default 64)  */
+    int items;              /* 1: one item per line (names); '\n' ends an item,
+                               empty lines are dropped and the text starts
+                               with '\n' so every item has a start context */
+    const nmz_vocab *vocab; /* encode with this vocabulary (e.g. the model's);
+                               NULL builds one from the text */
+    unsigned normalize;     /* NMZ_TEXT_* flags for a new vocabulary (with
+                               `vocab` set, the vocabulary's flags apply) */
+} nmz_text_opts;
+
+nmz_text_opts nmz_text_defaults(void);
+/* Read a UTF-8 text file into non-overlapping sequences: input = ids
+ * [i·T, i·T+T), target = the same window shifted by one character.
+ * Normalisation: a UTF-8 BOM is dropped, CR LF and CR become LF. */
+nmz_status nmz_dataset_load_text(nmz_dataset **out, const char *path, const nmz_text_opts *opts);
+
+typedef struct nmz_csv_opts {
+    int n_targets;   /* trailing columns that are targets (default 1)       */
+    int n_inputs;    /* if > 0: the first n_inputs columns are inputs and all
+                        remaining columns are targets (overrides n_targets) */
+    int header;      /* 1 yes, 0 no, -1 auto-detect (default)               */
+    int categorical; /* 1: the single target column holds class labels and
+                        is one-hot encoded; 0: numeric; -1: auto (default:
+                        categorical when any label is not a number)          */
+    char delimiter;  /* default ','                                         */
+} nmz_csv_opts;
+
+nmz_csv_opts nmz_csv_defaults(void);
+nmz_status nmz_dataset_load_csv(nmz_dataset **out, const char *path,
+                                const nmz_csv_opts *opts);
+/* Copying constructor (y may be NULL for unlabelled data: zero targets). */
+nmz_status nmz_dataset_create(nmz_dataset **out, int n_samples, int n_inputs,
+                              int n_outputs, const float *x, const float *y);
+void nmz_dataset_free(nmz_dataset *ds);
+/* MNIST-style IDX files (big-endian; images: unsigned bytes [n, rows, cols],
+ * labels: unsigned bytes [n]). Pixels are kept as raw 0..255 floats (use
+ * normalization); labels are one-hot with class names "0", "1", ...
+ * limit > 0 reads only the first `limit` samples. sample shape [1,rows,cols]. */
+nmz_status nmz_dataset_load_idx(nmz_dataset **out, const char *images_path, const char *labels_path,
+                                int limit);
+/* Keep only the first n samples (n >= 1). */
+nmz_status nmz_dataset_truncate(nmz_dataset *ds, int n);
+
+/* ---------------------------------------------------------------- training */
+
+/* Train with mini-batch SGD + momentum until the whole-set loss reaches
+ * opts->target_loss or opts->max_epochs is hit. opts may be NULL: the net's
+ * stored training configuration is used. */
+nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds,
+                         const nmz_train_opts *opts, nmz_train_result *result);
+/* Same, validating on a separate data set `val` (e.g. another file) instead
+ * of the last val_fraction of `ds`; all of `ds` is used for training. */
+nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_dataset *val, const nmz_train_opts *opts,
+                             nmz_train_result *result);
+/* Whole-set loss and accuracy (accuracy NaN when not meaningful). */
+nmz_status nmz_net_evaluate(nmz_net *net, const nmz_dataset *ds, double *loss,
+                            double *accuracy);
+
+/* -------------------------------------------------------------- quick mode */
+
+/* The defaults "quick mode" picks for a network with the given layer sizes
+ * (sizes[0] = inputs, sizes[n-1] = outputs), with a one-line reason each. */
+typedef struct nmz_quick {
+    nmz_act hidden_act;
+    const char *why_hidden_act;
+    nmz_act output_act;
+    const char *why_output_act;
+    nmz_init init; /* resolved for the hidden activation */
+    const char *why_init;
+    nmz_loss loss;
+    const char *why_loss;
+    nmz_train_opts train;
+    const char *why_learning_rate;
+    const char *why_momentum;
+    const char *why_batch;
+    const char *why_epochs;
+    const char *why_target_loss;
+} nmz_quick;
+
+nmz_status nmz_quick_defaults(int n_sizes, const int *sizes, nmz_quick *out);
+/* Only the training fields (train, why_learning_rate ... why_target_loss)
+ * for a given loss; nmz_quick_defaults uses this too. */
+nmz_status nmz_quick_train_defaults(nmz_loss loss, nmz_quick *out);
+/* Build a fully configured net from layer sizes using nmz_quick_defaults.
+ * `quick` (may be NULL) receives the choices that were made. */
+nmz_status nmz_net_create_quick(nmz_net **out, int n_sizes, const int *sizes,
+                                uint64_t seed, nmz_quick *quick);
+
+/* ---------------------------------------------------------------- file I/O */
+
+/* Portable .nmz format (DESIGN §7). Builds the net if needed. Writes
+ * format 3; optimizer state (velocity / Adam moments) is included when the
+ * net has been trained, unless NMZ_SAVE_NO_OPTIMIZER is given. Files of
+ * format 2 and 3 can be loaded. */
+#define NMZ_SAVE_NO_OPTIMIZER 1u
+nmz_status nmz_net_save(nmz_net *net, const char *path);
+nmz_status nmz_net_save_ex(nmz_net *net, const char *path, unsigned flags);
+nmz_status nmz_net_load(nmz_net **out, const char *path);
+
+/* ------------------------------------------------------------------- trace */
+
+typedef enum nmz_trace_phase {
+    NMZ_TRACE_FORWARD = 0,
+    NMZ_TRACE_LOSS,
+    NMZ_TRACE_BACKWARD,
+    NMZ_TRACE_UPDATE
+} nmz_trace_phase;
+
+typedef struct nmz_trace_item {
+    const char *name;
+    const nmz_tensor *t;
+} nmz_trace_item;
+
+#define NMZ_TRACE_MAX_SCALARS 8
+
+/* A named number attached to an event: "L" (loss), "lr", "momentum", ... */
+typedef struct nmz_trace_scalar {
+    const char *name;
+    double value;
+} nmz_trace_scalar;
+
+typedef struct nmz_trace_event {
+    nmz_trace_phase phase;
+    long step;              /* 1-based number of the pass the event belongs to */
+    int layer;              /* layer index, -1 for loss events              */
+    int time_step;          /* -1 unless a sequence layer emits per step    */
+    const char *layer_type; /* "dense", "activation", "loss", ...           */
+    const char *detail;     /* activation/loss name, or param name for updates */
+    int n_scalars;          /* loss events: "L"; update events: "lr", "momentum" */
+    nmz_trace_scalar scalars[NMZ_TRACE_MAX_SCALARS];
+    int n_items;
+    nmz_trace_item items[NMZ_TRACE_MAX_ITEMS];
+} nmz_trace_event;
+
+typedef void (*nmz_trace_fn)(const nmz_trace_event *ev, void *user);
+
+/* Install (or with fn == NULL remove) a trace callback. Tensors inside an
+ * event are only valid during the callback. */
+void nmz_net_set_trace(nmz_net *net, nmz_trace_fn fn, void *user);
+
+const char *nmz_trace_phase_name(nmz_trace_phase p);
+/* Find an item by name in an event (NULL if absent). */
+const nmz_tensor *nmz_trace_find(const nmz_trace_event *ev, const char *name);
+/* Find a scalar by name; returns 1 and stores it in *out if present. */
+int nmz_trace_scalar_get(const nmz_trace_event *ev, const char *name, double *out);
+/* Write one event as one JSON line (no trailing comma, ends with '\n'). */
+nmz_status nmz_trace_event_write_json(const nmz_trace_event *ev, FILE *f);
+
+/* A recorder deep-copies every event it receives. Use
+ * nmz_net_set_trace(net, nmz_trace_recorder_fn, rec). */
+typedef struct nmz_trace_recorder nmz_trace_recorder;
+nmz_status nmz_trace_recorder_create(nmz_trace_recorder **out);
+void nmz_trace_recorder_free(nmz_trace_recorder *rec);
+void nmz_trace_recorder_fn(const nmz_trace_event *ev, void *rec);
+void nmz_trace_recorder_clear(nmz_trace_recorder *rec);
+size_t nmz_trace_recorder_count(const nmz_trace_recorder *rec);
+const nmz_trace_event *nmz_trace_recorder_get(const nmz_trace_recorder *rec, size_t i);
+/* NMZ_ERR_NOMEM if a copy failed while recording (events were dropped). */
+nmz_status nmz_trace_recorder_status(const nmz_trace_recorder *rec);
+
+/* ---------------------------------------------------------- gradient check */
+
+typedef struct nmz_gradcheck_result {
+    size_t checked;      /* number of scalars compared                 */
+    double max_abs_err;  /* max |analytic − numeric|                   */
+    double max_rel_err;  /* max |a − n| / max(|a| + |n|, 1e-8)         */
+    int worst_layer;     /* -1 means the input gradient                 */
+    char worst_param[16];/* "W", "b", "x"                               */
+    size_t worst_index;
+    double worst_analytic;
+    double worst_numeric;
+    size_t failures;     /* scalars with |a−n| > atol + rtol·max(|a|,|n|) */
+    size_t kinks;        /* checks skipped: a relu changed side or a max-pool
+                            winner changed within ±eps, so the loss has no
+                            derivative there and the difference quotient is
+                            meaningless (not counted in `checked`)        */
+} nmz_gradcheck_result;
+
+/* Compare backprop gradients (all params and the input) with central
+ * differences (L(w+eps) − L(w−eps)) / 2eps. Parameters are restored.
+ * Tolerances: atol + rtol·max(|a|,|n|); pass 0 for defaults (1e-4, 2e-2). */
+nmz_status nmz_net_gradcheck(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t,
+                             double eps, double atol, double rtol,
+                             nmz_gradcheck_result *result);
+/* Same, choosing the mode: training = 1 (dropout active; the PRNG state is
+ * replayed before every forward pass so each pass sees the same mask) or
+ * training = 0 (evaluation mode). nmz_net_gradcheck uses training = 1. */
+nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_tensor *t,
+                                  double eps, double atol, double rtol, int training,
+                                  nmz_gradcheck_result *result);
+
+/* ------------------------------------------------------------ matrix product */
+
+/* C[M,N] = A[M,K]·B[K,N], row-major floats, sums in float in increasing k.
+ * TRANS_A: A is stored [K,M]; TRANS_B: B is stored [N,K] (not both);
+ * ACCUMULATE: C += A·B. nmz_matmul is cache-blocked (and multi-threaded
+ * when built with OpenMP); nmz_matmul_naive is the three-loop reference.
+ * Both give bit-identical results (DESIGN decision 92). */
+#define NMZ_MM_TRANS_A 1u
+#define NMZ_MM_TRANS_B 2u
+#define NMZ_MM_ACCUMULATE 4u
+nmz_status nmz_matmul(int M, int N, int K, const float *A, const float *B, float *C, unsigned flags);
+nmz_status nmz_matmul_naive(int M, int N, int K, const float *A, const float *B, float *C, unsigned flags);
+/* Threads the library computes with (1 unless built with OpenMP). */
+int nmz_threads(void);
+
+/* ----------------------------------------------------------------- summary */
+
+/* Write a human-readable multi-line summary of the architecture. Returns the
+ * number of characters that would have been written (like snprintf). */
+int nmz_net_summary(const nmz_net *net, char *buf, size_t n);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* NEUROMZ_H */
