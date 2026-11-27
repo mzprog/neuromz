@@ -197,7 +197,7 @@ nmz_status nmz_backend_select(const char *name) {
 
 nmz_status nmz_backend_select_thread(const char *name) {
     const nmz_backend *be;
-    char note[256];
+    char note[sizeof t_note - 16]; /* room for " (this thread)" */
     nmz_status s;
     if (!name) { /* back to the process-wide selection */
         t_selected = 0;
