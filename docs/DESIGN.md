@@ -16,7 +16,8 @@ init, gate traces, gradient-survival comparison, Arabic prose) added
 decisions 71–90; phase 5 (a decoder-only Transformer, AdamW, warm-up,
 the blocked matrix product, the KV cache, attention traces) added
 decisions 91–110. Release 2.1 (device backends: the backend layer, the
-CPU and CUDA backends) added §11 and decisions 127–153.
+CPU and CUDA backends, devices in the program) added §11 and decisions
+127–157.
 
 ---
 
@@ -601,6 +602,11 @@ T [--pos P] [--layer N] [--head H]` shows attention at one position with
 real numbers; `show attention` a heatmap and the head patterns over any
 text; `show params` the parameters per component; `generate --context N
 --no-cache`; `compare` accepts Transformers.
+
+Devices (2.1, decisions 154–157): `--device auto|cpu|cuda` for one command
+or the shell, `set --device D` in the shell, `train … --device D` for one
+run, `show device`; `new` and `train` print the device with the other
+settings, tagged `[auto]` (with the reason) or `[yours]`.
 
 ---
 
@@ -1712,6 +1718,48 @@ attention traces):
     by a pointer each, so code built against 2.0 must be recompiled (the
     library is a static library by default, which a program rebuilds with
     it anyway). The CLI 2.1.0 pins `v2.1.0` and adds `--device`.
+
+### Release 2.1, Step D: devices in the program
+
+154. **The program's default is `--device auto`; the library's stays the
+    CPU.** A program chooses for its user (decision 132). A plain build has
+    no CUDA, so there "auto" is the CPU and every walkthrough's numbers
+    stay bit for bit what they were; whoever builds with `-DNMZ_CUDA=ON`
+    asked for the GPU, so "auto" takes it when there is a usable one. The
+    output never hides the choice: `new` lists `device cuda [auto] NVIDIA
+    GeForce GTX 1660 Ti, 6144 MiB: a usable GPU was found (--device cpu
+    for the CPU)` with the other settings, `train` prints it in its header,
+    and a fallback prints the library's reason ("no usable CUDA device (no
+    NVIDIA driver is installed), using the CPU"). An explicit `--device
+    cuda` that cannot be used is an error with that reason, not a silent
+    fallback.
+155. **The device is the session's, not the model's.** Model files record
+    no device (decision 150), so `set --device` changes the shell, works
+    without a network, and checks the device at once (reporting it or the
+    reason it cannot be used, and keeping the old one then). `train …
+    --device D` follows `train`'s rule that options override for one run;
+    `new … --device D` sets the session's (new creates its network);
+    one-shot `--device D` anywhere on the line applies to that command,
+    except after `set`, which reports the device itself.
+156. **The device is selected only when a command computes.** `help`,
+    `load`, `save` or `show params` never initialise a GPU (that costs a
+    few hundred milliseconds and a driver call); `new`, `train`, `test`,
+    `predict`, `trace`, `step`, `gradcheck`, `generate`, `compare` and the
+    `show` views that run the network select it first. `show device` lists
+    the device, why it was chosen, the GPU's compute capability and memory
+    (total, free, held by the program now and at most, the cap), and which
+    devices the build can use.
+157. **The program is honest about small networks.** `train` on a GPU
+    reports the GPU memory used at the end, and for a network under 5000
+    weights notes that the CPU is usually faster (decision 152: Iris
+    trains in 0.42 s on the GPU, 0.01 s on the CPU). "auto" does not switch
+    devices by size: a choice that depends on a threshold would be harder
+    to predict than a note. The smoke test covers devices in every build:
+    without a usable GPU it checks the fallback and the clean failure of
+    `--device cuda`; with one it trains on the GPU, loads the file on the
+    CPU, runs gradient checks and traces on the GPU and exhausts a small
+    memory cap — and in a CUDA build with a GPU the whole script, every
+    model type and view, runs on the GPU.
 
 ---
 
