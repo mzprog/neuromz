@@ -33,12 +33,15 @@ extern "C" {
 #endif
 
 #define NMZ_VERSION_MAJOR 2
-#define NMZ_VERSION_MINOR 1
+#define NMZ_VERSION_MINOR 2
 #define NMZ_VERSION_PATCH 0
-#define NMZ_VERSION_STRING "2.1.0"
+#define NMZ_VERSION_STRING "2.2.0"
 
 /* this library has nmz_backend_select & co. (2.1.0 on) */
 #define NMZ_HAVE_BACKENDS 1
+/* this library has nmz_backend_select_thread and nmz_model_new & co. (2.2.0 on) */
+#define NMZ_HAVE_THREADS 1
+#define NMZ_HAVE_MODEL_WORDS 1
 
 #define NMZ_MAX_RANK 4
 /* A per-sample dimension of 0 (first dimension only) means "any length":
