@@ -69,7 +69,7 @@ set(NMZ_LIB_SOURCES
     src/error.c src/tensor.c src/rng.c src/activation.c src/dense.c src/loss.c src/net.c src/train.c
     src/trace.c src/gradcheck.c src/io.c src/dataset.c src/defaults.c src/conv2d.c src/shape_layers.c
     src/normalize.c src/text.c src/recurrent.c src/lstm.c src/gru.c src/generate.c src/matmul.c
-    src/attention.c src/transformer.c src/backend.c src/backend_cpu.c)
+    src/attention.c src/transformer.c src/backend.c src/backend_cpu.c src/model.c)
 add_library(neuromz STATIC ${NMZ_LIB_SOURCES})
 add_library(neuromz::neuromz ALIAS neuromz)
 set_target_properties(neuromz PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
@@ -154,7 +154,7 @@ if(NMZ_BUILD_TESTS)
   add_executable(test_neuromz
       tests/test_main.c tests/test_core.c tests/test_math.c tests/test_train.c tests/test_io.c
       tests/test_layers.c tests/test_optim.c tests/test_text.c tests/test_seq.c tests/test_gated.c
-      tests/test_transformer.c tests/test_backend.c tests/test_threads.c tests/test_threads_util.c)
+      tests/test_transformer.c tests/test_backend.c tests/test_threads.c tests/test_threads_util.c tests/test_model.c)
   set_target_properties(test_neuromz PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
   target_include_directories(test_neuromz PRIVATE src)
   target_link_libraries(test_neuromz PRIVATE neuromz nmz_warnings)

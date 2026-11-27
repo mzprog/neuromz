@@ -31,6 +31,8 @@ nmz_status nmz__fail(nmz_status s, const char *fmt, ...)
     ;
 
 char *nmz__strdup(const char *s);
+/* the status of the last recorded failure on this thread */
+nmz_status nmz__last_status(void);
 
 /* ----- backends and device copies of tensors (backend.c, DESIGN §11) */
 extern const nmz_backend nmz__cpu_backend;         /* the reference: v2.0.1's loops      */

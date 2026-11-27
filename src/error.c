@@ -31,6 +31,8 @@ const char *nmz_status_str(nmz_status s) {
 
 const char *nmz_last_error(void) { return g_last_error; }
 
+nmz_status nmz__last_status(void) { return g_last_status; }
+
 nmz_status nmz__fail(nmz_status s, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
