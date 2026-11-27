@@ -461,7 +461,8 @@ static void test_ops_lookups(void) {
 static void test_ops_layernorm_attention(void) {
     static const int lns[][2] = {{1, 5}, {7, 64}, {300, 129}, {64, 1}, {9, 512}};
     static const int attns[][5] = {/* B H T Tp d */ {2, 3, 5, 0, 4}, {2, 3, 5, 3, 4}, {1, 2, 1, 7, 16},
-                                   {1, 2, 70, 0, 16}, {3, 4, 33, 0, 8}, {2, 1, 40, 25, 64}};
+                                   {1, 2, 70, 0, 16}, {3, 4, 33, 0, 8}, {2, 1, 40, 25, 64},
+                                   {5, 2, 20, 4, 8}};
     nmz_rng r;
     size_t i;
     if (!backends()) return;
@@ -702,7 +703,11 @@ static void test_ops_optim_loop(void) {
 
 /* ------------------------------------------------- layers and models */
 
-enum { Z_DENSE, Z_ACTS, Z_CONV, Z_RNN, Z_LSTM, Z_GRU, Z_GPT, Z_PARTS, Z_CNN_BIG, Z_COUNT };
+/* Z_WIDE (not in the loops over the zoo: too many parameters for a full
+ * gradient check): recurrent layers wider than the CUDA sequence kernels
+ * take (lstm H > 256, gru H > 512, rnn H > 1024), which the layers then
+ * compose step by step on the GPU */
+enum { Z_DENSE, Z_ACTS, Z_CONV, Z_RNN, Z_LSTM, Z_GRU, Z_GPT, Z_PARTS, Z_CNN_BIG, Z_COUNT, Z_WIDE = Z_COUNT };
 static const char *const k_zoo[Z_COUNT] = {"dense+softmax/ce", "activations/mse", "conv+pool+dropout",
                                            "embed+rnn (carry)", "lstm+dropout+lstm", "gru (carry)",
                                            "transformer (tied)", "sinusoid+ln+attention+ffn", "mnist-like cnn"};
@@ -775,6 +780,11 @@ static int make(int k, model *m) {
         if (k == Z_RNN) {
             nmz_net_add(m->net, nmz_layer_rnn(7, NMZ_INIT_AUTO));
             m->carry = 1;
+        } else if (k == Z_WIDE) {
+            nmz_net_add(m->net, nmz_layer_lstm(260, NMZ_INIT_AUTO, 1.0f));
+            nmz_net_add(m->net, nmz_layer_gru(520, NMZ_INIT_AUTO));
+            nmz_net_add(m->net, nmz_layer_rnn(1030, NMZ_INIT_AUTO));
+            m->carry = 1;
         } else if (k == Z_LSTM) {
             nmz_net_add(m->net, nmz_layer_lstm(5, NMZ_INIT_AUTO, 1.0f));
             nmz_net_add(m->net, nmz_layer_dropout(0.25f));
@@ -800,7 +810,7 @@ static int make(int k, model *m) {
         break;
     }
     if (nmz_net_build(m->net) != NMZ_OK) return 0;
-    for (i = 0; i < nmz_net_layer_count(m->net); i++) {
+    for (i = 0; k != Z_WIDE && i < nmz_net_layer_count(m->net); i++) { /* wide: tanh would saturate */
         nmz_layer *l = nmz_net_layer(m->net, i);
         for (j = 0; j < nmz_layer_param_count(l); j++) {
             nmz_tensor *v = nmz_layer_param_value(l, j);
@@ -892,6 +902,18 @@ static void test_layers_match_cpu(void) {
         CHECK_MSG(a.n == b.n && d < 1e-4 && fabs(a.loss - b.loss) < 1e-5 * (1 + fabs(a.loss)),
                   "%s: GPU vs CPU relative difference %.3g, loss %.9g vs %.9g", k_zoo[k], d, a.loss, b.loss);
         test_note("%-28s %6zu numbers, max rel diff %.1e", k_zoo[k], a.n, d);
+        free(a.v);
+        free(b.v);
+    }
+    { /* recurrent layers too wide for the sequence kernels: composed on the GPU */
+        result a, b;
+        double d;
+        CHECK_MSG(run_pass(Z_WIDE, "cpu", &a), "wide recurrent layers on the CPU");
+        CHECK_MSG(run_pass(Z_WIDE, "cuda", &b), "wide recurrent layers on the GPU: %s", nmz_last_error());
+        d = rel(a.v, b.v, a.n < b.n ? a.n : b.n);
+        CHECK_MSG(a.n == b.n && d < 1e-4 && fabs(a.loss - b.loss) < 1e-5 * (1 + fabs(a.loss)),
+                  "wide lstm/gru/rnn: GPU vs CPU relative difference %.3g, loss %.9g vs %.9g", d, a.loss, b.loss);
+        test_note("%-28s %6zu numbers, max rel diff %.1e", "wide lstm/gru/rnn (composed)", a.n, d);
         free(a.v);
         free(b.v);
     }
