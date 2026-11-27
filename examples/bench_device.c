@@ -1,9 +1,9 @@
-/* bench_device.c — training time per epoch on a chosen backend, for the
- * models of the README's device table (README "Performance", DESIGN §11):
+/* bench_device.c â€” training time per epoch on a chosen backend, for the
+ * models of the README's device table (README "Performance", DESIGN آ§11):
  *
- *   mnist-cnn      the CLI preset: conv 8 → pool → conv 16 → pool → 64 → 10
+ *   mnist-cnn      the CLI preset: conv 8 â†’ pool â†’ conv 16 â†’ pool â†’ 64 â†’ 10
  *                  (27.6 k weights), Adam, batch 32, 60 000 images
- *   alice-lstm     the char-lstm preset: embed 32 → lstm 64 → softmax
+ *   alice-lstm     the char-lstm preset: embed 32 â†’ lstm 64 â†’ softmax
  *                  (32 k), 16 streams of 64 characters, carried state
  *   alice-gpt      the char-gpt preset: 2 blocks of 32, context 128 (32 k)
  *   alice-gpt-213k 4 blocks of 64, 4 heads, dropout 0.2, context 128 (213 k)
@@ -11,7 +11,7 @@
  *                  sized for a 6 GB GPU (about half of it)
  *
  * Usage: bench_device MODEL [--device cpu|cuda|auto] [--epochs N]
- *                           [--batches N] [--data DIR]
+ *                           [--batches N] [--batch N] [--data DIR]
  * Two times are reported: a whole epoch as the CLI shows it (the updates
  * and the evaluation of the whole training and validation sets), and the
  * updates alone: the time from the first to the last update of epoch 1,
@@ -87,13 +87,14 @@ int main(int argc, char **argv) {
     nmz_train_opts o = nmz_train_defaults();
     nmz_train_result res;
     timing tm;
-    int epochs = 1, i, threads = nmz_threads(), seq = 0;
+    int epochs = 1, i, threads = nmz_threads(), seq = 0, batch = 0;
     double t_total;
     memset(&tm, 0, sizeof tm);
     for (i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
         else if (!strcmp(argv[i], "--epochs") && i + 1 < argc) epochs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--batches") && i + 1 < argc) tm.max_batches = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--batch") && i + 1 < argc) batch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--data") && i + 1 < argc) dir = argv[++i];
     }
 #ifdef NMZ_HAVE_BACKENDS
@@ -101,7 +102,7 @@ int main(int argc, char **argv) {
         nmz_device_info di;
         TRY(nmz_backend_select(device));
         nmz_backend_info(&di);
-        printf("device: %s — %s (%s)\n", di.backend, di.device, di.note);
+        printf("device: %s â€” %s (%s)\n", di.backend, di.device, di.note);
         if (di.mem_total) printf("        compute %d.%d, %.0f MiB\n", di.cc_major, di.cc_minor, di.mem_total / 1048576.0);
     }
 #else
@@ -182,6 +183,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     TRY(nmz_net_build(net));
+    if (batch > 0) o.batch_size = batch;
     if (o.schedule == NMZ_SCHED_WARMUP_COSINE) {
         long per = (long)((ds->n_samples - (long)(ds->n_samples * 0.1)) + o.batch_size - 1) / o.batch_size;
         o.warmup_steps = (int)(0.05 * per * epochs) > 10 ? (int)(0.05 * per * epochs) : 10;
