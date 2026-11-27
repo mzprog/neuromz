@@ -50,51 +50,42 @@ src/                   libneuromz — platform-independent C11, libc + libm only
                        batches of rows (finished rows leave the batch);
                        Transformers: KV cache, context window, sliding
   matmul.c             C = A·B, cache-blocked with a register tile, the
-                       naive reference, optional OpenMP (make OMP=1)
+                       naive reference, optional OpenMP (-DNMZ_OPENMP=ON)
   attention.c          causal multi-head self-attention (+ KV cache)
   transformer.c        position encoding, LayerNorm, feed-forward, the
                        pre-LN block (composite layer), tied output
   defaults.c           "quick mode" defaults and the reasons for them
   internal.h           private helpers shared by the library sources
-cli/                   the `neuromz` program (may use POSIX/terminal code)
-  cli.h                CLI-internal declarations
-  main.c               entry point, REPL, argv dispatch (-m/-o/--ascii), clock/tty
-  cmd_new.c            `new`: layer-spec grammar, presets, explanations
-  commands.c           show/train/test/predict/save/load/trace/step/...
-  util.c               option parsing, dataset resolution (CSV/IDX/mnist)
-  print.c              formula printer for dense/activation/loss/SGD events
-  print_conv.c         conv/pool/flatten/dropout/normalize/Adam printers, heatmaps
-  print_seq.c          a character rnn/lstm/gru unrolled through time: every gate,
-                       gate heatmaps, BPTT, vanishing gradients along h and c
-  print_attn.c         a Transformer's attention at one position with real
-                       numbers, heatmaps, head patterns, the residual stream
-  cmd_seq.c            `compare` (gradient survival side by side), `show gates`,
-                       `show attention`, `show params`
-  line.c               dynamic line reader and tokenizer (no fixed buffers)
 tests/                 test_*.c (unit, gradient checks, convergence, I/O),
-                       cli_smoke.sh (CLI abuse test); all run under sanitizers
+                       data/*.nmz (model files of earlier phases), package/
+                       (a find_package consumer); all run under sanitizers
 examples/              xor.csv, xor_and.csv, iris.csv (+ 120/30 train/test
                        split), names_en.txt, names_ar.txt, DATASETS.md,
-                       api_xor.c, run_examples.sh, benchmark.sh,
-                       benchmark_mnist.sh,
-                       benchmark_gated.sh, benchmark_transformer.sh,
+                       api_xor.c, api_mnist.c (CTest regressions),
                        bench_conv.c, bench_matmul.c
-scripts/get_mnist.sh   downloads MNIST into data/ (gitignored), verifies MD5
-scripts/get_text.sh    downloads Alice (Gutenberg #11) and Kalila wa-Dimna
+scripts/get_mnist.*    downloads MNIST into data/ (gitignored), verifies
+                       MD5 + SHA-256 (.sh: Unix-like systems, .ps1: Windows)
+scripts/get_text.*     downloads Alice (Gutenberg #11) and Kalila wa-Dimna
                        (Arabic Wikisource, fixed revisions) into data/,
-                       verifies SHA-256; strip_wikitext.awk removes markup
+                       verifies SHA-256 of every download and of the result;
+                       strip_wikitext.awk removes markup (ported in .ps1)
+cmake/                 neuromzConfig.cmake.in (find_package support)
 docs/DESIGN.md         this file
 legacy/                v1 sources (2017–2020), unchanged, tag `v1-legacy`
-Makefile               lib, cli, test, sanitize, examples, data, bench, clean
+CMakeLists.txt         library, tests, examples; test, sanitize, bench,
+                       data, data-text targets; install + package config
 ```
 
-Build products go to `build/` (`build/libneuromz.a`, `build/neuromz`,
-`build/test_neuromz`); the sanitizer build goes to `build/san/`; `make
-OMP=1 …` builds with OpenMP into `build/omp/` (and `build/san-omp/`).
+The `neuromz` program is its own repository since v2.0.0,
+[neuromz-cli](https://github.com/mzprog/neuromz-cli) (`src/` there; it
+was `cli/` here, and its history came along — decision 121). It uses only
+the public headers. Build trees are CMake's (`build/` by convention, the
+sanitizer tree `build-san/`); `-DNMZ_OPENMP=ON` builds with OpenMP.
 
 The library never includes POSIX headers, never touches the terminal, never
-prints, and never calls `exit()`/`abort()`. The CLI is the only place allowed
-to do those things.
+prints, and never calls `exit()`/`abort()`; its one platform difference is
+how a UTF-8 file name is opened on Windows (decision 113). The CLI is the
+only place allowed to do the rest.
 
 ---
 
@@ -552,7 +543,9 @@ phase-4 commits) must load and generate the same text.
 
 ## 8. CLI
 
-`neuromz` with no arguments starts an interactive shell (prompt only when
+(The program lives in [neuromz-cli](https://github.com/mzprog/neuromz-cli)
+since v2.0.0; this section stays here because the decisions below refer to
+it.) `neuromz` with no arguments starts an interactive shell (prompt only when
 stdin is a terminal, so scripts can be piped in). `neuromz CMD ARGS...` runs
 one command; `-m FILE` loads a model first and `-o FILE` saves it after, so
 one-shot use composes in shell scripts.
@@ -607,7 +600,7 @@ text; `show params` the parameters per component; `generate --context N
 | biased init, no `srand` | Xavier/He uniform from a seeded PCG32 |
 | no epoch limit, stop on last sample | full-dataset loss per epoch + `max_epochs` |
 | raw struct dump file | portable little-endian format with magic, version, CRC |
-| heap overflows, use-after-free, NULL derefs | tests + CLI smoke run under ASan/UBSan in `make sanitize` |
+| heap overflows, use-after-free, NULL derefs | tests (and, in neuromz-cli, the CLI smoke test) run under ASan/UBSan (`--target sanitize`, and in CI) |
 | fixed 32-byte token buffer | dynamic line reader/tokenizer |
 
 ---
@@ -1294,3 +1287,60 @@ attention traces):
     minute (naive convolution)" predates im2col), mnist-mlp ~20 s, names /
     names-lstm ~2 s, names-gpt ~1.5 s, char-rnn / char-lstm / char-gpt
     ~9–10 s, arabic-text ~1 min, arabic-gpt ~50 s.
+120. **No floating-point contraction (`-ffp-contract=off`).** With FMA,
+    `c += a·b` is rounded once instead of twice, and a compiler may fuse it
+    in one loop and not in another: on Apple Clang / arm64 the blocked
+    matmul then differed from the naive loops in the last bit (and one
+    convolution gradient check fell just outside its tolerance). GCC
+    already does not contract in ISO C mode; Clang does by default, so the
+    flag is set for GCC and Clang. MSVC does not contract under its
+    default `/fp:precise`. Bit-identical results across code paths are
+    what the KV-cache and blocked-matmul tests rely on (decisions 92, 98);
+    across platforms the results agree as well where the libm agrees (the
+    XOR quick-mode run converges in 172 epochs with GCC on Linux and with
+    MSVC on Windows).
+121. **The CLI moved to its own repository with its history**
+    ([neuromz-cli](https://github.com/mzprog/neuromz-cli)), the first step
+    of splitting the project into `neuromz` (the library, later its CPU and
+    CUDA backends), `neuromz-protocol`, `neuromz-server`, `neuromz-cli` and
+    `neuromz-web`. `git filter-repo` kept every commit that touched
+    `cli/`, the smoke test, the fixtures and the example data and scripts
+    the program uses, with `cli/` renamed to `src/`. What stays here: the
+    library, its tests, the C examples and benchmarks (`api_xor`,
+    `api_mnist`, `bench_conv`, `bench_matmul`), the data scripts (one copy
+    of the checksums; the CLI's `data` targets call them), DESIGN and the
+    `v1-legacy` tag. The CLI-driven benchmark scripts and the CLI
+    walkthroughs of the README moved with the program; this README keeps
+    the build, the C API, the performance numbers and a summary of the
+    results. The small example datasets are in both repositories (the
+    library's tests and the program's smoke test both read them).
+122. **The program pins the library by tag.** `neuromz-cli` fetches the
+    library with CMake's FetchContent at `NMZ_LIBRARY_TAG` (default the
+    release it was tested with, `v2.0.0`), so a checkout of a CLI release
+    always builds the same library; `-DNMZ_LOCAL_PATH=../neuromz` builds
+    against a working copy and `-DNMZ_USE_INSTALLED=ON` against an
+    installed package (`find_package(neuromz 2.0)`, provided by
+    `cmake --install`: headers, the static library, `neuromzConfig.cmake`
+    with OpenMP as a dependency when the library was built with it). The
+    CLI's CI has one job against the library's `master`, to see breakage
+    before a release. Library and CLI share version numbers. When the
+    library is a subproject, its tests and examples are off and its
+    warnings are not errors (a newer compiler must not break a user's
+    build); its own CI keeps `-Werror`.
+123. **The library's regressions run without the CLI.** CTest runs the unit
+    tests, `examples/api_xor.c` (fails if quick-mode or hand-built XOR does
+    not converge) and `examples/api_mnist.c` (the mnist-cnn architecture,
+    one epoch on 20 000 images, at least 95% test accuracy; 96.6% measured;
+    exit 77 = skipped when the data has not been downloaded), and
+    `tests/package` checks in CI that an installed library is usable via
+    `find_package`. XOR+AND, Iris and the text models stay covered by the
+    unit tests (decisions 85, 107 and the fixtures).
+124. **Release v2.0.0, MIT licence.** Both repositories carry the MIT
+    licence (copyright Mohamad Zbib), a CHANGELOG in the Keep a Changelog
+    format, and the same version number. The library's `master` gets `v2`
+    merged (no squash: the phase history is the documentation of how the
+    engine grew); tags `v2.0.0` in both repositories. Before publishing,
+    both repositories were checked for tracked datasets, models (only the
+    small `tests/data/*.nmz` fixtures are tracked), build outputs and
+    secrets. The contact address in `legacy/` is the v1 code's own and was
+    already public.

@@ -6,9 +6,9 @@
 | `iris.csv` (+ `iris_train.csv`, `iris_test.csv`) | Fisher's Iris data, 150 flowers | the copy shipped with scikit-learn (identical to R's `iris` and Fisher 1936); train/test = every 5th row | public domain (historical data set) |
 | `names_en.txt` | 5163 English first names, one per line | US Census Bureau, *Frequently Occurring Names*, 1990 census: `dist.female.first` (4275) and `dist.male.first` (1219) from www2.census.gov/topics/genealogy/1990surnames/ | public domain (work of the US federal government) |
 | `names_ar.txt` | 504 common Arabic given names, one per line | compiled for this project (see below) | CC0 |
-| `data/train-*`, `data/t10k-*` (`make data`, not committed) | MNIST | LeCun, Cortes, Burges; via the Google / AWS mirrors, MD5-checked | CC BY-SA 3.0 (as distributed by the authors' site) |
-| `data/alice.txt` (`make data-text`, not committed) | Lewis Carroll, *Alice's Adventures in Wonderland* (1865), 151 KB, 3382 lines | Project Gutenberg eBook #11 via official mirrors, SHA-256-checked, header/footer removed | public domain in the USA |
-| `data/kalila.txt` (`make data-text`, not committed) | Ibn al-Muqaffaʿ, *Kalila wa-Dimna* (كليلة ودمنة, Arabic, 8th century), 431 KB, 240 376 characters, 126 paragraphs | Arabic Wikisource, the 19 chapters of [كليلة ودمنة](https://ar.wikisource.org/wiki/كليلة_ودمنة) at fixed page revisions, each SHA-256-checked, wiki markup removed (see below) | the work: public domain (author died c. 759); the Wikisource transcription: CC BY-SA 4.0 (Wikimedia terms of use) |
+| `data/train-*`, `data/t10k-*` (`cmake --build build --target data`, not committed) | MNIST | LeCun, Cortes, Burges; via the Google / AWS mirrors, MD5- and SHA-256-checked | CC BY-SA 3.0 (as distributed by the authors' site) |
+| `data/alice.txt` (`cmake --build build --target data-text`, not committed) | Lewis Carroll, *Alice's Adventures in Wonderland* (1865), 151 KB, 3382 lines | Project Gutenberg eBook #11 via official mirrors, SHA-256-checked, header/footer removed | public domain in the USA |
+| `data/kalila.txt` (`cmake --build build --target data-text`, not committed) | Ibn al-Muqaffaʿ, *Kalila wa-Dimna* (كليلة ودمنة, Arabic, 8th century), 431 KB, 240 376 characters, 126 paragraphs | Arabic Wikisource, the 19 chapters of [كليلة ودمنة](https://ar.wikisource.org/wiki/كليلة_ودمنة) at fixed page revisions, each SHA-256-checked, wiki markup removed (see below) | the work: public domain (author died c. 759); the Wikisource transcription: CC BY-SA 4.0 (Wikimedia terms of use) |
 
 ## How `names_en.txt` was made
 
@@ -40,7 +40,7 @@ which allows downloading and processing it with attribution (this file is
 the attribution: Arabic Wikisource contributors, page history linked from
 each chapter). Nothing of it is committed to this repository.
 
-`scripts/get_text.sh` fetches the raw wikitext of each chapter at a fixed
+`scripts/get_text.sh` (`get_text.ps1` on Windows) fetches the raw wikitext of each chapter at a fixed
 revision id (`index.php?oldid=N&action=raw`; a revision never changes, so its
 SHA-256 is stable even when the page is edited later), in the order of the
 book's index page, and checks every checksum. `scripts/strip_wikitext.awk`
