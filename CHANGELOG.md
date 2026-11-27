@@ -5,6 +5,48 @@ its own changelog in [neuromz-cli](https://github.com/mzprog/neuromz-cli);
 both use the same version numbers. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.0] — 2026-11-27
+
+Threads, and models described in words, for
+[neuromz-server](https://github.com/mzprog/neuromz-server) (which runs
+several jobs at once) and the program's remote mode. Design:
+[`docs/DESIGN.md`](docs/DESIGN.md) §11.8 and decisions 158–165. On the CPU,
+everything computes exactly as in 2.1.0, bit for bit.
+
+### Added
+- **Several nets at once in several threads.** The backend registry and the
+  process-wide selection are behind a lock; `nmz_backend_select_thread`
+  picks a device for the calling thread only (it wins over
+  `nmz_backend_select` there; `NULL` resets it); `nmz_backend_sync` waits
+  for a thread's queued device work. The CUDA backend gives every host
+  thread its own stream, cuBLAS handle, pinned buffers and work buffers;
+  the device, cuBLAS and the memory cap are shared. The rules (what is and
+  is not thread-safe) are at the top of `neuromz.h` and in DESIGN §11.8.
+  On POSIX the library now links the platform's threads (`Threads::Threads`,
+  found by the package config).
+- **Models described in words** (moved from the program): `nmz_model_new`
+  takes the arguments of the program's `new` (layer specs or `--preset`,
+  `--loss`, `--seed`, `--data`, …), explains every default through a line
+  callback, and maps data names through a callback (`nmz_model_env`);
+  `nmz_model_format`, `nmz_preset_count` / `_name` / `_summary` / `_input`
+  / `_data`; `nmz_train_option` parses a training option as the program
+  spells it (with `NMZ_SET_*` flags for what was given) and
+  `nmz_train_describe` prints a configuration in one line. Errors come
+  back through `nmz_last_error`; the library still never prints.
+- `NMZ_HAVE_THREADS` and `NMZ_HAVE_MODEL_WORDS`.
+- Tests: `threads/*` (six nets in six threads byte-identical to sequential
+  runs, per-thread selection, per-thread errors, the registry from eight
+  threads, stopping mid-epoch), `model/*`, and `gpu/concurrent_threads`
+  (three GPU nets and a CPU net at once, files identical to sequential
+  runs).
+
+### Unchanged
+- The public API of 2.1 (everything added is new), the file format, and
+  every CPU result: the probe of decision 128 gives the same 75 lines and
+  11 model files as 2.0.1 and 2.1.0. Progress and stopping already had
+  their hooks (`on_batch` / `on_epoch` returning non-zero); they are now
+  tested mid-epoch.
+
 ## [2.1.0] — 2026-11-27
 
 Device backends, and a CUDA backend that trains every model type on an
@@ -130,6 +172,7 @@ The first public release of v2, a rewrite of the 2017 v1 (kept in
 - `bench_conv` uses C11 `timespec_get`; unsigned negations are written as
   `0u - x` (MSVC C4146); two Clang warnings in the tests.
 
+[2.2.0]: https://github.com/mzprog/neuromz/releases/tag/v2.2.0
 [2.1.0]: https://github.com/mzprog/neuromz/releases/tag/v2.1.0
 [2.0.1]: https://github.com/mzprog/neuromz/releases/tag/v2.0.1
 [2.0.0]: https://github.com/mzprog/neuromz/releases/tag/v2.0.0
