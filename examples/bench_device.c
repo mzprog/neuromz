@@ -1,9 +1,9 @@
-/* bench_device.c â€” training time per epoch on a chosen backend, for the
- * models of the README's device table (README "Performance", DESIGN آ§11):
+/* bench_device.c — training time per epoch on a chosen backend, for the
+ * models of the README's device table (README "Performance", DESIGN §11):
  *
- *   mnist-cnn      the CLI preset: conv 8 â†’ pool â†’ conv 16 â†’ pool â†’ 64 â†’ 10
+ *   mnist-cnn      the CLI preset: conv 8 → pool → conv 16 → pool → 64 → 10
  *                  (27.6 k weights), Adam, batch 32, 60 000 images
- *   alice-lstm     the char-lstm preset: embed 32 â†’ lstm 64 â†’ softmax
+ *   alice-lstm     the char-lstm preset: embed 32 → lstm 64 → softmax
  *                  (32 k), 16 streams of 64 characters, carried state
  *   alice-gpt      the char-gpt preset: 2 blocks of 32, context 128 (32 k)
  *   alice-gpt-213k 4 blocks of 64, 4 heads, dropout 0.2, context 128 (213 k)
@@ -102,7 +102,7 @@ int main(int argc, char **argv) {
         nmz_device_info di;
         TRY(nmz_backend_select(device));
         nmz_backend_info(&di);
-        printf("device: %s â€” %s (%s)\n", di.backend, di.device, di.note);
+        printf("device: %s — %s (%s)\n", di.backend, di.device, di.note);
         if (di.mem_total) printf("        compute %d.%d, %.0f MiB\n", di.cc_major, di.cc_minor, di.mem_total / 1048576.0);
     }
 #else

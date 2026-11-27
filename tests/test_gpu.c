@@ -1,4 +1,4 @@
-/* test_gpu.c â€” the CUDA backend against the CPU (DESIGN آ§11.7, decision 141).
+/* test_gpu.c — the CUDA backend against the CPU (DESIGN §11.7, decision 141).
  *
  * Op level: every required op of the table, CPU vs CUDA, on random inputs
  * and many shapes (odd sizes, strides, flags), within the tolerances below.
@@ -8,8 +8,8 @@
  * --parity: training on both devices reaches the same quality (XOR, Iris,
  * the MNIST CNN, the names RNN, the Alice LSTM, a small Transformer).
  *
- * Tolerances (largest |gpu âˆ’ cpu| / largest |cpu| of a result):
- *   0      data movement, element-wise +, أ—, one-hot, gathers, im2col,
+ * Tolerances (largest |gpu − cpu| / largest |cpu| of a result):
+ *   0      data movement, element-wise +, ×, one-hot, gathers, im2col,
  *          max-pool winners, normalisation, counts (the same float ops)
  *   1e-6   reductions summed in double on both sides (column/row sums,
  *          squared norms), the optimizers (double math on both)
@@ -62,7 +62,7 @@ static void from_gpu(float *h, const float *d, size_t n) {
     if (n) gpu->download(gpu, h, d, n * sizeof(float));
 }
 
-/* largest |a âˆ’ b| relative to the largest |a| */
+/* largest |a − b| relative to the largest |a| */
 static double rel(const float *a, const float *b, size_t n) {
     double worst = 0, scale = 1e-30;
     size_t i;
@@ -385,7 +385,7 @@ static void test_ops_lookups(void) {
     nmz_rng r, r1, r2;
     if (!backends()) return;
     nmz_rng_seed(&r, 6, 1);
-    { /* dropout: the GPU draws its own masks â€” check what a mask must be */
+    { /* dropout: the GPU draws its own masks — check what a mask must be */
         size_t n = 200001, i, zeros = 0, bad = 0;
         float *m = malloc(n * 4), *m2 = malloc(n * 4), *dm = dup_to_gpu(NULL, n);
         const float keep = 1.0f / (1.0f - 0.3f);
