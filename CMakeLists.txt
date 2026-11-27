@@ -160,6 +160,23 @@ if(NMZ_BUILD_TESTS)
   # files go to the build tree
   add_test(NAME unit COMMAND test_neuromz WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(unit PROPERTIES FIXTURES_REQUIRED built ENVIRONMENT "NMZ_TEST_DIR=${CMAKE_BINARY_DIR}")
+  if(NMZ_CUDA)
+    # the GPU tests (label gpu): every op against the CPU, gradient checks on
+    # the GPU, training parity; exit 77 (skipped) without a usable GPU
+    add_executable(test_gpu tests/test_gpu.c tests/test_gpu_main.c)
+    set_target_properties(test_gpu PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    target_include_directories(test_gpu PRIVATE src)
+    target_link_libraries(test_gpu PRIVATE neuromz nmz_warnings)
+    add_test(NAME gpu COMMAND test_gpu WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    add_test(NAME gpu_parity COMMAND test_gpu --parity WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(gpu gpu_parity PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 FIXTURES_REQUIRED built
+                                                   ENVIRONMENT "NMZ_TEST_DIR=${CMAKE_BINARY_DIR}")
+    # the same build on a machine "without a GPU": the CPU suite still passes
+    # and auto falls back to the CPU
+    add_test(NAME unit_no_gpu COMMAND test_neuromz backend WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(unit_no_gpu PROPERTIES FIXTURES_REQUIRED built
+                         ENVIRONMENT "NMZ_TEST_DIR=${CMAKE_BINARY_DIR};CUDA_VISIBLE_DEVICES=-1")
+  endif()
   if(NMZ_SANITIZE)
     set_property(TEST unit APPEND PROPERTY ENVIRONMENT "ASAN_OPTIONS=detect_leaks=1"
                                                        "UBSAN_OPTIONS=print_stacktrace=1")
