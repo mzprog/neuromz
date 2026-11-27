@@ -19,9 +19,9 @@ extern "C" {
 #endif
 
 #define NMZ_VERSION_MAJOR 2
-#define NMZ_VERSION_MINOR 0
-#define NMZ_VERSION_PATCH 1
-#define NMZ_VERSION_STRING "2.0.1"
+#define NMZ_VERSION_MINOR 1
+#define NMZ_VERSION_PATCH 0
+#define NMZ_VERSION_STRING "2.1.0"
 
 /* this library has nmz_backend_select & co. (2.1.0 on) */
 #define NMZ_HAVE_BACKENDS 1
