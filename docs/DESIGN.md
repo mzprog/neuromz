@@ -1344,3 +1344,11 @@ attention traces):
     small `tests/data/*.nmz` fixtures are tracked), build outputs and
     secrets. The contact address in `legacy/` is the v1 code's own and was
     already public.
+125. **The GitHub repository is `mzprog/neuromz`** (renamed from
+    `NeuroMZ` with `gh repo rename` at the release; GitHub redirects the
+    old URL, and the names of the planned repositories are lower case too).
+    Both repositories have a `.gitattributes` with `* text=auto eol=lf`:
+    Git for Windows checks text out with CRLF by default, which changed the
+    bytes of the example data on Windows — the library's loader already
+    reads CRLF as LF, but the CLI's text excerpts (`show gates --data`,
+    `compare`) did not; they now do, and checkouts are identical anyway.
