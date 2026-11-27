@@ -246,7 +246,10 @@ struct nmz_backend {
     nmz_status (*count_correct)(const nmz_backend *be, int mode, size_t rows, int cols, const float *y,
                                 const float *t, double *out);
 
-    /* ---- optional fused kernels (NULL: composed from the ops above) */
+    /* ---- optional fused kernels (NULL: composed from the ops above). A
+     * kernel may also decline a call it does not handle (a hidden size too
+     * large for one thread block, say) by returning NMZ_ERR_UNSUPPORTED
+     * before touching anything; the layer then composes the math. */
     nmz_status (*dense_forward)(const nmz_backend *be, size_t rows, int n_in, int units, const float *x,
                                 const float *W, const float *b, float *y);
     nmz_status (*dense_backward)(const nmz_backend *be, size_t rows, int n_in, int units, const float *x,

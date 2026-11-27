@@ -235,9 +235,10 @@ static nmz_status gru_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, 
     py = nmz__w(be, y);
     pg = nmz__w(be, &g->gates);
     if (!px || !pWx || !pWh || !pb || !ph0 || !py || !pg) return nmz__op_failed();
-    if (NMZ_FUSED(be, gru_forward)) {
-        s = be->gru_forward(be, B, T, D, H, px, ph0, pWx, pWh, pb, py, pg);
-    } else {
+    /* a fused kernel may decline a shape it does not handle (NMZ_ERR_UNSUPPORTED) */
+    s = NMZ_FUSED(be, gru_forward) ? be->gru_forward(be, B, T, D, H, px, ph0, pWx, pWh, pb, py, pg)
+                                   : NMZ_ERR_UNSUPPORTED;
+    if (s == NMZ_ERR_UNSUPPORTED) {
         float *prh;
         shape[0] = B;
         shape[1] = H;
@@ -330,10 +331,10 @@ static nmz_status gru_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tens
     if (dx) pdx = nmz__w(be, dx);
     if (!px || !py || !ph0 || !pg || !pWx || !pWh || !pdy || !pdWx || !pdWh || !pdb || !pdhn || (dx && !pdx))
         return nmz__op_failed();
-    if (NMZ_FUSED(be, gru_backward)) {
-        s = be->gru_backward(be, B, T, D, H, px, py, ph0, pg, pWx, pWh, pdy, pdWx, pdWh, pdb, pdx, pdhn,
-                             tracing ? &rec : NULL);
-    } else {
+    s = NMZ_FUSED(be, gru_backward) ? be->gru_backward(be, B, T, D, H, px, py, ph0, pg, pWx, pWh, pdy, pdWx, pdWh, pdb,
+                                                       pdx, pdhn, tracing ? &rec : NULL)
+                                    : NMZ_ERR_UNSUPPORTED;
+    if (s == NMZ_ERR_UNSUPPORTED) {
         float *pda, *prh, *pgp, *pdir, *pdrh;
         shape[1] = T;
         shape[2] = G;

@@ -231,9 +231,10 @@ static nmz_status lstm_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y,
     pg = nmz__w(be, &m->gates);
     pc = nmz__w(be, &m->c);
     if (!px || !pWx || !pWh || !pb || !ph0 || !pc0 || !py || !pg || !pc) return nmz__op_failed();
-    if (NMZ_FUSED(be, lstm_forward)) {
-        s = be->lstm_forward(be, B, T, D, H, px, ph0, pc0, pWx, pWh, pb, py, pg, pc);
-    } else { /* a = x·W_x + b for all steps; per step a_t += h_{t−1}·W_h, then the gates */
+    /* a fused kernel may decline a shape it does not handle (NMZ_ERR_UNSUPPORTED) */
+    s = NMZ_FUSED(be, lstm_forward) ? be->lstm_forward(be, B, T, D, H, px, ph0, pc0, pWx, pWh, pb, py, pg, pc)
+                                    : NMZ_ERR_UNSUPPORTED;
+    if (s == NMZ_ERR_UNSUPPORTED) { /* a = x·W_x + b for all steps; per step a_t += h_{t−1}·W_h, then the gates */
         s = be->gemm(be, 0, B * T, G, D, px, D, pWx, G, pg, G);
         if (s == NMZ_OK) s = be->add_bias(be, (size_t)B * T, G, pg, pb);
         for (t = 0; t < T && s == NMZ_OK; t++) {
@@ -339,10 +340,10 @@ static nmz_status lstm_backward(nmz_layer *l, const nmz_tensor *x, const nmz_ten
     if (!px || !py || !ph0 || !pc0 || !pg || !pc || !pWx || !pWh || !pdy || !pdWx || !pdWh || !pdb || !pdhn || !pdcn ||
         (dx && !pdx))
         return nmz__op_failed();
-    if (NMZ_FUSED(be, lstm_backward)) {
-        s = be->lstm_backward(be, B, T, D, H, px, py, ph0, pc0, pg, pc, pWx, pWh, pdy, pdWx, pdWh, pdb, pdx, pdhn, pdcn,
-                              tracing ? &rec : NULL);
-    } else {
+    s = NMZ_FUSED(be, lstm_backward) ? be->lstm_backward(be, B, T, D, H, px, py, ph0, pc0, pg, pc, pWx, pWh, pdy, pdWx,
+                                                         pdWh, pdb, pdx, pdhn, pdcn, tracing ? &rec : NULL)
+                                     : NMZ_ERR_UNSUPPORTED;
+    if (s == NMZ_ERR_UNSUPPORTED) {
         int s3[3];
         float *pda, *pgp;
         s3[0] = B;

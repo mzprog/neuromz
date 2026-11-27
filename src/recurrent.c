@@ -486,23 +486,26 @@ static nmz_status rnn_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, 
     rnn_layer *r = l->self;
     const nmz_backend *be = ctx->backend;
     int B = x->shape[0], T = x->shape[1], H = r->units, D = r->D, t, tracing = NMZ_TRACING(ctx);
-    int fused = NMZ_FUSED(be, rnn_forward), shape[2];
+    int shape[2];
     const float *px, *pWx, *pWh, *pb, *ph0;
     float *py, *pz = NULL;
     nmz_status s;
     if ((s = initial_state(be, ctx, &r->h0, &r->state, B, H, (size_t)H, 0)) != NMZ_OK) return s;
-    if ((tracing || !fused) && (s = nmz_tensor_reshape(&r->z, 3, y->shape)) != NMZ_OK) return s;
+    if (tracing && (s = nmz_tensor_reshape(&r->z, 3, y->shape)) != NMZ_OK) return s;
     px = nmz__r(be, x);
     pWx = nmz__r(be, &r->Wxh);
     pWh = nmz__r(be, &r->Whh);
     pb = nmz__r(be, &r->b);
     ph0 = nmz__r(be, &r->h0);
     py = nmz__w(be, y);
-    if (tracing || !fused) pz = nmz__w(be, &r->z);
-    if (!px || !pWx || !pWh || !pb || !ph0 || !py || ((tracing || !fused) && !pz)) return nmz__op_failed();
-    if (fused) {
-        s = be->rnn_forward(be, B, T, D, H, px, ph0, pWx, pWh, pb, py, pz);
-    } else { /* z = x·W_xh + b for all steps at once; then per step z_t += h_{t−1}·W_hh, h_t = tanh(z_t) */
+    if (tracing) pz = nmz__w(be, &r->z);
+    if (!px || !pWx || !pWh || !pb || !ph0 || !py || (tracing && !pz)) return nmz__op_failed();
+    /* a fused kernel may decline a shape it does not handle (NMZ_ERR_UNSUPPORTED) */
+    s = NMZ_FUSED(be, rnn_forward) ? be->rnn_forward(be, B, T, D, H, px, ph0, pWx, pWh, pb, py, pz)
+                                   : NMZ_ERR_UNSUPPORTED;
+    if (s == NMZ_ERR_UNSUPPORTED) { /* z = x·W_xh + b for all steps at once; then per step z_t += h_{t−1}·W_hh, h_t = tanh(z_t) */
+        if (!pz && ((s = nmz_tensor_reshape(&r->z, 3, y->shape)) != NMZ_OK || !(pz = nmz__w(be, &r->z))))
+            return s != NMZ_OK ? s : nmz__op_failed();
         s = be->gemm(be, 0, B * T, H, D, px, D, pWx, H, pz, H);
         if (s == NMZ_OK) s = be->add_bias(be, (size_t)B * T, H, pz, pb);
         for (t = 0; t < T && s == NMZ_OK; t++) {
@@ -600,10 +603,10 @@ static nmz_status rnn_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tens
     if (dx) pdx = nmz__w(be, dx);
     if (!px || !py || !ph0 || !pWx || !pWh || !pdy || !pdWx || !pdWh || !pdb || !pdn || (dx && !pdx))
         return nmz__op_failed();
-    if (NMZ_FUSED(be, rnn_backward)) {
-        s = be->rnn_backward(be, B, T, D, H, px, py, ph0, pWx, pWh, pdy, pdWx, pdWh, pdb, pdx, pdn,
-                             tracing ? &rec : NULL);
-    } else {
+    s = NMZ_FUSED(be, rnn_backward) ? be->rnn_backward(be, B, T, D, H, px, py, ph0, pWx, pWh, pdy, pdWx, pdWh, pdb, pdx,
+                                                       pdn, tracing ? &rec : NULL)
+                                    : NMZ_ERR_UNSUPPORTED;
+    if (s == NMZ_ERR_UNSUPPORTED) {
         int s3[3];
         float *pgz, *pgp;
         s3[0] = B;

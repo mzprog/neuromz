@@ -56,6 +56,9 @@ typedef cublasStatus_t(CUBLASWINAPI *pf_sgemm)(cublasHandle_t, cublasOperation_t
                                                 const float *, const float *, int, const float *, int, const float *,
                                                 float *, int);
 typedef cublasStatus_t(CUBLASWINAPI *pf_get_version)(cublasHandle_t, int *);
+typedef cublasStatus_t(CUBLASWINAPI *pf_sgemm_sb)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int,
+                                                   const float *, const float *, int, long long, const float *, int,
+                                                   long long, const float *, float *, int, long long, int);
 
 #define MAX_PENDING 64
 
@@ -72,6 +75,7 @@ static struct {
     void *lib;
     cublasHandle_t blas;
     pf_sgemm sgemm;
+    pf_sgemm_sb sgemm_sb; /* strided batched: attention, one GEMM per head */
     int blas_version;
     size_t used, peak;
     size_t limit, limit_default; /* what alloc may hand out (decision 142) */
@@ -83,6 +87,8 @@ static struct {
     int n_pending;
     void *scratch;             /* reductions' partial sums, offsets           */
     size_t scratch_cap;
+    float *work[4];            /* the fused sequences' buffers (grow only)    */
+    size_t work_cap[4];
     nmz_status sticky;         /* an asynchronous error seen at sync          */
 } g;
 
@@ -206,6 +212,19 @@ static void *scratch(size_t bytes) {
         g.scratch_cap = bytes < 65536 ? 65536 : bytes;
     }
     return g.scratch;
+}
+
+/* grow-only buffers of the fused sequence kernels (one op at a time on one
+ * stream, so they are never in use by two ops) */
+static float *work(int i, size_t floats) {
+    if (floats > g.work_cap[i]) {
+        if (g.work[i]) cu_release(&g_be, g.work[i]);
+        g.work_cap[i] = 0;
+        g.work[i] = (float *)cu_alloc(&g_be, floats * sizeof(float));
+        if (!g.work[i]) return NULL;
+        g.work_cap[i] = floats;
+    }
+    return g.work[i];
 }
 
 static nmz_status cu_upload(const nmz_backend *be, void *dev, const void *host, size_t bytes) {
@@ -794,6 +813,41 @@ __global__ void k_attn_bwd_kv(int B, int H, int T, int Tk, int Tp, int d, int E,
     }
 }
 
+
+/* the attention softmax over the visible keys of each score row (b, h, t):
+ * from S (raw scores, masked entries set to 0 for the trace) into P */
+__global__ void k_attn_softmax(size_t rows, int T, int Tk, int Tp, float *S, float *P) {
+    for (size_t r = WARP_ID(); r < rows; r += WARP_STRIDE()) {
+        int lane = threadIdx.x & 31, last = Tp + (int)(r % T);
+        float *sr = S + r * Tk, *pr = P + r * Tk, mx = -INFINITY;
+        double sum = 0;
+        for (int j = lane; j <= last; j += 32) mx = fmaxf(mx, sr[j]);
+        mx = warp_max(mx);
+        for (int j = lane; j <= last; j += 32) sum += expf(sr[j] - mx);
+        sum = warp_sumd(sum);
+        for (int j = lane; j < Tk; j += 32) {
+            if (j <= last) {
+                pr[j] = (float)(expf(sr[j] - mx) / sum);
+            } else {
+                pr[j] = 0.0f; /* masked: the future */
+                if (S != P) sr[j] = 0.0f;
+            }
+        }
+    }
+}
+/* dP (∂L/∂weights in) → ∂L/∂scores (out): p ⊙ (dp − Σ p·dp), 0 where masked */
+__global__ void k_attn_softmax_bwd(size_t rows, int T, int Tk, int Tp, const float *P, float *dP) {
+    for (size_t r = WARP_ID(); r < rows; r += WARP_STRIDE()) {
+        int lane = threadIdx.x & 31, last = Tp + (int)(r % T);
+        const float *pr = P + r * Tk;
+        float *dr = dP + r * Tk;
+        double dot = 0;
+        for (int j = lane; j <= last; j += 32) dot += (double)pr[j] * dr[j];
+        dot = warp_sumd(dot);
+        for (int j = lane; j < Tk; j += 32) dr[j] = j <= last ? (float)(pr[j] * ((double)dr[j] - dot)) : 0.0f;
+    }
+}
+
 /* ------------------------------------------------------ recurrent cells */
 
 #define AT(r, b, j) ((r).p[(size_t)(b) * (r).ld + (j)])
@@ -889,6 +943,213 @@ __global__ void k_gru_bwd2(int B, int H, nmz_rows gt, nmz_rows hp, nmz_rows drh,
         AT(da, b, H + j) = d * AT(hp, b, j) * r * (1.0f - r);
         AT(dhn, b, j) = AT(direct, b, j) + d * r;
     }
+}
+
+
+/* ------------------------------------------- fused recurrent sequences
+ * A recurrence is sequential in t but independent across rows: one thread
+ * block per row runs every step of it, keeping h (and c) in shared memory
+ * and reading W_h from the cache, so a sequence costs one launch instead
+ * of two per step. The input product of all steps and the weight
+ * gradients of all steps stay single cuBLAS GEMMs around these kernels. */
+
+#define SEQ_REC(field, j) \
+    if (rec.field) rec.field[row * H + (j)]
+
+__global__ void k_rnn_seq_fwd(int T, int H, const float *h0, const float *Whh, float *z, float *y) {
+    extern __shared__ float sh[]; /* h [H] */
+    const int b = blockIdx.x, j = threadIdx.x;
+    if (j < H) sh[j] = h0[(size_t)b * H + j];
+    __syncthreads();
+    for (int t = 0; t < T; t++) {
+        size_t row = (size_t)b * T + t;
+        float acc = 0.0f;
+        if (j < H) {
+            acc = z[row * H + j];
+            for (int i = 0; i < H; i++) acc += sh[i] * Whh[(size_t)i * H + j];
+        }
+        __syncthreads();
+        if (j < H) {
+            float hv = tanhf(acc);
+            z[row * H + j] = acc;
+            y[row * H + j] = hv;
+            sh[j] = hv;
+        }
+        __syncthreads();
+    }
+}
+
+/* WhT = W_hᵀ ([G, H]): ∂L/∂h_{t−1} reads it by rows, coalesced */
+__global__ void k_rnn_seq_bwd(int T, int H, const float *y, const float *dy, const float *WhT, float *dz,
+                              float *dh_next, nmz_seq_record rec) {
+    extern __shared__ float sh[]; /* dz_t [H] */
+    const int b = blockIdx.x, j = threadIdx.x;
+    float dn = 0.0f;
+    for (int t = T - 1; t >= 0; t--) {
+        size_t row = (size_t)b * T + t;
+        if (j < H) {
+            float hv = y[row * H + j], dh = dy[row * H + j] + dn, d = dh * (1.0f - hv * hv);
+            dz[row * H + j] = d;
+            sh[j] = d;
+            SEQ_REC(dh_next, j) = dn;
+            SEQ_REC(dh, j) = dh;
+            SEQ_REC(da, j) = d;
+        }
+        __syncthreads();
+        if (j < H) {
+            float acc = 0.0f;
+            for (int k = 0; k < H; k++) acc += sh[k] * WhT[(size_t)k * H + j];
+            dn = acc;
+            SEQ_REC(dh_prev, j) = acc;
+        }
+        __syncthreads();
+    }
+    if (j < H) dh_next[(size_t)b * H + j] = dn;
+}
+
+__global__ void k_lstm_seq_fwd(int T, int H, const float *h0, const float *c0, const float *Wh, float *gates, float *c,
+                               float *y) {
+    extern __shared__ float sh[]; /* h [H], a [4H] */
+    const int b = blockIdx.x, j = threadIdx.x, G = 4 * H;
+    float *h = sh, *a = sh + H, cprev = 0.0f;
+    if (j < H) h[j] = h0[(size_t)b * H + j], cprev = c0[(size_t)b * H + j];
+    __syncthreads();
+    for (int t = 0; t < T; t++) {
+        size_t row = (size_t)b * T + t;
+        float *gt = gates + row * G;
+        if (j < G) {
+            float acc = gt[j];
+            for (int i = 0; i < H; i++) acc += h[i] * Wh[(size_t)i * G + j];
+            a[j] = acc;
+        }
+        __syncthreads();
+        if (j < H) {
+            float ig = sig(a[j]), fg = sig(a[H + j]), gg = tanhf(a[2 * H + j]), og = sig(a[3 * H + j]);
+            float cv = fg * cprev + ig * gg, hv = og * tanhf(cv);
+            cprev = cv;
+            gt[j] = ig, gt[H + j] = fg, gt[2 * H + j] = gg, gt[3 * H + j] = og;
+            c[row * H + j] = cv;
+            y[row * H + j] = hv;
+            h[j] = hv;
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void k_lstm_seq_bwd(int T, int H, const float *gates, const float *c, const float *c0, const float *dy,
+                               const float *WhT, float *dA, float *dh_next, float *dc_next, nmz_seq_record rec) {
+    extern __shared__ float sh[]; /* da_t [4H] */
+    const int b = blockIdx.x, j = threadIdx.x, G = 4 * H;
+    float dhn = 0.0f, dcn = 0.0f;
+    for (int t = T - 1; t >= 0; t--) {
+        size_t row = (size_t)b * T + t;
+        if (j < H) {
+            const float *gt = gates + row * G;
+            float ig = gt[j], fg = gt[H + j], gg = gt[2 * H + j], og = gt[3 * H + j], tc = tanhf(c[row * H + j]);
+            float cp = t ? c[(row - 1) * H + j] : c0[(size_t)b * H + j];
+            float dh = dy[row * H + j] + dhn, dc = dcn + dh * og * (1.0f - tc * tc);
+            sh[j] = dc * gg * ig * (1.0f - ig);
+            sh[H + j] = dc * cp * fg * (1.0f - fg);
+            sh[2 * H + j] = dc * ig * (1.0f - gg * gg);
+            sh[3 * H + j] = dh * tc * og * (1.0f - og);
+            SEQ_REC(dh_next, j) = dhn;
+            SEQ_REC(dh, j) = dh;
+            SEQ_REC(dc_next, j) = dcn;
+            SEQ_REC(dc, j) = dc;
+            SEQ_REC(dc_prev, j) = dc * fg;
+            dcn = dc * fg;
+        }
+        __syncthreads();
+        if (j < G) {
+            dA[row * G + j] = sh[j];
+            if (rec.da) rec.da[row * G + j] = sh[j];
+        }
+        if (j < H) {
+            float acc = 0.0f;
+            for (int k = 0; k < G; k++) acc += sh[k] * WhT[(size_t)k * H + j];
+            dhn = acc;
+            SEQ_REC(dh_prev, j) = acc;
+        }
+        __syncthreads();
+    }
+    if (j < H) dh_next[(size_t)b * H + j] = dhn, dc_next[(size_t)b * H + j] = dcn;
+}
+
+__global__ void k_gru_seq_fwd(int T, int H, const float *h0, const float *Wh, float *gates, float *y) {
+    extern __shared__ float sh[]; /* h [H], a [2H], rh [H] */
+    const int b = blockIdx.x, j = threadIdx.x, G = 3 * H;
+    float *h = sh, *a = sh + H, *rh = sh + 3 * H;
+    if (j < H) h[j] = h0[(size_t)b * H + j];
+    __syncthreads();
+    for (int t = 0; t < T; t++) {
+        size_t row = (size_t)b * T + t;
+        float *gt = gates + row * G;
+        if (j < 2 * H) { /* z and r see h_{t−1} */
+            float acc = gt[j];
+            for (int i = 0; i < H; i++) acc += h[i] * Wh[(size_t)i * G + j];
+            a[j] = acc;
+        }
+        __syncthreads();
+        if (j < H) {
+            float z = sig(a[j]), r = sig(a[H + j]);
+            gt[j] = z, gt[H + j] = r;
+            rh[j] = r * h[j];
+        }
+        __syncthreads();
+        if (j < H) { /* the candidate sees r ⊙ h_{t−1} */
+            float acc = gt[2 * H + j], n, z = gt[j];
+            for (int i = 0; i < H; i++) acc += rh[i] * Wh[(size_t)i * G + 2 * H + j];
+            n = tanhf(acc);
+            gt[2 * H + j] = n;
+            y[row * H + j] = z * h[j] + (1.0f - z) * n;
+            h[j] = y[row * H + j]; /* only this thread reads h[j] in this phase */
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void k_gru_seq_bwd(int T, int H, const float *y, const float *h0, const float *gates, const float *dy,
+                              const float *WhT, float *dA, float *RH, float *dh_next, nmz_seq_record rec) {
+    extern __shared__ float sh[]; /* da_t [3H] */
+    const int b = blockIdx.x, j = threadIdx.x, G = 3 * H;
+    float dhn = 0.0f, direct = 0.0f, part = 0.0f, hp = 0.0f, r = 0.0f;
+    for (int t = T - 1; t >= 0; t--) {
+        size_t row = (size_t)b * T + t;
+        if (j < H) {
+            const float *gt = gates + row * G;
+            float z = gt[j], n = gt[2 * H + j], dh;
+            r = gt[H + j];
+            hp = t ? y[(row - 1) * H + j] : h0[(size_t)b * H + j];
+            dh = dy[row * H + j] + dhn;
+            sh[j] = dh * (hp - n) * z * (1.0f - z);
+            sh[2 * H + j] = dh * (1.0f - z) * (1.0f - n * n);
+            direct = dh * z;
+            RH[row * H + j] = r * hp;
+            SEQ_REC(dh_next, j) = dhn;
+            SEQ_REC(dh, j) = dh;
+            SEQ_REC(direct, j) = direct;
+        }
+        __syncthreads();
+        if (j < H) { /* ∂L/∂(r⊙h_{t−1}) = ∂L/∂a_ĥ·W_hĥᵀ, then ∂L/∂a_r */
+            float drh = 0.0f;
+            for (int k = 0; k < H; k++) drh += sh[2 * H + k] * WhT[(size_t)(2 * H + k) * H + j];
+            sh[H + j] = drh * hp * r * (1.0f - r);
+            part = direct + drh * r;
+        }
+        __syncthreads();
+        if (j < G) {
+            dA[row * G + j] = sh[j];
+            if (rec.da) rec.da[row * G + j] = sh[j];
+        }
+        if (j < H) { /* + [∂L/∂a_z ∂L/∂a_r]·[W_hz W_hr]ᵀ */
+            float acc = part;
+            for (int k = 0; k < 2 * H; k++) acc += sh[k] * WhT[(size_t)k * H + j];
+            dhn = acc;
+            SEQ_REC(dh_prev, j) = acc;
+        }
+        __syncthreads();
+    }
+    if (j < H) dh_next[(size_t)b * H + j] = dhn;
 }
 
 /* ------------------------------------------------------------ optimizers */
@@ -1284,29 +1545,89 @@ static nmz_status cu_ln_backward(const nmz_backend *be, size_t rows, int D, cons
     return colsum(rows, D, dy, NULL, db);                       /* db += Σ dy     */
 }
 
+/* row-major, strided batched: C_i = α·op(A_i)·op(B_i) + β·C_i, i = 0 … batch−1 */
+static nmz_status gemm_sb(int ta, int tb, int M, int N, int K, float alpha, const float *A, int lda, long long sa,
+                          const float *B, int ldb, long long sb, float beta, float *C, int ldc, long long sc, int batch) {
+    cublasStatus_t st = g.sgemm_sb(g.blas, tb ? CUBLAS_OP_T : CUBLAS_OP_N, ta ? CUBLAS_OP_T : CUBLAS_OP_N, N, M, K, &alpha,
+                                   B, ldb, sb, A, lda, sa, &beta, C, ldc, sc, batch);
+    if (st != CUBLAS_STATUS_SUCCESS)
+        return nmz_backend_error(NMZ_ERR_STATE, "cuBLAS strided batched SGEMM failed (status %d)", (int)st);
+    return NMZ_OK;
+}
+
+/* Attention on the GPU. Long query blocks (training, a prompt): per row b,
+ * the heads' products as strided batched cuBLAS GEMMs (S = Q·Kᵀ/√d for all
+ * keys, the causal softmax zeroes the future, C = P·V); the masked half of
+ * S is computed and thrown away, which cuBLAS does faster than a masked
+ * kernel. Short blocks (generation: one new position against the KV cache):
+ * one warp per query row, one launch. */
+#define ATTN_GEMM_MIN_T 16
+
 static nmz_status cu_attn_forward(const nmz_backend *be, int B, int H, int T, int Tk, int Tp, int d, int E,
                                   const float *qkv, const float *kv, float *P, float *S, float *ctx) {
+    const float scale = (float)(1.0 / sqrt((double)d));
+    nmz_status s;
+    int b;
     (void)be;
     if (!B || !T) return NMZ_OK;
     NEED(qkv && kv && P && ctx);
-    k_attn_fwd<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>(B, H, T, Tk, Tp, d, E,
-                                                                       (float)(1.0 / sqrt((double)d)), qkv, kv, P, S,
-                                                                       ctx);
-    return check("attention");
+    if (T < ATTN_GEMM_MIN_T) {
+        k_attn_fwd<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, kv, P, S,
+                                                                           ctx);
+        return check("attention");
+    }
+    for (b = 0; b < B; b++) { /* scores of every head of row b: [T, Tk] each */
+        float *Sb = (S ? S : P) + (size_t)b * H * T * Tk;
+        if ((s = gemm_sb(0, 1, T, Tk, d, scale, qkv + (size_t)b * T * 3 * E, 3 * E, d, kv + (size_t)b * Tk * 2 * E,
+                         2 * E, d, 0.0f, Sb, Tk, (long long)T * Tk, H)) != NMZ_OK)
+            return s;
+    }
+    k_attn_softmax<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>((size_t)B * H * T, T, Tk, Tp, S ? S : P, P);
+    if ((s = check("attention softmax")) != NMZ_OK) return s;
+    for (b = 0; b < B; b++) /* context = weights · values, heads side by side */
+        if ((s = gemm_sb(0, 0, T, d, Tk, 1.0f, P + (size_t)b * H * T * Tk, Tk, (long long)T * Tk,
+                         kv + (size_t)b * Tk * 2 * E + E, 2 * E, d, 0.0f, ctx + (size_t)b * T * E, E, d, H)) != NMZ_OK)
+            return s;
+    return NMZ_OK;
 }
 
 static nmz_status cu_attn_backward(const nmz_backend *be, int B, int H, int T, int Tk, int Tp, int d, int E,
                                    const float *qkv, const float *kv, const float *P, const float *dctx, float *dP,
                                    float *dqkv, float *dkv) {
     const float scale = (float)(1.0 / sqrt((double)d));
+    nmz_status s;
+    int b;
     (void)be;
     if (!B || !T) return NMZ_OK;
     NEED(qkv && kv && P && dctx && dP && dqkv && dkv);
-    k_attn_bwd_q<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, kv, P, dctx,
-                                                                         dP, dqkv);
-    k_attn_bwd_kv<<<warps_blocks((size_t)B * H * Tk), TPB, 0, g.stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, P, dctx,
-                                                                           dP, dkv);
-    return check("attention backward");
+    if (T < ATTN_GEMM_MIN_T) {
+        k_attn_bwd_q<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, kv, P,
+                                                                             dctx, dP, dqkv);
+        k_attn_bwd_kv<<<warps_blocks((size_t)B * H * Tk), TPB, 0, g.stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, P,
+                                                                               dctx, dP, dkv);
+        return check("attention backward");
+    }
+    for (b = 0; b < B; b++) { /* ∂L/∂weights = ∂L/∂context · Vᵀ */
+        const float *dc = dctx + (size_t)b * T * E, *v = kv + (size_t)b * Tk * 2 * E + E;
+        if ((s = gemm_sb(0, 1, T, Tk, d, 1.0f, dc, E, d, v, 2 * E, d, 0.0f, dP + (size_t)b * H * T * Tk, Tk,
+                         (long long)T * Tk, H)) != NMZ_OK)
+            return s;
+    }
+    k_attn_softmax_bwd<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>((size_t)B * H * T, T, Tk, Tp, P, dP);
+    if ((s = check("attention softmax backward")) != NMZ_OK) return s;
+    for (b = 0; b < B; b++) {
+        const float *dS = dP + (size_t)b * H * T * Tk, *Pb = P + (size_t)b * H * T * Tk;
+        const float *q = qkv + (size_t)b * T * 3 * E, *k = kv + (size_t)b * Tk * 2 * E, *dc = dctx + (size_t)b * T * E;
+        float *dq = dqkv + (size_t)b * T * 3 * E, *dk = dkv + (size_t)b * Tk * 2 * E;
+        /* ∂L/∂q += ∂L/∂S · K/√d   ∂L/∂k += ∂L/∂Sᵀ · Q/√d   ∂L/∂v += Pᵀ · ∂L/∂context */
+        if ((s = gemm_sb(0, 0, T, d, Tk, scale, dS, Tk, (long long)T * Tk, k, 2 * E, d, 1.0f, dq, 3 * E, d, H)) !=
+                NMZ_OK ||
+            (s = gemm_sb(1, 0, Tk, d, T, scale, dS, Tk, (long long)T * Tk, q, 3 * E, d, 1.0f, dk, 2 * E, d, H)) !=
+                NMZ_OK ||
+            (s = gemm_sb(1, 0, Tk, d, T, 1.0f, Pb, Tk, (long long)T * Tk, dc, E, d, 1.0f, dk + E, 2 * E, d, H)) != NMZ_OK)
+            return s;
+    }
+    return NMZ_OK;
 }
 
 static nmz_seq_record rec_of(const nmz_seq_record *r) {
@@ -1371,6 +1692,137 @@ static nmz_status cu_gru_cell_backward2(const nmz_backend *be, int B, int H, nmz
     NEED(gates.p && h_prev.p && drh.p && direct.p && da.p && dh_next.p);
     k_gru_bwd2<<<CELL(B * H)>>>(B, H, gates, h_prev, drh, direct, da, dh_next);
     return check("gru cell backward");
+}
+
+
+/* ------------------------------------------------- fused sequences (host) */
+
+static unsigned seq_threads(int n) { return (unsigned)((n + 31) / 32 * 32); }
+
+/* W [H, G] → WhT [G, H] (work buffer 0) */
+static float *transposed(const float *W, int H, int G) {
+    float *t = work(0, (size_t)G * H);
+    if (t) k_transpose3<<<blocks_for((size_t)G * H), TPB, 0, g.stream>>>(H, G, 1, W, t);
+    return t;
+}
+
+/* the weight gradients of all steps at once, as in the layers' composition:
+ * dWx += xᵀ·dA, dWh (columns c0 … c0+n) += prevᵀ·dA, db += Σ dA, dx = dA·Wxᵀ */
+static nmz_status seq_grads(int B, int T, int D, int H, int G, const float *x, const float *y, const float *h0,
+                            const float *Wx, const float *dA, float *dWx, float *dWh, float *db, float *dx, int cols) {
+    float *prev = work(2, (size_t)B * T * H);
+    nmz_status s;
+    if (!prev) return nmz__op_failed();
+    if ((s = cu_gemm(&g_be, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE, D, G, B * T, x, D, dA, G, dWx, G)) != NMZ_OK) return s;
+    if (T > 1 && (s = cu_copy(&g_be, (size_t)B, (size_t)(T - 1) * H, y, (size_t)T * H, prev + H, (size_t)T * H)) != NMZ_OK)
+        return s;
+    if ((s = cu_copy(&g_be, (size_t)B, (size_t)H, h0, (size_t)H, prev, (size_t)T * H)) != NMZ_OK) return s;
+    if ((s = cu_gemm(&g_be, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE, H, cols, B * T, prev, H, dA, G, dWh, G)) != NMZ_OK)
+        return s;
+    if ((s = colsum((size_t)B * T, G, dA, NULL, db)) != NMZ_OK) return s;
+    return dx ? cu_gemm(&g_be, NMZ_MM_TRANS_B, B * T, D, G, dA, G, Wx, G, dx, D) : NMZ_OK;
+}
+
+static nmz_status cu_rnn_forward(const nmz_backend *be, int B, int T, int D, int H, const float *x, const float *h0,
+                                 const float *Wxh, const float *Whh, const float *b, float *y, float *z) {
+    nmz_status s;
+    (void)be;
+    if (H > 1024) return NMZ_ERR_UNSUPPORTED; /* one block per row: the layer composes it instead */
+    if (!B || !T) return NMZ_OK;
+    NEED(x && h0 && Wxh && Whh && b && y);
+    if (!z && !(z = work(1, (size_t)B * T * H))) return nmz__op_failed();
+    if ((s = cu_gemm(&g_be, 0, B * T, H, D, x, D, Wxh, H, z, H)) != NMZ_OK ||
+        (s = cu_add_bias(&g_be, (size_t)B * T, H, z, b)) != NMZ_OK)
+        return s;
+    k_rnn_seq_fwd<<<(unsigned)B, seq_threads(H), (size_t)H * sizeof(float), g.stream>>>(T, H, h0, Whh, z, y);
+    return check("rnn sequence");
+}
+
+static nmz_status cu_rnn_backward(const nmz_backend *be, int B, int T, int D, int H, const float *x, const float *y,
+                                  const float *h0, const float *Wxh, const float *Whh, const float *dy, float *dWxh,
+                                  float *dWhh, float *db, float *dx, float *dh_next, const nmz_seq_record *rec) {
+    float *WhT, *dz;
+    nmz_status s;
+    (void)be;
+    if (H > 1024) return NMZ_ERR_UNSUPPORTED;
+    if (!B || !T) return NMZ_OK;
+    NEED(x && y && h0 && Wxh && Whh && dy && dWxh && dWhh && db && dh_next);
+    if (!(WhT = transposed(Whh, H, H)) || !(dz = work(1, (size_t)B * T * H))) return nmz__op_failed();
+    k_rnn_seq_bwd<<<(unsigned)B, seq_threads(H), (size_t)H * sizeof(float), g.stream>>>(T, H, y, dy, WhT, dz, dh_next,
+                                                                                         rec_of(rec));
+    if ((s = check("rnn sequence backward")) != NMZ_OK) return s;
+    return seq_grads(B, T, D, H, H, x, y, h0, Wxh, dz, dWxh, dWhh, db, dx, H);
+}
+
+static nmz_status cu_lstm_forward(const nmz_backend *be, int B, int T, int D, int H, const float *x, const float *h0,
+                                  const float *c0, const float *Wx, const float *Wh, const float *b, float *y,
+                                  float *gates, float *c) {
+    const int G = 4 * H;
+    nmz_status s;
+    (void)be;
+    if (G > 1024) return NMZ_ERR_UNSUPPORTED;
+    if (!B || !T) return NMZ_OK;
+    NEED(x && h0 && c0 && Wx && Wh && b && y && gates && c);
+    if ((s = cu_gemm(&g_be, 0, B * T, G, D, x, D, Wx, G, gates, G)) != NMZ_OK ||
+        (s = cu_add_bias(&g_be, (size_t)B * T, G, gates, b)) != NMZ_OK)
+        return s;
+    k_lstm_seq_fwd<<<(unsigned)B, seq_threads(G), (size_t)5 * H * sizeof(float), g.stream>>>(T, H, h0, c0, Wh, gates, c,
+                                                                                             y);
+    return check("lstm sequence");
+}
+
+static nmz_status cu_lstm_backward(const nmz_backend *be, int B, int T, int D, int H, const float *x, const float *y,
+                                   const float *h0, const float *c0, const float *gates, const float *c,
+                                   const float *Wx, const float *Wh, const float *dy, float *dWx, float *dWh,
+                                   float *db, float *dx, float *dh_next, float *dc_next, const nmz_seq_record *rec) {
+    const int G = 4 * H;
+    float *WhT, *dA;
+    nmz_status s;
+    (void)be;
+    if (G > 1024) return NMZ_ERR_UNSUPPORTED;
+    if (!B || !T) return NMZ_OK;
+    NEED(x && y && h0 && c0 && gates && c && Wx && Wh && dy && dWx && dWh && db && dh_next && dc_next);
+    if (!(WhT = transposed(Wh, H, G)) || !(dA = work(1, (size_t)B * T * G))) return nmz__op_failed();
+    k_lstm_seq_bwd<<<(unsigned)B, seq_threads(G), (size_t)G * sizeof(float), g.stream>>>(
+        T, H, gates, c, c0, dy, WhT, dA, dh_next, dc_next, rec_of(rec));
+    if ((s = check("lstm sequence backward")) != NMZ_OK) return s;
+    return seq_grads(B, T, D, H, G, x, y, h0, Wx, dA, dWx, dWh, db, dx, G);
+}
+
+static nmz_status cu_gru_forward(const nmz_backend *be, int B, int T, int D, int H, const float *x, const float *h0,
+                                 const float *Wx, const float *Wh, const float *b, float *y, float *gates) {
+    const int G = 3 * H;
+    nmz_status s;
+    (void)be;
+    if (2 * H > 1024) return NMZ_ERR_UNSUPPORTED;
+    if (!B || !T) return NMZ_OK;
+    NEED(x && h0 && Wx && Wh && b && y && gates);
+    if ((s = cu_gemm(&g_be, 0, B * T, G, D, x, D, Wx, G, gates, G)) != NMZ_OK ||
+        (s = cu_add_bias(&g_be, (size_t)B * T, G, gates, b)) != NMZ_OK)
+        return s;
+    k_gru_seq_fwd<<<(unsigned)B, seq_threads(2 * H), (size_t)4 * H * sizeof(float), g.stream>>>(T, H, h0, Wh, gates, y);
+    return check("gru sequence");
+}
+
+static nmz_status cu_gru_backward(const nmz_backend *be, int B, int T, int D, int H, const float *x, const float *y,
+                                  const float *h0, const float *gates, const float *Wx, const float *Wh,
+                                  const float *dy, float *dWx, float *dWh, float *db, float *dx, float *dh_next,
+                                  const nmz_seq_record *rec) {
+    const int G = 3 * H;
+    float *WhT, *dA, *RH;
+    nmz_status s;
+    (void)be;
+    if (G > 1024) return NMZ_ERR_UNSUPPORTED;
+    if (!B || !T) return NMZ_OK;
+    NEED(x && y && h0 && gates && Wx && Wh && dy && dWx && dWh && db && dh_next);
+    if (!(WhT = transposed(Wh, H, G)) || !(dA = work(1, (size_t)B * T * G)) || !(RH = work(3, (size_t)B * T * H)))
+        return nmz__op_failed();
+    k_gru_seq_bwd<<<(unsigned)B, seq_threads(G), (size_t)G * sizeof(float), g.stream>>>(T, H, y, h0, gates, dy, WhT, dA,
+                                                                                         RH, dh_next, rec_of(rec));
+    if ((s = check("gru sequence backward")) != NMZ_OK) return s;
+    /* z and r saw h_{t−1}, the candidate r ⊙ h_{t−1}: two products for W_h */
+    if ((s = seq_grads(B, T, D, H, G, x, y, h0, Wx, dA, dWx, dWh, db, dx, 2 * H)) != NMZ_OK) return s;
+    return cu_gemm(&g_be, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE, H, H, B * T, RH, H, dA + 2 * H, G, dWh + 2 * H, G);
 }
 
 static nmz_status cu_sgd_velocity(const nmz_backend *be, size_t n, float lr, float mu, int fresh, const float *gr,
@@ -1583,9 +2035,10 @@ static nmz_status cu_init(const nmz_backend *be, char *why, size_t n) {
     create = (pf_create)symbol(g.lib, "cublasCreate_v2");
     set_stream = (pf_set_stream)symbol(g.lib, "cublasSetStream_v2");
     g.sgemm = (pf_sgemm)symbol(g.lib, "cublasSgemm_v2");
+    g.sgemm_sb = (pf_sgemm_sb)symbol(g.lib, "cublasSgemmStridedBatched");
     get_version = (pf_get_version)symbol(g.lib, "cublasGetVersion_v2");
-    if (!create || !set_stream || !g.sgemm) {
-        snprintf(why, n, "%s lacks cublasCreate_v2/cublasSgemm_v2", CUBLAS_LIB);
+    if (!create || !set_stream || !g.sgemm || !g.sgemm_sb) {
+        snprintf(why, n, "%s lacks cublasCreate_v2/cublasSgemm_v2/cublasSgemmStridedBatched", CUBLAS_LIB);
         return NMZ_ERR_UNSUPPORTED;
     }
     if (cudaStreamCreateWithFlags(&g.stream, cudaStreamNonBlocking) != cudaSuccess || create(&g.blas) != CUBLAS_STATUS_SUCCESS ||
@@ -1694,5 +2147,11 @@ extern "C" const nmz_backend *nmz__cuda_backend(void) {
     b->gather_rows = cu_gather_rows;
     b->onehot = cu_onehot;
     b->count_correct = cu_count_correct;
+    b->rnn_forward = cu_rnn_forward; /* the recurrences: one launch per sequence */
+    b->rnn_backward = cu_rnn_backward;
+    b->lstm_forward = cu_lstm_forward;
+    b->lstm_backward = cu_lstm_backward;
+    b->gru_forward = cu_gru_forward;
+    b->gru_backward = cu_gru_backward;
     return b;
 }
