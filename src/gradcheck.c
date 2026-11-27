@@ -182,7 +182,7 @@ nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_t
         nmz_tensor *w = nmz_layer_param_value(l, pi);
         for (e = 0; e < w->size; e++) {
             float orig = w->data[e];
-            double lp, lm;
+            double lp = 0, lm = 0;
             w->data[e] = (float)(orig + eps);
             sb.crossed = 0;
             s = loss_at(net, x, t, training, &rng0, &sb, &lp);
@@ -203,7 +203,7 @@ nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_t
     if ((s = nmz_tensor_copy(&xp, x)) != NMZ_OK) goto out;
     for (e = 0; e < xp.size && !(net->layers[0]->ops->flags & NMZ_LAYER_DISCRETE_INPUT); e++) {
         float orig = xp.data[e];
-        double lp, lm;
+        double lp = 0, lm = 0;
         xp.data[e] = (float)(orig + eps);
         sb.crossed = 0;
         s = loss_at(net, &xp, t, training, &rng0, &sb, &lp);

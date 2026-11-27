@@ -11,7 +11,7 @@ uint32_t nmz_rng_u32(nmz_rng *r) {
     r->state = old * 6364136223846793005ULL + r->inc;
     xorshifted = (uint32_t)(((old >> 18u) ^ old) >> 27u);
     rot = (uint32_t)(old >> 59u);
-    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31u));
+    return (xorshifted >> rot) | (xorshifted << ((0u - rot) & 31u));
 }
 
 void nmz_rng_seed(nmz_rng *r, uint64_t seed, uint64_t stream) {
@@ -31,7 +31,7 @@ uint32_t nmz_rng_below(nmz_rng *r, uint32_t bound) {
     m = (uint64_t)nmz_rng_u32(r) * bound;
     l = (uint32_t)m;
     if (l < bound) {
-        uint32_t t = (uint32_t)(-bound) % bound;
+        uint32_t t = (0u - bound) % bound;
         while (l < t) {
             m = (uint64_t)nmz_rng_u32(r) * bound;
             l = (uint32_t)m;

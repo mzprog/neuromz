@@ -42,6 +42,12 @@ if(MSVC)
 else()
   target_compile_options(nmz_warnings INTERFACE -Wall -Wextra -pedantic -Wshadow -Wstrict-prototypes
                                                 -Wmissing-prototypes -Wvla $<$<BOOL:${NMZ_WERROR}>:-Werror>)
+  # no fused multiply-add contraction: a·b + c rounds twice everywhere, so
+  # the blocked matmul stays bit-identical to the naive loops (and the KV
+  # cache to recomputation) on CPUs with FMA too. GCC already does this in
+  # ISO C mode; Clang (Apple's in particular, on arm64) contracts by
+  # default — decision 120. MSVC does not contract under /fp:precise.
+  target_compile_options(nmz_warnings INTERFACE -ffp-contract=off)
 endif()
 if(NMZ_SANITIZE)
   if(MSVC)
