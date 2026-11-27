@@ -89,6 +89,10 @@ Building needs the CUDA Toolkit (tested with 13.5: `nvcc` and the CUDA
 runtime, which is linked statically). cuBLAS is loaded when a program first
 selects the GPU, so a CUDA build starts on any machine: without an NVIDIA
 GPU or driver, `"cuda"` fails with the reason and `"auto"` uses the CPU.
+To compute on a GPU, a machine needs the NVIDIA driver and cuBLAS
+(`cublas64_13.dll` and `cublasLt64_13.dll` on Windows, `libcublas.so.13`
+and `libcublasLt.so.13` on Linux: installed with the CUDA Toolkit, or
+placed next to the program).
 GPUs from compute capability 7.5 (Turing, the oldest CUDA 13 supports).
 `-DNMZ_CUDA_ARCHITECTURES` chooses the code compiled in: by default the GPU
 of the building machine (else 75); for a binary for others list them, e.g.
