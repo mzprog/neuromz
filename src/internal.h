@@ -20,6 +20,10 @@ nmz_status nmz__fail(nmz_status s, const char *fmt, ...)
     ;
 
 char *nmz__strdup(const char *s);
+/* file names are UTF-8 on every system (error.c) */
+FILE *nmz__fopen(const char *path, const char *mode);
+int nmz__remove(const char *path);
+int nmz__rename(const char *from, const char *to);
 /* Product of dims with overflow/limit checks. */
 nmz_status nmz__shape_size(int rank, const int *shape, size_t *out);
 int nmz__shape_equal(int rank_a, const int *a, int rank_b, const int *b);
@@ -155,7 +159,12 @@ struct nmz_net {
 
     int carry;            /* recurrent layers continue from their state */
     nmz_vocab *vocab;     /* text models: the character vocabulary      */
+    char *data_path;      /* training data source (decision 111)        */
+    uint64_t *item_hash;  /* sorted FNV-1a hashes of training items     */
+    int n_item_hash;
 };
+/* net.c: store an already sorted, distinct hash set (takes ownership) */
+void nmz__net_set_item_hashes(nmz_net *net, uint64_t *h, int n);
 
 /* Is the loss fused with a final softmax layer? */
 int nmz__net_fused_ce(const nmz_net *net);

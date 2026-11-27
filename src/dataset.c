@@ -94,7 +94,7 @@ static int parse_number(const char *s, float *out) {
 }
 
 static nmz_status read_all(const char *path, char **out) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = nmz__fopen(path, "rb");
     char *buf = NULL;
     size_t len = 0, cap = 0, n;
     if (!f) return nmz__fail(NMZ_ERR_IO, "cannot open '%s': %s", path, strerror(errno));
@@ -360,7 +360,7 @@ static int read_be32(FILE *f, uint32_t *v) {
 }
 
 static nmz_status idx_open(const char *path, uint32_t magic, int ndims, uint32_t *dims, FILE **out) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = nmz__fopen(path, "rb");
     uint32_t m = 0;
     int i;
     if (!f) return nmz__fail(NMZ_ERR_IO, "cannot open '%s': %s", path, strerror(errno));

@@ -198,7 +198,45 @@ static void test_train_after_load(void) {
     nmz_dataset_free(ds);
 }
 
+/* decision 111: the training data path and item hashes travel with the
+ * model; files without them (all earlier versions) load with none */
+static void test_data_source(void) {
+    nmz_net *net = make_net(), *back = NULL, *old = NULL;
+    const char *items[4] = {"Mara", "Lina", "Mara", "\xd9\x86\xd9\x88\xd8\xb1"}; /* a duplicate; نور */
+    CHECK(net != NULL);
+    if (!net) return;
+    CHECK(nmz_net_data_path(net) == NULL);
+    CHECK(nmz_net_knows_item(net, "Mara") == -1);
+    CHECK_OK(nmz_net_set_data_source(net, "/data/names.txt", items, 4));
+    CHECK(nmz_net_item_count(net) == 3);
+    CHECK(nmz_net_knows_item(net, "Mara") == 1);
+    CHECK(nmz_net_knows_item(net, "\xd9\x86\xd9\x88\xd8\xb1") == 1);
+    CHECK(nmz_net_knows_item(net, "Mar") == 0);
+    CHECK(nmz_net_knows_item(net, "") == 0);
+    CHECK_OK(nmz_net_save(net, test_path("t_src.nmz")));
+    CHECK_OK(nmz_net_load(&back, test_path("t_src.nmz")));
+    if (back) {
+        CHECK(nmz_net_data_path(back) && !strcmp(nmz_net_data_path(back), "/data/names.txt"));
+        CHECK(nmz_net_item_count(back) == 3);
+        CHECK(nmz_net_knows_item(back, "Lina") == 1);
+        CHECK(nmz_net_knows_item(back, "Lena") == 0);
+    }
+    /* path only (running text), then cleared */
+    CHECK_OK(nmz_net_set_data_source(net, "book.txt", NULL, 0));
+    CHECK(nmz_net_knows_item(net, "Mara") == -1);
+    CHECK_OK(nmz_net_set_data_source(net, NULL, NULL, 0));
+    CHECK(nmz_net_data_path(net) == NULL);
+    CHECK_STATUS(nmz_net_set_data_source(net, NULL, NULL, -1), NMZ_ERR_ARG);
+    /* a phase-2 file has no data_source section */
+    CHECK_OK(nmz_net_load(&old, "tests/data/v3_phase2_iris.nmz"));
+    if (old) CHECK(nmz_net_data_path(old) == NULL && nmz_net_knows_item(old, "x") == -1);
+    nmz_net_free(net);
+    nmz_net_free(back);
+    nmz_net_free(old);
+}
+
 const test_case io_tests[] = {
+    {"io/data_source_roundtrip", test_data_source},
     {"io/save_load_roundtrip", test_roundtrip},
     {"io/little_endian_layout", test_byte_layout},
     {"io/corrupt_truncated_foreign", test_corruption},

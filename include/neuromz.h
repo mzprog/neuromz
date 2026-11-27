@@ -486,6 +486,16 @@ nmz_status nmz_net_generate_batch(nmz_net *net, const nmz_gen_opts *opts, int co
 /* Text models: the character vocabulary, saved with the model (copied). */
 nmz_status nmz_net_set_vocab(nmz_net *net, const nmz_vocab *v);
 const nmz_vocab *nmz_net_vocab(const nmz_net *net);
+/* Where the model was trained from, saved with it (DESIGN decision 111):
+ * a path (may be NULL) and, for line-per-item data such as names, the set
+ * of training items as 64-bit FNV-1a hashes (items may be NULL / n = 0).
+ * Items are compared byte for byte; duplicates are kept once. Replaces any
+ * earlier source. */
+nmz_status nmz_net_set_data_source(nmz_net *net, const char *path, const char *const *items, int n_items);
+const char *nmz_net_data_path(const nmz_net *net); /* NULL when none */
+int nmz_net_item_count(const nmz_net *net);        /* distinct items stored */
+/* 1 if `item` was a training item, 0 if not, -1 when no items are stored. */
+int nmz_net_knows_item(const nmz_net *net, const char *item);
 /* ∂L/∂input of the last backward pass ([B, input_shape...]). */
 const nmz_tensor *nmz_net_input_grad(const nmz_net *net);
 /* Output of layer i from the last forward (i = -1: the input copy). */

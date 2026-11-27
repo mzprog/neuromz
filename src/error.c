@@ -1,9 +1,15 @@
-/* error.c — status strings and the thread-local last-error message. */
+/* error.c — status strings, the thread-local last-error message, and the
+ * library's only operating-system difference: file names (UTF-8 on every
+ * system; on Windows the C runtime's narrow functions use the ANSI code
+ * page, so names are converted to UTF-16 for _wfopen — decision 113). */
 #include "internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <wchar.h>
+#endif
 
 #if defined(_MSC_VER)
 #define NMZ_THREAD_LOCAL __declspec(thread)
@@ -38,6 +44,65 @@ nmz_status nmz__fail(nmz_status s, const char *fmt, ...) {
     vsnprintf(g_last_error, sizeof g_last_error, fmt, ap);
     va_end(ap);
     return s;
+}
+
+#if defined(_WIN32)
+/* UTF-8 → UTF-16 with the library's own decoder (no <windows.h>) */
+static wchar_t *widen(const char *s) {
+    uint32_t *cps = NULL;
+    size_t n = 0, i, k = 0;
+    wchar_t *w;
+    if (nmz_utf8_decode(s, strlen(s), &cps, &n, NULL) != NMZ_OK) return NULL;
+    w = malloc((2 * n + 1) * sizeof *w);
+    for (i = 0; w && i < n; i++) {
+        uint32_t c = cps[i];
+        if (c >= 0x10000u) { /* surrogate pair */
+            c -= 0x10000u;
+            w[k++] = (wchar_t)(0xD800u + (c >> 10));
+            w[k++] = (wchar_t)(0xDC00u + (c & 0x3FFu));
+        } else {
+            w[k++] = (wchar_t)c;
+        }
+    }
+    if (w) w[k] = 0;
+    free(cps);
+    return w;
+}
+#endif
+
+FILE *nmz__fopen(const char *path, const char *mode) {
+#if defined(_WIN32)
+    wchar_t *wp = widen(path), *wm = widen(mode);
+    FILE *f = wp && wm ? _wfopen(wp, wm) : NULL;
+    free(wp);
+    free(wm);
+    return f;
+#else
+    return fopen(path, mode);
+#endif
+}
+
+int nmz__remove(const char *path) {
+#if defined(_WIN32)
+    wchar_t *wp = widen(path);
+    int r = wp ? _wremove(wp) : -1;
+    free(wp);
+    return r;
+#else
+    return remove(path);
+#endif
+}
+
+int nmz__rename(const char *from, const char *to) {
+#if defined(_WIN32)
+    wchar_t *a = widen(from), *b = widen(to);
+    int r = a && b ? _wrename(a, b) : -1;
+    free(a);
+    free(b);
+    return r;
+#else
+    return rename(from, to);
+#endif
 }
 
 char *nmz__strdup(const char *s) {

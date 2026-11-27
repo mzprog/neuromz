@@ -244,6 +244,15 @@ static void sec_train_ext2(nmz_net *net, nmz_writer *w) {
     nmz_write_u32(w, (uint32_t)net->train.warmup_steps);
 }
 
+/* phase 6: where the model was trained from (decision 111): the path and
+ * the sorted hashes of line-per-item training data */
+static void sec_data_source(nmz_net *net, nmz_writer *w) {
+    int i;
+    write_str(w, net->data_path ? net->data_path : "");
+    nmz_write_u32(w, (uint32_t)net->n_item_hash);
+    for (i = 0; i < net->n_item_hash; i++) write_u64(w, net->item_hash[i]);
+}
+
 static void write_section(nmz_net *net, nmz_writer *w, const char *tag, void (*fn)(nmz_net *, nmz_writer *)) {
     writer_ext counter;
     memset(&counter, 0, sizeof counter);
@@ -309,13 +318,15 @@ static nmz_status save_body(nmz_net *net, nmz_writer *w, unsigned flags) {
         int with_vocab = net->vocab != NULL;
         int with_tnorm = with_vocab && net->vocab->normalize != 0;
         int with_ext2 = has_train_ext2(net);
-        nmz_write_u32(w, (uint32_t)(with_norm + with_opt + with_vocab + with_tnorm + 1 + with_ext2));
+        int with_src = net->data_path != NULL || net->n_item_hash > 0;
+        nmz_write_u32(w, (uint32_t)(with_norm + with_opt + with_vocab + with_tnorm + 1 + with_ext2 + with_src));
         if (with_norm) write_section(net, w, "normalize", sec_normalize);
         if (with_opt) write_section(net, w, "optimizer", sec_optimizer);
         if (with_vocab) write_section(net, w, "vocab", sec_vocab);
         if (with_tnorm) write_section(net, w, "text_norm", sec_text_norm);
         write_section(net, w, "train_ext", sec_train_ext);
         if (with_ext2) write_section(net, w, "train_ext2", sec_train_ext2);
+        if (with_src) write_section(net, w, "data_source", sec_data_source);
     }
     return nmz_write_u32(w, w->crc); /* footer: CRC of everything above */
 }
@@ -335,7 +346,7 @@ nmz_status nmz_net_save_ex(nmz_net *net, const char *path, unsigned flags) {
     memcpy(tmp, path, n);
     memcpy(tmp + n, ".tmp", 5);
     memset(&x, 0, sizeof x);
-    x.w.f = fopen(tmp, "wb");
+    x.w.f = nmz__fopen(tmp, "wb");
     if (!x.w.f) {
         s = nmz__fail(NMZ_ERR_IO, "cannot write '%s': %s", tmp, strerror(errno));
         free(tmp);
@@ -344,11 +355,11 @@ nmz_status nmz_net_save_ex(nmz_net *net, const char *path, unsigned flags) {
     s = save_body(net, &x.w, flags);
     if (fclose(x.w.f) != 0 && s == NMZ_OK) s = nmz__fail(NMZ_ERR_IO, "write failed: %s", strerror(errno));
     /* write to a temp file, then rename: a failed save never destroys a good model */
-    if (s == NMZ_OK && rename(tmp, path) != 0) {
-        remove(path); /* rename() does not overwrite on some platforms */
-        if (rename(tmp, path) != 0) s = nmz__fail(NMZ_ERR_IO, "cannot replace '%s': %s", path, strerror(errno));
+    if (s == NMZ_OK && nmz__rename(tmp, path) != 0) {
+        nmz__remove(path); /* rename() does not overwrite on Windows */
+        if (nmz__rename(tmp, path) != 0) s = nmz__fail(NMZ_ERR_IO, "cannot replace '%s': %s", path, strerror(errno));
     }
-    if (s != NMZ_OK) remove(tmp);
+    if (s != NMZ_OK) nmz__remove(tmp);
     free(tmp);
     return s;
 }
@@ -444,6 +455,42 @@ static nmz_status read_train_ext(nmz_reader *r, nmz_net *net) {
     return NMZ_OK;
 }
 
+static void read_data_source(nmz_reader *r, nmz_net *net, uint32_t len) {
+    char *path = NULL;
+    uint32_t n = 0, i;
+    uint64_t *h = NULL;
+    if (read_str(r, &path) != NMZ_OK || nmz_read_u32(r, &n) != NMZ_OK) {
+        free(path);
+        return;
+    }
+    if ((uint64_t)n * 8u > len || n > 10000000u) {
+        free(path);
+        r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt data_source section");
+        return;
+    }
+    if (n && !(h = malloc((size_t)n * sizeof *h))) {
+        free(path);
+        r->err = nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+        return;
+    }
+    for (i = 0; i < n && r->err == NMZ_OK; i++) {
+        read_u64(r, &h[i]);
+        if (i && h[i] <= h[i - 1]) r->err = nmz__fail(NMZ_ERR_FORMAT, "corrupt data_source section (unsorted)");
+    }
+    if (r->err != NMZ_OK) {
+        free(path);
+        free(h);
+        return;
+    }
+    free(net->data_path);
+    net->data_path = NULL;
+    if (*path)
+        net->data_path = path;
+    else
+        free(path);
+    nmz__net_set_item_hashes(net, h, (int)n);
+}
+
 static nmz_status read_sections(nmz_reader *r, nmz_net *net) {
     uint32_t n = 0, i, len = 0;
     if (nmz_read_u32(r, &n) != NMZ_OK) return r->err;
@@ -478,6 +525,8 @@ static nmz_status read_sections(nmz_reader *r, nmz_net *net) {
                 net->train.warmup_steps = (int)warm;
             }
         }
+        else if (!strcmp(tag, "data_source"))
+            read_data_source(r, net, len);
         else if (!strcmp(tag, "text_norm")) {
             uint32_t f = 0;
             if (nmz_read_u32(r, &f) == NMZ_OK) {
@@ -696,7 +745,7 @@ nmz_status nmz_net_load(nmz_net **out, const char *path) {
     if (!out || !path) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
     *out = NULL;
     memset(&x, 0, sizeof x);
-    x.r.f = fopen(path, "rb");
+    x.r.f = nmz__fopen(path, "rb");
     if (!x.r.f) return nmz__fail(NMZ_ERR_IO, "cannot open '%s': %s", path, strerror(errno));
     s = load_body(&x.r, out);
     fclose(x.r.f);

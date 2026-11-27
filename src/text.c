@@ -203,7 +203,7 @@ nmz_text_opts nmz_text_defaults(void) {
 }
 
 static nmz_status read_file(const char *path, char **buf, size_t *len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = nmz__fopen(path, "rb");
     size_t cap = 65536, n = 0, got;
     char *b;
     if (!f) return nmz__fail(NMZ_ERR_IO, "cannot open '%s': %s", path, strerror(errno));

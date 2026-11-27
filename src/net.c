@@ -160,6 +160,8 @@ void nmz_net_free(nmz_net *net) {
     nmz_tensor_free(&net->in1);
     nmz_tensor_free(&net->out1);
     nmz_vocab_free(net->vocab);
+    free(net->data_path);
+    free(net->item_hash);
     free(net);
 }
 
@@ -834,6 +836,70 @@ nmz_status nmz_net_set_vocab(nmz_net *net, const nmz_vocab *v) {
 }
 
 const nmz_vocab *nmz_net_vocab(const nmz_net *net) { return net ? net->vocab : NULL; }
+
+/* ------------------------------------------------- training data source
+ * The CLI's `generate --new-only` needs to know which items the model saw.
+ * Keeping 8 bytes per item (not the items) keeps model files small and
+ * private enough to share; a false "known" needs a 64-bit collision
+ * (≈ n²/2⁶⁵, about 10⁻¹¹ for 20 000 names). */
+static uint64_t item_hash(const char *s) {
+    uint64_t h = 14695981039346656037ull; /* FNV-1a 64 */
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * 1099511628211ull;
+    return h;
+}
+
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+void nmz__net_set_item_hashes(nmz_net *net, uint64_t *h, int n) {
+    free(net->item_hash);
+    net->item_hash = h;
+    net->n_item_hash = h ? n : 0;
+}
+
+nmz_status nmz_net_set_data_source(nmz_net *net, const char *path, const char *const *items, int n_items) {
+    char *p = NULL;
+    uint64_t *h = NULL;
+    int i, n = 0;
+    if (!net || n_items < 0 || (n_items > 0 && !items)) return nmz__fail(NMZ_ERR_ARG, "bad data source arguments");
+    if (path && strlen(path) > 4096) return nmz__fail(NMZ_ERR_ARG, "data path too long");
+    if (n_items > 10000000) return nmz__fail(NMZ_ERR_ARG, "too many items (at most 10 000 000)");
+    if (path && !(p = nmz__strdup(path))) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+    if (n_items > 0) {
+        if (!(h = malloc((size_t)n_items * sizeof *h))) {
+            free(p);
+            return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+        }
+        for (i = 0; i < n_items; i++) {
+            if (!items[i]) {
+                free(p);
+                free(h);
+                return nmz__fail(NMZ_ERR_ARG, "item %d is NULL", i);
+            }
+            h[i] = item_hash(items[i]);
+        }
+        qsort(h, (size_t)n_items, sizeof *h, cmp_u64);
+        for (i = 0; i < n_items; i++)
+            if (n == 0 || h[i] != h[n - 1]) h[n++] = h[i];
+    }
+    free(net->data_path);
+    net->data_path = p;
+    nmz__net_set_item_hashes(net, h, n);
+    return NMZ_OK;
+}
+
+const char *nmz_net_data_path(const nmz_net *net) { return net ? net->data_path : NULL; }
+
+int nmz_net_item_count(const nmz_net *net) { return net ? net->n_item_hash : 0; }
+
+int nmz_net_knows_item(const nmz_net *net, const char *item) {
+    uint64_t h;
+    if (!net || !net->item_hash || !item) return -1;
+    h = item_hash(item);
+    return bsearch(&h, net->item_hash, (size_t)net->n_item_hash, sizeof h, cmp_u64) != NULL;
+}
 
 int nmz_net_is_sequence(const nmz_net *net) { return net && net->in_shape[0] == NMZ_ANY_LENGTH; }
 
