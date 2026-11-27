@@ -58,7 +58,7 @@ static nmz_status cpu_copy(const nmz_backend *be, size_t rows, size_t cols, cons
     size_t r;
     (void)be;
     if (rows == 1 || (lds == cols && ldd == cols)) {
-        if (rows * cols) memmove(dst, src, rows * cols * sizeof(float));
+        if (rows && cols) memmove(dst, src, rows * cols * sizeof(float));
         return NMZ_OK;
     }
     for (r = 0; r < rows; r++) memmove(dst + r * ldd, src + r * lds, cols * sizeof(float));

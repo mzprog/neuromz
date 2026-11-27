@@ -115,7 +115,7 @@ nmz_status nmz_backend_select(const char *name) {
             snprintf(g_note, sizeof g_note, "auto: CUDA device found (%s)", di.device);
         } else {
             g_current = NULL;
-            snprintf(g_note, sizeof g_note, "auto: no usable CUDA device (%s), using the CPU", sl->why);
+            snprintf(g_note, sizeof g_note, "auto: no usable CUDA device (%.200s), using the CPU", sl->why);
         }
         return NMZ_OK;
     }
