@@ -2104,7 +2104,7 @@ static void cu_info(const nmz_backend *be, nmz_device_info *out) {
     size_t fr = 0, tot = 0;
     (void)be;
     if (!g.ready) return;
-    snprintf(out->device, sizeof out->device, "%s", g.prop.name);
+    snprintf(out->device, sizeof out->device, "%.127s", g.prop.name); /* prop.name has 256 */
     out->cc_major = g.prop.major;
     out->cc_minor = g.prop.minor;
     cudaMemGetInfo(&fr, &tot);
