@@ -14,9 +14,13 @@
  *     row-major operands passed as the transposed column-major problem.
  *     Every other op is a kernel below, in float with double sums where the
  *     CPU sums in double (reductions, statistics, Adam).
- *   - One stream. Ops are asynchronous; scalars an op returns (losses,
- *     norms, counts) are written by a kernel to device memory, copied to
- *     pinned host memory on the stream, and delivered at sync().
+ *   - One stream per host thread (with its own cuBLAS handle, work
+ *     buffers and pending results), so nets trained in parallel threads
+ *     run side by side on the GPU without sharing state (decision 158).
+ *     Ops are asynchronous; scalars an op returns (losses, norms, counts)
+ *     are written by a kernel to device memory, copied to pinned host
+ *     memory on the thread's stream, and delivered at that thread's sync().
+ *     The device, cuBLAS and the allocation table are shared (a mutex).
  *   - Reductions are deterministic: partial sums per block, then one pass
  *     in a fixed order (no atomics), so a run repeats bit for bit. The one
  *     exception is the embedding gradient of a large vocabulary
@@ -27,6 +31,7 @@
 #include <cuda_runtime.h>
 
 #include <math.h>
+#include <mutex>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +72,7 @@ typedef int cublasOperation_t;
 /* ------------------------------------------------------------------ state */
 
 typedef cublasStatus_t(CUBLASWINAPI *pf_create)(cublasHandle_t *);
+typedef cublasStatus_t(CUBLASWINAPI *pf_destroy)(cublasHandle_t);
 typedef cublasStatus_t(CUBLASWINAPI *pf_set_stream)(cublasHandle_t, cudaStream_t);
 typedef cublasStatus_t(CUBLASWINAPI *pf_sgemm)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int,
                                                 const float *, const float *, int, const float *, int, const float *,
@@ -83,13 +89,15 @@ typedef struct alloc_slot {
     size_t n;
 } alloc_slot;
 
+/* shared by every thread: the device, cuBLAS, the memory accounting (g_mu) */
 static struct {
     int ready;
     int dev;
     cudaDeviceProp prop;
-    cudaStream_t stream;
     void *lib;
-    cublasHandle_t blas;
+    pf_create create;
+    pf_destroy destroy;
+    pf_set_stream set_stream;
     pf_sgemm sgemm;
     pf_sgemm_sb sgemm_sb; /* strided batched: attention, one GEMM per head */
     int blas_version;
@@ -97,16 +105,28 @@ static struct {
     size_t limit, limit_default; /* what alloc may hand out (decision 142) */
     alloc_slot *slots; /* open addressing: device pointer → bytes */
     size_t n_slots, n_live;
-    double *pinned;            /* MAX_PENDING scalars on their way to the host */
-    double *dscal;             /* the same on the device                       */
-    double *pend_dst[MAX_PENDING];
-    int n_pending;
-    void *scratch;             /* reductions' partial sums, offsets           */
-    size_t scratch_cap;
-    float *work[4];            /* the fused sequences' buffers (grow only)    */
-    size_t work_cap[4];
-    nmz_status sticky;         /* an asynchronous error seen at sync          */
 } g;
+static std::mutex g_mu; /* the allocation table, used/peak/limit */
+
+/* one per host thread that computes (decision 158): created on the thread's
+ * first op, released when the thread ends */
+struct cu_thread {
+    int started = 0;
+    cudaStream_t stream = 0;
+    cublasHandle_t blas = NULL;
+    double *pinned = NULL;            /* MAX_PENDING scalars on their way to the host */
+    double *dscal = NULL;             /* the same on the device                       */
+    double *pend_dst[MAX_PENDING] = {};
+    int n_pending = 0;
+    void *scratch = NULL;             /* reductions' partial sums, offsets           */
+    size_t scratch_cap = 0;
+    float *work[4] = {};              /* the fused sequences' buffers (grow only)    */
+    size_t work_cap[4] = {};
+    ~cu_thread();
+};
+static thread_local cu_thread t_state;
+static cu_thread *thread_state(void);
+#define TS (thread_state())
 
 static nmz_backend g_be;
 
@@ -178,6 +198,7 @@ static size_t table_take(void *p) {
 static void *cu_alloc(const nmz_backend *be, size_t bytes) {
     void *p = NULL;
     cudaError_t e;
+    std::lock_guard<std::mutex> lock(g_mu);
     (void)be;
     if (!bytes) bytes = 4;
     if (g.limit && g.used + bytes > g.limit) { /* beyond the cap the driver would page memory out (WDDM) */
@@ -214,39 +235,79 @@ static void *cu_alloc(const nmz_backend *be, size_t bytes) {
 static void cu_release(const nmz_backend *be, void *p) {
     (void)be;
     if (!p) return;
-    g.used -= table_take(p);
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g.used -= table_take(p);
+    }
     cudaFree(p);
+}
+
+/* the calling thread's stream, cuBLAS handle and buffers, made on first use;
+ * a failure leaves NULLs that make the ops fail with a message, not crash */
+static cu_thread *thread_state(void) {
+    cu_thread *t = &t_state;
+    if (t->started) return t;
+    t->started = 1;
+    if (cudaSetDevice(g.dev) != cudaSuccess || cudaStreamCreateWithFlags(&t->stream, cudaStreamNonBlocking) != cudaSuccess) {
+        (void)cudaGetLastError();
+        t->stream = 0;
+        nmz_backend_error(NMZ_ERR_STATE, "CUDA: could not create a stream for this thread");
+        return t;
+    }
+    if (g.create(&t->blas) != CUBLAS_STATUS_SUCCESS || g.set_stream(t->blas, t->stream) != CUBLAS_STATUS_SUCCESS) {
+        t->blas = NULL;
+        nmz_backend_error(NMZ_ERR_STATE, "CUDA: could not start cuBLAS for this thread");
+    }
+    if (cudaMallocHost((void **)&t->pinned, MAX_PENDING * sizeof(double)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        t->pinned = NULL;
+    }
+    t->dscal = (double *)cu_alloc(&g_be, MAX_PENDING * sizeof(double));
+    return t;
+}
+
+cu_thread::~cu_thread() {
+    int i;
+    if (!started) return;
+    if (stream) cudaStreamSynchronize(stream);
+    for (i = 0; i < 4; i++)
+        if (work[i]) cu_release(&g_be, work[i]);
+    if (scratch) cu_release(&g_be, scratch);
+    if (dscal) cu_release(&g_be, dscal);
+    if (pinned) cudaFreeHost(pinned);
+    if (blas && g.destroy) g.destroy(blas);
+    if (stream) cudaStreamDestroy(stream);
 }
 
 /* grow-only work space for reductions */
 static void *scratch(size_t bytes) {
-    if (bytes > g.scratch_cap) {
-        if (g.scratch) cu_release(&g_be, g.scratch);
-        g.scratch_cap = 0;
-        g.scratch = cu_alloc(&g_be, bytes < 65536 ? 65536 : bytes);
-        if (!g.scratch) return NULL;
-        g.scratch_cap = bytes < 65536 ? 65536 : bytes;
+    if (bytes > TS->scratch_cap) {
+        if (TS->scratch) cu_release(&g_be, TS->scratch);
+        TS->scratch_cap = 0;
+        TS->scratch = cu_alloc(&g_be, bytes < 65536 ? 65536 : bytes);
+        if (!TS->scratch) return NULL;
+        TS->scratch_cap = bytes < 65536 ? 65536 : bytes;
     }
-    return g.scratch;
+    return TS->scratch;
 }
 
 /* grow-only buffers of the fused sequence kernels (one op at a time on one
  * stream, so they are never in use by two ops) */
 static float *work(int i, size_t floats) {
-    if (floats > g.work_cap[i]) {
-        if (g.work[i]) cu_release(&g_be, g.work[i]);
-        g.work_cap[i] = 0;
-        g.work[i] = (float *)cu_alloc(&g_be, floats * sizeof(float));
-        if (!g.work[i]) return NULL;
-        g.work_cap[i] = floats;
+    if (floats > TS->work_cap[i]) {
+        if (TS->work[i]) cu_release(&g_be, TS->work[i]);
+        TS->work_cap[i] = 0;
+        TS->work[i] = (float *)cu_alloc(&g_be, floats * sizeof(float));
+        if (!TS->work[i]) return NULL;
+        TS->work_cap[i] = floats;
     }
-    return g.work[i];
+    return TS->work[i];
 }
 
 static nmz_status cu_upload(const nmz_backend *be, void *dev, const void *host, size_t bytes) {
     (void)be;
     if (!bytes) return NMZ_OK;
-    if (cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, g.stream) != cudaSuccess)
+    if (cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, TS->stream) != cudaSuccess)
         return cuda_fail(cudaGetLastError(), "copy to the device");
     return NMZ_OK;
 }
@@ -256,7 +317,7 @@ static nmz_status cu_sync(const nmz_backend *be);
 static nmz_status cu_download(const nmz_backend *be, void *host, const void *dev, size_t bytes) {
     (void)be;
     if (!bytes) return NMZ_OK;
-    if (cudaMemcpyAsync(host, dev, bytes, cudaMemcpyDeviceToHost, g.stream) != cudaSuccess)
+    if (cudaMemcpyAsync(host, dev, bytes, cudaMemcpyDeviceToHost, TS->stream) != cudaSuccess)
         return cuda_fail(cudaGetLastError(), "copy to the host");
     return cu_sync(&g_be);
 }
@@ -265,23 +326,24 @@ static nmz_status cu_sync(const nmz_backend *be) {
     cudaError_t e;
     int i;
     (void)be;
-    e = cudaStreamSynchronize(g.stream);
+    e = cudaStreamSynchronize(TS->stream);
     if (e != cudaSuccess) return cuda_fail(e, "a kernel failed");
-    for (i = 0; i < g.n_pending; i++) *g.pend_dst[i] = g.pinned[i];
-    g.n_pending = 0;
+    for (i = 0; i < TS->n_pending; i++) *TS->pend_dst[i] = TS->pinned[i];
+    TS->n_pending = 0;
     return NMZ_OK;
 }
 
 /* the device slot an op's scalar goes to; it reaches *dst at the next sync */
 static double *scalar_slot(double *dst) {
-    if (g.n_pending == MAX_PENDING && cu_sync(&g_be) != NMZ_OK) return NULL;
-    g.pend_dst[g.n_pending] = dst;
-    return g.dscal + g.n_pending;
+    if (!TS->dscal || !TS->pinned) return NULL;
+    if (TS->n_pending == MAX_PENDING && cu_sync(&g_be) != NMZ_OK) return NULL;
+    TS->pend_dst[TS->n_pending] = dst;
+    return TS->dscal + TS->n_pending;
 }
 
 static nmz_status scalar_send(void) { /* after the kernel that wrote the slot */
-    int i = g.n_pending++;
-    if (cudaMemcpyAsync(&g.pinned[i], g.dscal + i, sizeof(double), cudaMemcpyDeviceToHost, g.stream) != cudaSuccess)
+    int i = TS->n_pending++;
+    if (cudaMemcpyAsync(&TS->pinned[i], TS->dscal + i, sizeof(double), cudaMemcpyDeviceToHost, TS->stream) != cudaSuccess)
         return cuda_fail(cudaGetLastError(), "copy a result to the host");
     return check("a reduction");
 }
@@ -1229,10 +1291,10 @@ static nmz_status cu_fill(const nmz_backend *be, size_t n, float v, float *x) {
     if (!n) return NMZ_OK;
     NEED(x);
     if (v == 0.0f && !signbit(v)) {
-        if (cudaMemsetAsync(x, 0, n * sizeof(float), g.stream) != cudaSuccess) return check("fill");
+        if (cudaMemsetAsync(x, 0, n * sizeof(float), TS->stream) != cudaSuccess) return check("fill");
         return NMZ_OK;
     }
-    k_fill<<<blocks_for(n), TPB, 0, g.stream>>>(n, v, x);
+    k_fill<<<blocks_for(n), TPB, 0, TS->stream>>>(n, v, x);
     return check("fill");
 }
 
@@ -1243,10 +1305,10 @@ static nmz_status cu_copy(const nmz_backend *be, size_t rows, size_t cols, const
     if (!rows || !cols) return NMZ_OK;
     NEED(src && dst);
     if (rows == 1 || (lds == cols && ldd == cols))
-        e = cudaMemcpyAsync(dst, src, rows * cols * sizeof(float), cudaMemcpyDeviceToDevice, g.stream);
+        e = cudaMemcpyAsync(dst, src, rows * cols * sizeof(float), cudaMemcpyDeviceToDevice, TS->stream);
     else
         e = cudaMemcpy2DAsync(dst, ldd * sizeof(float), src, lds * sizeof(float), cols * sizeof(float), rows,
-                              cudaMemcpyDeviceToDevice, g.stream);
+                              cudaMemcpyDeviceToDevice, TS->stream);
     return e == cudaSuccess ? NMZ_OK : cuda_fail(e, "copy");
 }
 
@@ -1254,7 +1316,7 @@ static nmz_status cu_add(const nmz_backend *be, size_t n, const float *a, const 
     (void)be;
     if (!n) return NMZ_OK;
     NEED(a && b && o);
-    k_add<<<blocks_for(n), TPB, 0, g.stream>>>(n, a, b, o);
+    k_add<<<blocks_for(n), TPB, 0, TS->stream>>>(n, a, b, o);
     return check("add");
 }
 
@@ -1262,7 +1324,7 @@ static nmz_status cu_mul(const nmz_backend *be, size_t n, const float *a, const 
     (void)be;
     if (!n) return NMZ_OK;
     NEED(a && b && o);
-    k_mul<<<blocks_for(n), TPB, 0, g.stream>>>(n, a, b, o);
+    k_mul<<<blocks_for(n), TPB, 0, TS->stream>>>(n, a, b, o);
     return check("mul");
 }
 
@@ -1278,13 +1340,13 @@ static nmz_status cu_gemm(const nmz_backend *be, unsigned flags, int M, int N, i
     NEED(C);
     if (K <= 0) {
         if (flags & NMZ_MM_ACCUMULATE) return NMZ_OK;
-        if (cudaMemset2DAsync(C, (size_t)ldc * sizeof(float), 0, (size_t)N * sizeof(float), (size_t)M, g.stream) !=
+        if (cudaMemset2DAsync(C, (size_t)ldc * sizeof(float), 0, (size_t)N * sizeof(float), (size_t)M, TS->stream) !=
             cudaSuccess)
             return check("gemm (K = 0)");
         return NMZ_OK;
     }
     NEED(A && B);
-    st = g.sgemm(g.blas, tb ? CUBLAS_OP_T : CUBLAS_OP_N, ta ? CUBLAS_OP_T : CUBLAS_OP_N, N, M, K, &one, B, ldb, A, lda,
+    st = g.sgemm(TS->blas, tb ? CUBLAS_OP_T : CUBLAS_OP_N, ta ? CUBLAS_OP_T : CUBLAS_OP_N, N, M, K, &one, B, ldb, A, lda,
                  &beta, C, ldc);
     if (st != CUBLAS_STATUS_SUCCESS)
         return nmz_backend_error(NMZ_ERR_STATE, "cuBLAS SGEMM failed (status %d) for %dx%dx%d", (int)st, M, N, K);
@@ -1295,7 +1357,7 @@ static nmz_status cu_add_bias(const nmz_backend *be, size_t rows, int cols, floa
     (void)be;
     if (!rows || cols <= 0) return NMZ_OK;
     NEED(y && b);
-    k_add_bias<<<blocks_for(rows * cols), TPB, 0, g.stream>>>(rows * cols, cols, y, b);
+    k_add_bias<<<blocks_for(rows * cols), TPB, 0, TS->stream>>>(rows * cols, cols, y, b);
     return check("add_bias");
 }
 
@@ -1304,7 +1366,7 @@ static nmz_status cu_add_bias3(const nmz_backend *be, int A, int B, int C, float
     (void)be;
     if (!n) return NMZ_OK;
     NEED(y && bias);
-    k_add_bias3<<<blocks_for(n), TPB, 0, g.stream>>>(n, B, C, y, bias);
+    k_add_bias3<<<blocks_for(n), TPB, 0, TS->stream>>>(n, B, C, y, bias);
     return check("add_bias3");
 }
 
@@ -1315,8 +1377,8 @@ static nmz_status colsum(size_t rows, int cols, const float *a, const float *b, 
     if (!rows || cols <= 0) return NMZ_OK;
     if (gy > 256) gy = 256;
     if (!(part = (double *)scratch((size_t)gy * cols * sizeof(double)))) return nmz__op_failed();
-    k_colsum_part<<<dim3((unsigned)((cols + 31) / 32), (unsigned)gy), dim3(32, 8), 0, g.stream>>>(rows, cols, a, b, part);
-    k_colsum_finish<<<(unsigned)((cols + 127) / 128), 128, 0, g.stream>>>(gy, cols, part, out);
+    k_colsum_part<<<dim3((unsigned)((cols + 31) / 32), (unsigned)gy), dim3(32, 8), 0, TS->stream>>>(rows, cols, a, b, part);
+    k_colsum_finish<<<(unsigned)((cols + 127) / 128), 128, 0, TS->stream>>>(gy, cols, part, out);
     return check("column sums");
 }
 
@@ -1331,7 +1393,7 @@ static nmz_status cu_rowsum_add(const nmz_backend *be, int rows, size_t cols, co
     (void)be;
     if (rows <= 0) return NMZ_OK;
     NEED(a && out);
-    k_rowsum<<<warps_blocks((size_t)rows), TPB, 0, g.stream>>>(rows, cols, a, out);
+    k_rowsum<<<warps_blocks((size_t)rows), TPB, 0, TS->stream>>>(rows, cols, a, out);
     return check("row sums");
 }
 
@@ -1340,7 +1402,7 @@ static nmz_status cu_transpose3(const nmz_backend *be, int A, int B, int C, cons
     (void)be;
     if (!n) return NMZ_OK;
     NEED(in && out);
-    k_transpose3<<<blocks_for(n), TPB, 0, g.stream>>>(A, B, C, in, out);
+    k_transpose3<<<blocks_for(n), TPB, 0, TS->stream>>>(A, B, C, in, out);
     return check("transpose");
 }
 
@@ -1348,7 +1410,7 @@ static nmz_status cu_act_forward(const nmz_backend *be, nmz_act act, float alpha
     (void)be;
     if (!n) return NMZ_OK;
     NEED(z && a);
-    k_act_fwd<<<blocks_for(n), TPB, 0, g.stream>>>((int)act, alpha, n, z, a);
+    k_act_fwd<<<blocks_for(n), TPB, 0, TS->stream>>>((int)act, alpha, n, z, a);
     return check("activation");
 }
 
@@ -1357,7 +1419,7 @@ static nmz_status cu_act_backward(const nmz_backend *be, nmz_act act, float alph
     (void)be;
     if (!n) return NMZ_OK;
     NEED(z && dy && dz);
-    k_act_bwd<<<blocks_for(n), TPB, 0, g.stream>>>((int)act, alpha, n, z, dy, dz, fprime);
+    k_act_bwd<<<blocks_for(n), TPB, 0, TS->stream>>>((int)act, alpha, n, z, dy, dz, fprime);
     return check("activation backward");
 }
 
@@ -1365,7 +1427,7 @@ static nmz_status cu_softmax_forward(const nmz_backend *be, size_t rows, int col
     (void)be;
     if (!rows) return NMZ_OK;
     NEED(z && p);
-    k_softmax<<<warps_blocks(rows), TPB, 0, g.stream>>>(rows, cols, z, p);
+    k_softmax<<<warps_blocks(rows), TPB, 0, TS->stream>>>(rows, cols, z, p);
     return check("softmax");
 }
 
@@ -1374,7 +1436,7 @@ static nmz_status cu_softmax_backward(const nmz_backend *be, size_t rows, int co
     (void)be;
     if (!rows) return NMZ_OK;
     NEED(p && dy && dz);
-    k_softmax_bwd<<<warps_blocks(rows), TPB, 0, g.stream>>>(rows, cols, p, dy, dz);
+    k_softmax_bwd<<<warps_blocks(rows), TPB, 0, TS->stream>>>(rows, cols, p, dy, dz);
     return check("softmax backward");
 }
 
@@ -1386,7 +1448,7 @@ static nmz_status cu_softmax_backward(const nmz_backend *be, size_t rows, int co
         if (!part_) return nmz__op_failed();                                                                         \
         launch;                                                                                                      \
         if (!(slot_ = scalar_slot(dst))) return nmz__op_failed();                                                    \
-        k_sum_partials<<<1, 1, 0, g.stream>>>(part_, (int)nb_, (scale), slot_, 0);                                   \
+        k_sum_partials<<<1, 1, 0, TS->stream>>>(part_, (int)nb_, (scale), slot_, 0);                                   \
         return scalar_send();                                                                                        \
     } while (0)
 
@@ -1397,17 +1459,17 @@ static nmz_status cu_loss_value(const nmz_backend *be, nmz_loss kind, size_t row
     NEED(y && t && out);
     if (!rows) return nmz_backend_error(NMZ_ERR_ARG, "loss of an empty batch");
     if (kind == NMZ_LOSS_MSE) {
-        REDUCE_INTO(out, 1.0 / (double)rows, n, (k_mse_sum<<<nb_, TPB, 0, g.stream>>>(n, y, t, part_)));
+        REDUCE_INTO(out, 1.0 / (double)rows, n, (k_mse_sum<<<nb_, TPB, 0, TS->stream>>>(n, y, t, part_)));
     } else {
         /* per-row losses after the block partials in the scratch buffer */
         unsigned nb = blocks_for(rows);
         double *part = (double *)scratch((size_t)nb * sizeof(double) + rows * sizeof(double)), *row_loss, *slot;
         if (!part) return nmz__op_failed();
         row_loss = part + nb;
-        k_ce_rows<<<warps_blocks(rows), TPB, 0, g.stream>>>(rows, cols, y, t, z, row_loss);
-        k_sum_rows<<<nb, TPB, 0, g.stream>>>(rows, row_loss, part);
+        k_ce_rows<<<warps_blocks(rows), TPB, 0, TS->stream>>>(rows, cols, y, t, z, row_loss);
+        k_sum_rows<<<nb, TPB, 0, TS->stream>>>(rows, row_loss, part);
         if (!(slot = scalar_slot(out))) return nmz__op_failed();
-        k_sum_partials<<<1, 1, 0, g.stream>>>(part, (int)nb, 1.0 / (double)rows, slot, 0);
+        k_sum_partials<<<1, 1, 0, TS->stream>>>(part, (int)nb, 1.0 / (double)rows, slot, 0);
         return scalar_send();
     }
 }
@@ -1418,9 +1480,9 @@ static nmz_status cu_loss_grad(const nmz_backend *be, nmz_loss kind, size_t rows
     if (!rows) return NMZ_OK;
     NEED(y && t && gr);
     if (kind == NMZ_LOSS_MSE)
-        k_mse_grad<<<blocks_for(rows * cols), TPB, 0, g.stream>>>(rows * cols, 1.0 / (double)rows, y, t, gr);
+        k_mse_grad<<<blocks_for(rows * cols), TPB, 0, TS->stream>>>(rows * cols, 1.0 / (double)rows, y, t, gr);
     else
-        k_ce_grad<<<warps_blocks(rows), TPB, 0, g.stream>>>(rows, cols, 1.0 / (double)rows, y, t, gr);
+        k_ce_grad<<<warps_blocks(rows), TPB, 0, TS->stream>>>(rows, cols, 1.0 / (double)rows, y, t, gr);
     return check("loss gradient");
 }
 
@@ -1429,7 +1491,7 @@ static nmz_status cu_im2col(const nmz_backend *be, const nmz_conv_shape *s, cons
     (void)be;
     if (!n) return NMZ_OK;
     NEED(x && col);
-    k_im2col<<<blocks_for(n), TPB, 0, g.stream>>>(*s, x, col);
+    k_im2col<<<blocks_for(n), TPB, 0, TS->stream>>>(*s, x, col);
     return check("im2col");
 }
 
@@ -1438,7 +1500,7 @@ static nmz_status cu_col2im(const nmz_backend *be, const nmz_conv_shape *s, cons
     (void)be;
     if (!n) return NMZ_OK;
     NEED(col && dx);
-    k_col2im<<<blocks_for(n), TPB, 0, g.stream>>>(*s, col, dx);
+    k_col2im<<<blocks_for(n), TPB, 0, TS->stream>>>(*s, col, dx);
     return check("col2im");
 }
 
@@ -1448,7 +1510,7 @@ static nmz_status cu_pool_fwd(const nmz_backend *be, int planes, int H, int W, i
     (void)be;
     if (!n) return NMZ_OK;
     NEED(x && y && am);
-    k_pool_fwd<<<blocks_for(n), TPB, 0, g.stream>>>(planes, H, W, size, stride, OH, OW, x, y, am);
+    k_pool_fwd<<<blocks_for(n), TPB, 0, TS->stream>>>(planes, H, W, size, stride, OH, OW, x, y, am);
     return check("max-pool");
 }
 
@@ -1458,7 +1520,7 @@ static nmz_status cu_pool_bwd(const nmz_backend *be, int planes, int H, int W, i
     (void)be;
     if (!n) return NMZ_OK;
     NEED(dy && am && dx);
-    k_pool_bwd<<<blocks_for(n), TPB, 0, g.stream>>>(planes, H, W, size, stride, OH, OW, dy, am, dx);
+    k_pool_bwd<<<blocks_for(n), TPB, 0, TS->stream>>>(planes, H, W, size, stride, OH, OW, dy, am, dx);
     return check("max-pool backward");
 }
 
@@ -1468,7 +1530,7 @@ static nmz_status cu_dropout_mask(const nmz_backend *be, size_t n, float rate, n
     if (!n) return NMZ_OK;
     NEED(mask);
     key = ((uint64_t)nmz_rng_u32(rng) << 32) | nmz_rng_u32(rng); /* the net's PRNG decides the mask */
-    k_dropout<<<blocks_for(n), TPB, 0, g.stream>>>(n, rate, 1.0f / (1.0f - rate), key, mask);
+    k_dropout<<<blocks_for(n), TPB, 0, TS->stream>>>(n, rate, 1.0f / (1.0f - rate), key, mask);
     return check("dropout");
 }
 
@@ -1477,7 +1539,7 @@ static nmz_status cu_embed_forward(const nmz_backend *be, size_t n, int V, int D
     (void)be;
     if (!n) return NMZ_OK;
     NEED(ids && W && y);
-    k_embed_fwd<<<blocks_for(n * D), TPB, 0, g.stream>>>(n, V, D, ids, W, y);
+    k_embed_fwd<<<blocks_for(n * D), TPB, 0, TS->stream>>>(n, V, D, ids, W, y);
     return check("embedding");
 }
 
@@ -1487,9 +1549,9 @@ static nmz_status cu_embed_backward(const nmz_backend *be, size_t n, int V, int 
     if (!n) return NMZ_OK;
     NEED(ids && dy && dW);
     if ((double)V * (double)n <= 16777216.0)
-        k_embed_bwd<<<blocks_for((size_t)V * D), TPB, 0, g.stream>>>(n, V, D, ids, dy, dW);
+        k_embed_bwd<<<blocks_for((size_t)V * D), TPB, 0, TS->stream>>>(n, V, D, ids, dy, dW);
     else
-        k_embed_bwd_atomic<<<blocks_for(n * D), TPB, 0, g.stream>>>(n, V, D, ids, dy, dW);
+        k_embed_bwd_atomic<<<blocks_for(n * D), TPB, 0, TS->stream>>>(n, V, D, ids, dy, dW);
     return check("embedding backward");
 }
 
@@ -1506,7 +1568,7 @@ static int *offsets(int B, const int *off, int *off0, nmz_status *s) {
         *s = nmz__op_failed();
         return NULL;
     }
-    if (cudaMemcpyAsync(d, off, (size_t)B * sizeof(int), cudaMemcpyHostToDevice, g.stream) != cudaSuccess)
+    if (cudaMemcpyAsync(d, off, (size_t)B * sizeof(int), cudaMemcpyHostToDevice, TS->stream) != cudaSuccess)
         *s = check("offsets");
     return d;
 }
@@ -1520,7 +1582,7 @@ static nmz_status cu_posenc_forward(const nmz_backend *be, int B, int T, int D, 
     NEED(x && P && y);
     d = offsets(B, off, &o0, &s);
     if (s != NMZ_OK) return s;
-    k_posenc_fwd<<<blocks_for((size_t)B * T * D), TPB, 0, g.stream>>>(B, T, D, o0, d, x, P, y);
+    k_posenc_fwd<<<blocks_for((size_t)B * T * D), TPB, 0, TS->stream>>>(B, T, D, o0, d, x, P, y);
     return check("position encoding");
 }
 
@@ -1534,9 +1596,9 @@ static nmz_status cu_posenc_backward(const nmz_backend *be, int B, int T, int D,
     d = offsets(B, off, &o0, &s);
     if (s != NMZ_OK) return s;
     if (!d)
-        k_posenc_bwd_same<<<blocks_for((size_t)T * D), TPB, 0, g.stream>>>(B, T, D, o0, dy, dP);
+        k_posenc_bwd_same<<<blocks_for((size_t)T * D), TPB, 0, TS->stream>>>(B, T, D, o0, dy, dP);
     else
-        k_posenc_bwd_atomic<<<blocks_for((size_t)B * T * D), TPB, 0, g.stream>>>(B, T, D, d, dy, dP);
+        k_posenc_bwd_atomic<<<blocks_for((size_t)B * T * D), TPB, 0, TS->stream>>>(B, T, D, d, dy, dP);
     return check("position encoding backward");
 }
 
@@ -1545,7 +1607,7 @@ static nmz_status cu_ln_forward(const nmz_backend *be, size_t rows, int D, float
     (void)be;
     if (!rows) return NMZ_OK;
     NEED(x && gn && b && y && xh && mean && rstd);
-    k_ln_fwd<<<warps_blocks(rows), TPB, 0, g.stream>>>(rows, D, eps, x, gn, b, y, xh, mean, rstd);
+    k_ln_fwd<<<warps_blocks(rows), TPB, 0, TS->stream>>>(rows, D, eps, x, gn, b, y, xh, mean, rstd);
     return check("layernorm");
 }
 
@@ -1555,7 +1617,7 @@ static nmz_status cu_ln_backward(const nmz_backend *be, size_t rows, int D, cons
     (void)be;
     if (!rows) return NMZ_OK;
     NEED(dy && xh && rstd && gn && dg && db);
-    k_ln_bwd<<<warps_blocks(rows), TPB, 0, g.stream>>>(rows, D, dy, xh, rstd, gn, dx, dxhat);
+    k_ln_bwd<<<warps_blocks(rows), TPB, 0, TS->stream>>>(rows, D, dy, xh, rstd, gn, dx, dxhat);
     if ((s = check("layernorm backward")) != NMZ_OK) return s;
     if ((s = colsum(rows, D, dy, xh, dg)) != NMZ_OK) return s; /* dg += Σ dy ⊙ x̂ */
     return colsum(rows, D, dy, NULL, db);                       /* db += Σ dy     */
@@ -1564,7 +1626,7 @@ static nmz_status cu_ln_backward(const nmz_backend *be, size_t rows, int D, cons
 /* row-major, strided batched: C_i = α·op(A_i)·op(B_i) + β·C_i, i = 0 … batch−1 */
 static nmz_status gemm_sb(int ta, int tb, int M, int N, int K, float alpha, const float *A, int lda, long long sa,
                           const float *B, int ldb, long long sb, float beta, float *C, int ldc, long long sc, int batch) {
-    cublasStatus_t st = g.sgemm_sb(g.blas, tb ? CUBLAS_OP_T : CUBLAS_OP_N, ta ? CUBLAS_OP_T : CUBLAS_OP_N, N, M, K, &alpha,
+    cublasStatus_t st = g.sgemm_sb(TS->blas, tb ? CUBLAS_OP_T : CUBLAS_OP_N, ta ? CUBLAS_OP_T : CUBLAS_OP_N, N, M, K, &alpha,
                                    B, ldb, sb, A, lda, sa, &beta, C, ldc, sc, batch);
     if (st != CUBLAS_STATUS_SUCCESS)
         return nmz_backend_error(NMZ_ERR_STATE, "cuBLAS strided batched SGEMM failed (status %d)", (int)st);
@@ -1615,14 +1677,14 @@ static nmz_status cu_attn_forward(const nmz_backend *be, int B, int H, int T, in
     if (!B || !T) return NMZ_OK;
     NEED(qkv && kv && P && ctx);
     if (T < ATTN_GEMM_MIN_T) {
-        k_attn_fwd<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, kv, P, S,
+        k_attn_fwd<<<warps_blocks((size_t)B * H * T), TPB, 0, TS->stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, kv, P, S,
                                                                            ctx);
         return check("attention");
     }
     /* scores S = Q·Kᵀ/√d, [T, Tk] per (row, head); then the causal softmax */
     if ((s = gemm_bh(B, H, 0, 1, T, Tk, d, scale, qkv, 3 * E, sq, kv, 2 * E, skv, 0.0f, S ? S : P, Tk, sp)) != NMZ_OK)
         return s;
-    k_attn_softmax<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>((size_t)B * H * T, T, Tk, Tp, S ? S : P, P);
+    k_attn_softmax<<<warps_blocks((size_t)B * H * T), TPB, 0, TS->stream>>>((size_t)B * H * T, T, Tk, Tp, S ? S : P, P);
     if ((s = check("attention softmax")) != NMZ_OK) return s;
     /* context = weights · values, the heads side by side */
     return gemm_bh(B, H, 0, 0, T, d, Tk, 1.0f, P, Tk, sp, kv + E, 2 * E, skv, 0.0f, ctx, E, sc);
@@ -1639,15 +1701,15 @@ static nmz_status cu_attn_backward(const nmz_backend *be, int B, int H, int T, i
     if (!B || !T) return NMZ_OK;
     NEED(qkv && kv && P && dctx && dP && dqkv && dkv);
     if (T < ATTN_GEMM_MIN_T) {
-        k_attn_bwd_q<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, kv, P,
+        k_attn_bwd_q<<<warps_blocks((size_t)B * H * T), TPB, 0, TS->stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, kv, P,
                                                                              dctx, dP, dqkv);
-        k_attn_bwd_kv<<<warps_blocks((size_t)B * H * Tk), TPB, 0, g.stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, P,
+        k_attn_bwd_kv<<<warps_blocks((size_t)B * H * Tk), TPB, 0, TS->stream>>>(B, H, T, Tk, Tp, d, E, scale, qkv, P,
                                                                                dctx, dP, dkv);
         return check("attention backward");
     }
     /* ∂L/∂weights = ∂L/∂context · Vᵀ, then through the softmax: ∂L/∂S */
     if ((s = gemm_bh(B, H, 0, 1, T, Tk, d, 1.0f, dctx, E, sc, kv + E, 2 * E, skv, 0.0f, dP, Tk, sp)) != NMZ_OK) return s;
-    k_attn_softmax_bwd<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>((size_t)B * H * T, T, Tk, Tp, P, dP);
+    k_attn_softmax_bwd<<<warps_blocks((size_t)B * H * T), TPB, 0, TS->stream>>>((size_t)B * H * T, T, Tk, Tp, P, dP);
     if ((s = check("attention softmax backward")) != NMZ_OK) return s;
     /* ∂L/∂q += ∂L/∂S · K/√d   ∂L/∂k += ∂L/∂Sᵀ · Q/√d   ∂L/∂v += Pᵀ · ∂L/∂context */
     if ((s = gemm_bh(B, H, 0, 0, T, d, Tk, scale, dP, Tk, sp, kv, 2 * E, skv, 1.0f, dqkv, 3 * E, sq)) != NMZ_OK ||
@@ -1663,7 +1725,7 @@ static nmz_seq_record rec_of(const nmz_seq_record *r) {
     return z;
 }
 
-#define CELL(n) blocks_for((size_t)(n)), TPB, 0, g.stream
+#define CELL(n) blocks_for((size_t)(n)), TPB, 0, TS->stream
 static nmz_status cu_rnn_cell_forward(const nmz_backend *be, int B, int H, nmz_rows z, nmz_rows h) {
     (void)be;
     NEED(z.p && h.p);
@@ -1728,7 +1790,7 @@ static unsigned seq_threads(int n) { return (unsigned)((n + 31) / 32 * 32); }
 /* W [H, G] → WhT [G, H] (work buffer 0) */
 static float *transposed(const float *W, int H, int G) {
     float *t = work(0, (size_t)G * H);
-    if (t) k_transpose3<<<blocks_for((size_t)G * H), TPB, 0, g.stream>>>(H, G, 1, W, t);
+    if (t) k_transpose3<<<blocks_for((size_t)G * H), TPB, 0, TS->stream>>>(H, G, 1, W, t);
     return t;
 }
 
@@ -1760,7 +1822,7 @@ static nmz_status cu_rnn_forward(const nmz_backend *be, int B, int T, int D, int
     if ((s = cu_gemm(&g_be, 0, B * T, H, D, x, D, Wxh, H, z, H)) != NMZ_OK ||
         (s = cu_add_bias(&g_be, (size_t)B * T, H, z, b)) != NMZ_OK)
         return s;
-    k_rnn_seq_fwd<<<(unsigned)B, seq_threads(H), (size_t)H * sizeof(float), g.stream>>>(T, H, h0, Whh, z, y);
+    k_rnn_seq_fwd<<<(unsigned)B, seq_threads(H), (size_t)H * sizeof(float), TS->stream>>>(T, H, h0, Whh, z, y);
     return check("rnn sequence");
 }
 
@@ -1774,7 +1836,7 @@ static nmz_status cu_rnn_backward(const nmz_backend *be, int B, int T, int D, in
     if (!B || !T) return NMZ_OK;
     NEED(x && y && h0 && Wxh && Whh && dy && dWxh && dWhh && db && dh_next);
     if (!(WhT = transposed(Whh, H, H)) || !(dz = work(1, (size_t)B * T * H))) return nmz__op_failed();
-    k_rnn_seq_bwd<<<(unsigned)B, seq_threads(H), (size_t)H * sizeof(float), g.stream>>>(T, H, y, dy, WhT, dz, dh_next,
+    k_rnn_seq_bwd<<<(unsigned)B, seq_threads(H), (size_t)H * sizeof(float), TS->stream>>>(T, H, y, dy, WhT, dz, dh_next,
                                                                                          rec_of(rec));
     if ((s = check("rnn sequence backward")) != NMZ_OK) return s;
     return seq_grads(B, T, D, H, H, x, y, h0, Wxh, dz, dWxh, dWhh, db, dx, H);
@@ -1792,7 +1854,7 @@ static nmz_status cu_lstm_forward(const nmz_backend *be, int B, int T, int D, in
     if ((s = cu_gemm(&g_be, 0, B * T, G, D, x, D, Wx, G, gates, G)) != NMZ_OK ||
         (s = cu_add_bias(&g_be, (size_t)B * T, G, gates, b)) != NMZ_OK)
         return s;
-    k_lstm_seq_fwd<<<(unsigned)B, seq_threads(G), (size_t)5 * H * sizeof(float), g.stream>>>(T, H, h0, c0, Wh, gates, c,
+    k_lstm_seq_fwd<<<(unsigned)B, seq_threads(G), (size_t)5 * H * sizeof(float), TS->stream>>>(T, H, h0, c0, Wh, gates, c,
                                                                                              y);
     return check("lstm sequence");
 }
@@ -1809,7 +1871,7 @@ static nmz_status cu_lstm_backward(const nmz_backend *be, int B, int T, int D, i
     if (!B || !T) return NMZ_OK;
     NEED(x && y && h0 && c0 && gates && c && Wx && Wh && dy && dWx && dWh && db && dh_next && dc_next);
     if (!(WhT = transposed(Wh, H, G)) || !(dA = work(1, (size_t)B * T * G))) return nmz__op_failed();
-    k_lstm_seq_bwd<<<(unsigned)B, seq_threads(G), (size_t)G * sizeof(float), g.stream>>>(
+    k_lstm_seq_bwd<<<(unsigned)B, seq_threads(G), (size_t)G * sizeof(float), TS->stream>>>(
         T, H, gates, c, c0, dy, WhT, dA, dh_next, dc_next, rec_of(rec));
     if ((s = check("lstm sequence backward")) != NMZ_OK) return s;
     return seq_grads(B, T, D, H, G, x, y, h0, Wx, dA, dWx, dWh, db, dx, G);
@@ -1826,7 +1888,7 @@ static nmz_status cu_gru_forward(const nmz_backend *be, int B, int T, int D, int
     if ((s = cu_gemm(&g_be, 0, B * T, G, D, x, D, Wx, G, gates, G)) != NMZ_OK ||
         (s = cu_add_bias(&g_be, (size_t)B * T, G, gates, b)) != NMZ_OK)
         return s;
-    k_gru_seq_fwd<<<(unsigned)B, seq_threads(2 * H), (size_t)4 * H * sizeof(float), g.stream>>>(T, H, h0, Wh, gates, y);
+    k_gru_seq_fwd<<<(unsigned)B, seq_threads(2 * H), (size_t)4 * H * sizeof(float), TS->stream>>>(T, H, h0, Wh, gates, y);
     return check("gru sequence");
 }
 
@@ -1843,7 +1905,7 @@ static nmz_status cu_gru_backward(const nmz_backend *be, int B, int T, int D, in
     NEED(x && y && h0 && gates && Wx && Wh && dy && dWx && dWh && db && dh_next);
     if (!(WhT = transposed(Wh, H, G)) || !(dA = work(1, (size_t)B * T * G)) || !(RH = work(3, (size_t)B * T * H)))
         return nmz__op_failed();
-    k_gru_seq_bwd<<<(unsigned)B, seq_threads(G), (size_t)G * sizeof(float), g.stream>>>(T, H, y, h0, gates, dy, WhT, dA,
+    k_gru_seq_bwd<<<(unsigned)B, seq_threads(G), (size_t)G * sizeof(float), TS->stream>>>(T, H, y, h0, gates, dy, WhT, dA,
                                                                                          RH, dh_next, rec_of(rec));
     if ((s = check("gru sequence backward")) != NMZ_OK) return s;
     /* z and r saw h_{t−1}, the candidate r ⊙ h_{t−1}: two products for W_h */
@@ -1856,7 +1918,7 @@ static nmz_status cu_sgd_velocity(const nmz_backend *be, size_t n, float lr, flo
     (void)be;
     if (!n) return NMZ_OK;
     NEED(gr && v_prev && v_out);
-    k_sgd<<<blocks_for(n), TPB, 0, g.stream>>>(n, lr, mu, fresh, gr, v_prev, v_out);
+    k_sgd<<<blocks_for(n), TPB, 0, TS->stream>>>(n, lr, mu, fresh, gr, v_prev, v_out);
     return check("sgd");
 }
 
@@ -1865,7 +1927,7 @@ static nmz_status cu_adam_update(const nmz_backend *be, size_t n, double lr, dou
     (void)be;
     if (!n) return NMZ_OK;
     NEED(w && gr && m && v);
-    k_adam<<<blocks_for(n), TPB, 0, g.stream>>>(n, lr, b1, b2, eps, bc1, bc2, decay, w, gr, m, v);
+    k_adam<<<blocks_for(n), TPB, 0, TS->stream>>>(n, lr, b1, b2, eps, bc1, bc2, decay, w, gr, m, v);
     return check("adam");
 }
 
@@ -1876,7 +1938,7 @@ static nmz_status cu_adam_preview(const nmz_backend *be, size_t n, double lr, do
     (void)be;
     if (!n) return NMZ_OK;
     NEED(w && gr && m && v && m_out && v_out && mhat && vhat && delta);
-    k_adam_preview<<<blocks_for(n), TPB, 0, g.stream>>>(n, lr, b1, b2, eps, bc1, bc2, decay, fresh, w, gr, m, v, m_out,
+    k_adam_preview<<<blocks_for(n), TPB, 0, TS->stream>>>(n, lr, b1, b2, eps, bc1, bc2, decay, fresh, w, gr, m, v, m_out,
                                                         v_out, mhat, vhat, delta);
     return check("adam preview");
 }
@@ -1887,15 +1949,15 @@ static nmz_status cu_sumsq(const nmz_backend *be, int k, float *const *x, const 
     (void)be;
     NEED(out);
     if (!(slot = scalar_slot(out))) return nmz__op_failed();
-    if (cudaMemsetAsync(slot, 0, sizeof(double), g.stream) != cudaSuccess) return check("clip");
+    if (cudaMemsetAsync(slot, 0, sizeof(double), TS->stream) != cudaSuccess) return check("clip");
     for (i = 0; i < k; i++) { /* one tensor after the other, in order */
         unsigned nb = blocks_for(n[i]);
         double *part;
         if (!n[i]) continue;
         NEED(x[i]);
         if (!(part = (double *)scratch((size_t)nb * sizeof(double)))) return nmz__op_failed();
-        k_sumsq<<<nb, TPB, 0, g.stream>>>(n[i], x[i], part);
-        k_sum_partials<<<1, 1, 0, g.stream>>>(part, (int)nb, 1.0, slot, 1);
+        k_sumsq<<<nb, TPB, 0, TS->stream>>>(n[i], x[i], part);
+        k_sum_partials<<<1, 1, 0, TS->stream>>>(part, (int)nb, 1.0, slot, 1);
     }
     return scalar_send();
 }
@@ -1906,7 +1968,7 @@ static nmz_status cu_scale(const nmz_backend *be, int k, float *const *x, const 
     for (i = 0; i < k; i++) {
         if (!n[i]) continue;
         NEED(x[i]);
-        k_scale<<<blocks_for(n[i]), TPB, 0, g.stream>>>(n[i], f, x[i]);
+        k_scale<<<blocks_for(n[i]), TPB, 0, TS->stream>>>(n[i], f, x[i]);
     }
     return check("scale");
 }
@@ -1916,7 +1978,7 @@ static nmz_status cu_norm_apply(const nmz_backend *be, size_t n, size_t per, siz
     (void)be;
     if (!n || !per) return NMZ_OK;
     NEED(offset && scale && x);
-    k_norm<<<blocks_for(n), TPB, 0, g.stream>>>(n, per, div, groups, offset, scale, x, grad);
+    k_norm<<<blocks_for(n), TPB, 0, TS->stream>>>(n, per, div, groups, offset, scale, x, grad);
     return check("normalization");
 }
 
@@ -1925,7 +1987,7 @@ static nmz_status cu_gather_rows(const nmz_backend *be, int rows, size_t width, 
     (void)be;
     if (rows <= 0 || !width) return NMZ_OK;
     NEED(idx && src && dst);
-    k_gather<<<blocks_for((size_t)rows * width), TPB, 0, g.stream>>>(rows, width, idx, src, dst);
+    k_gather<<<blocks_for((size_t)rows * width), TPB, 0, TS->stream>>>(rows, width, idx, src, dst);
     return check("gather");
 }
 
@@ -1933,8 +1995,8 @@ static nmz_status cu_onehot(const nmz_backend *be, size_t n, int V, const float 
     (void)be;
     if (!n) return NMZ_OK;
     NEED(ids && out);
-    if (cudaMemsetAsync(out, 0, n * (size_t)V * sizeof(float), g.stream) != cudaSuccess) return check("one-hot");
-    k_onehot<<<blocks_for(n), TPB, 0, g.stream>>>(n, V, ids, out);
+    if (cudaMemsetAsync(out, 0, n * (size_t)V * sizeof(float), TS->stream) != cudaSuccess) return check("one-hot");
+    k_onehot<<<blocks_for(n), TPB, 0, TS->stream>>>(n, V, ids, out);
     return check("one-hot");
 }
 
@@ -1950,10 +2012,10 @@ static nmz_status cu_count_correct(const nmz_backend *be, int mode, size_t rows,
     }
     if (!(part = (double *)scratch((size_t)nb * sizeof(double) + rows * sizeof(double)))) return nmz__op_failed();
     ok = part + nb;
-    k_correct<<<warps_blocks(rows), TPB, 0, g.stream>>>(mode, rows, cols, y, t, ok);
-    k_sum_rows<<<nb, TPB, 0, g.stream>>>(rows, ok, part);
+    k_correct<<<warps_blocks(rows), TPB, 0, TS->stream>>>(mode, rows, cols, y, t, ok);
+    k_sum_rows<<<nb, TPB, 0, TS->stream>>>(rows, ok, part);
     if (!(slot = scalar_slot(out))) return nmz__op_failed();
-    k_sum_partials<<<1, 1, 0, g.stream>>>(part, (int)nb, 1.0, slot, 0);
+    k_sum_partials<<<1, 1, 0, TS->stream>>>(part, (int)nb, 1.0, slot, 0);
     return scalar_send();
 }
 
@@ -2008,9 +2070,8 @@ static const char *cublas_lib(void) {
 static nmz_status cu_init(const nmz_backend *be, char *why, size_t n) {
     int count = 0, *probe = NULL, got = 0, runtime = 0, driver = 0;
     cudaError_t e;
-    pf_create create;
-    pf_set_stream set_stream;
     pf_get_version get_version;
+    cublasHandle_t h = NULL;
     (void)be;
     if (g.ready) return NMZ_OK;
     cudaRuntimeGetVersion(&runtime);
@@ -2061,28 +2122,23 @@ static nmz_status cu_init(const nmz_backend *be, char *why, size_t n) {
                  CUBLAS_LIB);
         return NMZ_ERR_UNSUPPORTED;
     }
-    create = (pf_create)symbol(g.lib, "cublasCreate_v2");
-    set_stream = (pf_set_stream)symbol(g.lib, "cublasSetStream_v2");
+    g.create = (pf_create)symbol(g.lib, "cublasCreate_v2");
+    g.destroy = (pf_destroy)symbol(g.lib, "cublasDestroy_v2");
+    g.set_stream = (pf_set_stream)symbol(g.lib, "cublasSetStream_v2");
     g.sgemm = (pf_sgemm)symbol(g.lib, "cublasSgemm_v2");
     g.sgemm_sb = (pf_sgemm_sb)symbol(g.lib, "cublasSgemmStridedBatched");
     get_version = (pf_get_version)symbol(g.lib, "cublasGetVersion_v2");
-    if (!create || !set_stream || !g.sgemm || !g.sgemm_sb) {
+    if (!g.create || !g.destroy || !g.set_stream || !g.sgemm || !g.sgemm_sb) {
         snprintf(why, n, "%s lacks cublasCreate_v2/cublasSgemm_v2/cublasSgemmStridedBatched", CUBLAS_LIB);
         return NMZ_ERR_UNSUPPORTED;
     }
-    if (cudaStreamCreateWithFlags(&g.stream, cudaStreamNonBlocking) != cudaSuccess || create(&g.blas) != CUBLAS_STATUS_SUCCESS ||
-        set_stream(g.blas, g.stream) != CUBLAS_STATUS_SUCCESS) {
+    if (g.create(&h) != CUBLAS_STATUS_SUCCESS) {
         (void)cudaGetLastError();
         snprintf(why, n, "could not start cuBLAS on %s", g.prop.name);
         return NMZ_ERR_UNSUPPORTED;
     }
-    if (get_version) get_version(g.blas, &g.blas_version);
-    if (cudaMallocHost((void **)&g.pinned, MAX_PENDING * sizeof(double)) != cudaSuccess ||
-        !(g.dscal = (double *)cu_alloc(&g_be, MAX_PENDING * sizeof(double)))) {
-        (void)cudaGetLastError();
-        snprintf(why, n, "out of memory starting CUDA");
-        return NMZ_ERR_UNSUPPORTED;
-    }
+    if (get_version) get_version(h, &g.blas_version);
+    g.destroy(h);
     { /* the memory cap: what is free now (WDDM would otherwise page to the host), or NMZ_CUDA_MEMORY MiB */
         size_t fr = 0, tot = 0;
         const char *env = getenv("NMZ_CUDA_MEMORY");
@@ -2095,6 +2151,7 @@ static nmz_status cu_init(const nmz_backend *be, char *why, size_t n) {
 }
 
 static nmz_status cu_memory_limit(const nmz_backend *be, size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_mu);
     (void)be;
     g.limit = bytes ? bytes : g.limit_default;
     return NMZ_OK;
@@ -2110,6 +2167,7 @@ static void cu_info(const nmz_backend *be, nmz_device_info *out) {
     cudaMemGetInfo(&fr, &tot);
     out->mem_total = tot ? tot : g.prop.totalGlobalMem;
     out->mem_free = fr;
+    std::lock_guard<std::mutex> lock(g_mu);
     out->mem_used = g.used;
     out->mem_peak = g.peak;
     out->mem_limit = g.limit;
