@@ -118,6 +118,9 @@ jobs:
             curl -fsSL "$base/$rel" -o pkg.tar.xz
             tar -xf pkg.tar.xz --strip-components=1 -C "$HOME/cuda"
           done
+          # the archives install into lib/; nvcc.profile links from lib64/
+          [ -e "$HOME/cuda/lib64" ] || ln -s lib "$HOME/cuda/lib64"
+          ls "$HOME/cuda/lib64/"
           echo "CUDA=$HOME/cuda" >> "$GITHUB_ENV"
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNMZ_CUDA=ON -DCMAKE_CUDA_COMPILER="$CUDA/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA"
