@@ -1571,19 +1571,46 @@ static nmz_status gemm_sb(int ta, int tb, int M, int N, int K, float alpha, cons
     return NMZ_OK;
 }
 
-/* Attention on the GPU. Long query blocks (training, a prompt): per row b,
- * the heads' products as strided batched cuBLAS GEMMs (S = Q·Kᵀ/√d for all
- * keys, the causal softmax zeroes the future, C = P·V); the masked half of
+/* Attention on the GPU. Long query blocks (training, a prompt): the
+ * products of all (row, head) pairs as strided batched cuBLAS GEMMs (S =
+ * Q·Kᵀ/√d for all keys, the causal softmax zeroes the future, C = P·V),
+ * one call per head or per row (gemm_bh); the masked half of
  * S is computed and thrown away, which cuBLAS does faster than a masked
  * kernel. Short blocks (generation: one new position against the KV cache):
  * one warp per query row, one launch. */
 #define ATTN_GEMM_MIN_T 16
 
+/* where (row b, head h) of an attention tensor starts: X + b·rows + h·heads */
+typedef struct bh_stride {
+    size_t rows, heads;
+} bh_stride;
+
+/* the product for every (row, head) pair: one strided batched call per head
+ * (batched over the rows) or per row (batched over the heads), whichever
+ * makes fewer calls — each call costs a launch, 10–20 µs under WDDM */
+static nmz_status gemm_bh(int B, int H, int ta, int tb, int M, int N, int K, float alpha, const float *A, int lda,
+                          bh_stride sa, const float *Bm, int ldb, bh_stride sb, float beta, float *C, int ldc,
+                          bh_stride sc) {
+    const int by_head = B >= H, outer = by_head ? H : B, count = by_head ? B : H;
+    int o;
+    nmz_status s;
+    for (o = 0; o < outer; o++) {
+        size_t oa = (size_t)o * (by_head ? sa.heads : sa.rows), ob = (size_t)o * (by_head ? sb.heads : sb.rows),
+               oc = (size_t)o * (by_head ? sc.heads : sc.rows);
+        if ((s = gemm_sb(ta, tb, M, N, K, alpha, A + oa, lda, (long long)(by_head ? sa.rows : sa.heads), Bm + ob, ldb,
+                         (long long)(by_head ? sb.rows : sb.heads), beta, C + oc, ldc,
+                         (long long)(by_head ? sc.rows : sc.heads), count)) != NMZ_OK)
+            return s;
+    }
+    return NMZ_OK;
+}
+
 static nmz_status cu_attn_forward(const nmz_backend *be, int B, int H, int T, int Tk, int Tp, int d, int E,
                                   const float *qkv, const float *kv, float *P, float *S, float *ctx) {
     const float scale = (float)(1.0 / sqrt((double)d));
+    const bh_stride sq = {(size_t)T * 3 * E, (size_t)d}, skv = {(size_t)Tk * 2 * E, (size_t)d},
+                    sp = {(size_t)H * T * Tk, (size_t)T * Tk}, sc = {(size_t)T * E, (size_t)d};
     nmz_status s;
-    int b;
     (void)be;
     if (!B || !T) return NMZ_OK;
     NEED(qkv && kv && P && ctx);
@@ -1592,27 +1619,22 @@ static nmz_status cu_attn_forward(const nmz_backend *be, int B, int H, int T, in
                                                                            ctx);
         return check("attention");
     }
-    for (b = 0; b < B; b++) { /* scores of every head of row b: [T, Tk] each */
-        float *Sb = (S ? S : P) + (size_t)b * H * T * Tk;
-        if ((s = gemm_sb(0, 1, T, Tk, d, scale, qkv + (size_t)b * T * 3 * E, 3 * E, d, kv + (size_t)b * Tk * 2 * E,
-                         2 * E, d, 0.0f, Sb, Tk, (long long)T * Tk, H)) != NMZ_OK)
-            return s;
-    }
+    /* scores S = Q·Kᵀ/√d, [T, Tk] per (row, head); then the causal softmax */
+    if ((s = gemm_bh(B, H, 0, 1, T, Tk, d, scale, qkv, 3 * E, sq, kv, 2 * E, skv, 0.0f, S ? S : P, Tk, sp)) != NMZ_OK)
+        return s;
     k_attn_softmax<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>((size_t)B * H * T, T, Tk, Tp, S ? S : P, P);
     if ((s = check("attention softmax")) != NMZ_OK) return s;
-    for (b = 0; b < B; b++) /* context = weights · values, heads side by side */
-        if ((s = gemm_sb(0, 0, T, d, Tk, 1.0f, P + (size_t)b * H * T * Tk, Tk, (long long)T * Tk,
-                         kv + (size_t)b * Tk * 2 * E + E, 2 * E, d, 0.0f, ctx + (size_t)b * T * E, E, d, H)) != NMZ_OK)
-            return s;
-    return NMZ_OK;
+    /* context = weights · values, the heads side by side */
+    return gemm_bh(B, H, 0, 0, T, d, Tk, 1.0f, P, Tk, sp, kv + E, 2 * E, skv, 0.0f, ctx, E, sc);
 }
 
 static nmz_status cu_attn_backward(const nmz_backend *be, int B, int H, int T, int Tk, int Tp, int d, int E,
                                    const float *qkv, const float *kv, const float *P, const float *dctx, float *dP,
                                    float *dqkv, float *dkv) {
     const float scale = (float)(1.0 / sqrt((double)d));
+    const bh_stride sq = {(size_t)T * 3 * E, (size_t)d}, skv = {(size_t)Tk * 2 * E, (size_t)d},
+                    sp = {(size_t)H * T * Tk, (size_t)T * Tk}, sc = {(size_t)T * E, (size_t)d};
     nmz_status s;
-    int b;
     (void)be;
     if (!B || !T) return NMZ_OK;
     NEED(qkv && kv && P && dctx && dP && dqkv && dkv);
@@ -1623,27 +1645,15 @@ static nmz_status cu_attn_backward(const nmz_backend *be, int B, int H, int T, i
                                                                                dctx, dP, dkv);
         return check("attention backward");
     }
-    for (b = 0; b < B; b++) { /* ∂L/∂weights = ∂L/∂context · Vᵀ */
-        const float *dc = dctx + (size_t)b * T * E, *v = kv + (size_t)b * Tk * 2 * E + E;
-        if ((s = gemm_sb(0, 1, T, Tk, d, 1.0f, dc, E, d, v, 2 * E, d, 0.0f, dP + (size_t)b * H * T * Tk, Tk,
-                         (long long)T * Tk, H)) != NMZ_OK)
-            return s;
-    }
+    /* ∂L/∂weights = ∂L/∂context · Vᵀ, then through the softmax: ∂L/∂S */
+    if ((s = gemm_bh(B, H, 0, 1, T, Tk, d, 1.0f, dctx, E, sc, kv + E, 2 * E, skv, 0.0f, dP, Tk, sp)) != NMZ_OK) return s;
     k_attn_softmax_bwd<<<warps_blocks((size_t)B * H * T), TPB, 0, g.stream>>>((size_t)B * H * T, T, Tk, Tp, P, dP);
     if ((s = check("attention softmax backward")) != NMZ_OK) return s;
-    for (b = 0; b < B; b++) {
-        const float *dS = dP + (size_t)b * H * T * Tk, *Pb = P + (size_t)b * H * T * Tk;
-        const float *q = qkv + (size_t)b * T * 3 * E, *k = kv + (size_t)b * Tk * 2 * E, *dc = dctx + (size_t)b * T * E;
-        float *dq = dqkv + (size_t)b * T * 3 * E, *dk = dkv + (size_t)b * Tk * 2 * E;
-        /* ∂L/∂q += ∂L/∂S · K/√d   ∂L/∂k += ∂L/∂Sᵀ · Q/√d   ∂L/∂v += Pᵀ · ∂L/∂context */
-        if ((s = gemm_sb(0, 0, T, d, Tk, scale, dS, Tk, (long long)T * Tk, k, 2 * E, d, 1.0f, dq, 3 * E, d, H)) !=
-                NMZ_OK ||
-            (s = gemm_sb(1, 0, Tk, d, T, scale, dS, Tk, (long long)T * Tk, q, 3 * E, d, 1.0f, dk, 2 * E, d, H)) !=
-                NMZ_OK ||
-            (s = gemm_sb(1, 0, Tk, d, T, 1.0f, Pb, Tk, (long long)T * Tk, dc, E, d, 1.0f, dk + E, 2 * E, d, H)) != NMZ_OK)
-            return s;
-    }
-    return NMZ_OK;
+    /* ∂L/∂q += ∂L/∂S · K/√d   ∂L/∂k += ∂L/∂Sᵀ · Q/√d   ∂L/∂v += Pᵀ · ∂L/∂context */
+    if ((s = gemm_bh(B, H, 0, 0, T, d, Tk, scale, dP, Tk, sp, kv, 2 * E, skv, 1.0f, dqkv, 3 * E, sq)) != NMZ_OK ||
+        (s = gemm_bh(B, H, 1, 0, Tk, d, T, scale, dP, Tk, sp, qkv, 3 * E, sq, 1.0f, dkv, 2 * E, skv)) != NMZ_OK)
+        return s;
+    return gemm_bh(B, H, 1, 0, Tk, d, T, 1.0f, P, Tk, sp, dctx, E, sc, 1.0f, dkv + E, 2 * E, skv);
 }
 
 static nmz_seq_record rec_of(const nmz_seq_record *r) {
