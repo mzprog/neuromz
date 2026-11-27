@@ -26,6 +26,11 @@ and every derivative is checked against numerical gradients.
   there (cuBLAS + the library's own kernels), 10–240× faster on the models
   below; the public API stays C, traces still work, model files are the
   same on every device, and a CUDA build still runs without a GPU
+* **Threads** (2.2): several nets train at once in several threads, each
+  on its own device (`nmz_backend_select_thread`), with the results of
+  sequential runs — on the CPU and on the GPU; and models **described in
+  words** (`nmz_model_new`: the layer grammar and presets of the program's
+  `new`, with the explanation of every default)
 * Builds with GCC, Clang and MSVC (Windows natively), optional OpenMP;
   tested on Linux, Windows and macOS, under ASan + UBSan
 
@@ -33,6 +38,11 @@ and every derivative is checked against numerical gradients.
 this library — quick start, walkthroughs (MNIST, names, Alice, Arabic prose,
 RNN vs LSTM vs GRU, *how attention works, step by step*) and the benchmark
 results are in [its README](https://github.com/mzprog/neuromz-cli#readme).
+**Over the network:** [`neuromz-server`](https://github.com/mzprog/neuromz-server)
+hosts models and runs training and inference jobs on the CPU or a GPU, and
+[`neuromz-protocol`](https://github.com/mzprog/neuromz-protocol) is its
+HTTP + JSON API (OpenAPI, a C wire library, a conformance suite); the
+program's remote mode and the planned `neuromz-web` use it.
 
 NeuroMZ started in 2017 as a beginner's project. That code is preserved in
 [`legacy/`](legacy/) (git tag `v1-legacy`); v2 is a rewrite. The design and
@@ -67,12 +77,12 @@ runs only when the data has been downloaded.
 Using it from another CMake project:
 
 ```cmake
-find_package(neuromz 2.1 REQUIRED)          # after cmake --install
+find_package(neuromz 2.2 REQUIRED)          # after cmake --install
 target_link_libraries(app PRIVATE neuromz::neuromz)
 
 # or without installing:
 include(FetchContent)
-FetchContent_Declare(neuromz GIT_REPOSITORY https://github.com/mzprog/neuromz.git GIT_TAG v2.1.0)
+FetchContent_Declare(neuromz GIT_REPOSITORY https://github.com/mzprog/neuromz.git GIT_TAG v2.2.0)
 FetchContent_MakeAvailable(neuromz)
 target_link_libraries(app PRIVATE neuromz::neuromz)
 ```
@@ -147,6 +157,38 @@ nmz_backend_select("auto");               /* "cpu", "cuda", or "auto" */
 nmz_backend_info(&di);                    /* e.g. "cuda", "NVIDIA GeForce GTX 1660 Ti", 7.5, 6144 MiB */
 printf("%s: %s (%s)\n", di.backend, di.device, di.note);   /* note: why this device */
 /* ... train as above; di.mem_used / mem_peak / mem_limit: the library's GPU memory */
+```
+
+Threads: a net, dataset, vocabulary or recorder belongs to one thread at a
+time; different nets train at once in different threads. A thread can pick
+its own device, which wins over the process-wide choice in that thread:
+
+```c
+static int worker(void *arg) {             /* one per job, e.g. in a server */
+    nmz_backend_select_thread("cuda");     /* this thread only; NULL: back to the process-wide one */
+    /* ... build, train and save this job's net ... */
+    nmz_backend_select_thread(NULL);
+    return 0;
+}
+```
+
+The CUDA backend gives every thread its own stream, cuBLAS handle and
+buffers; the device and its memory cap are shared. Returning non-zero from
+`opts.on_batch` or `opts.on_epoch` stops training cleanly after that batch
+(`res.stopped`): that is how a server cancels a job. The rules are at the
+top of [`include/neuromz.h`](include/neuromz.h) and in
+[DESIGN §11.8](docs/DESIGN.md#118-threads).
+
+Models described in words, as the program's `new` takes them:
+
+```c
+static void line(const char *text, void *user) { puts(text); }   /* the explanation, line by line */
+char *const argv[] = {"2", "8:tanh", "1:sigmoid", "--loss", "mse"};
+nmz_model_env env = {0};
+env.print = line;
+if (nmz_model_new(5, argv, &env, &net) != NMZ_OK) fprintf(stderr, "%s\n", nmz_last_error());
+/* presets: nmz_preset_count / nmz_preset_name / nmz_preset_summary;
+ * training options as the program spells them: nmz_train_option, nmz_train_describe */
 ```
 
 All functions are documented in [`include/neuromz.h`](include/neuromz.h).
@@ -276,8 +318,8 @@ it still receives 0.86% of the last prediction's gradient on Alice, against
 
 ## Tests
 
-`cmake --build build --target test` runs 96 unit tests (~106 000 checks) in
-about a second, the two C examples as regressions (XOR must converge; the
+`cmake --build build --target test` runs 105 unit tests (~106 000 checks) in
+about two seconds, the two C examples as regressions (XOR must converge; the
 MNIST CNN must reach 95% after one epoch on 20 000 images, when the data is
 present), and in CI a consumer of the installed package:
 
@@ -353,7 +395,16 @@ present), and in CI a consumer of the installed package:
   gradient check on the GPU, recurrent layers too wide for the fused
   kernels, traces, the KV cache, a GPU-trained file on the CPU, identical
   files from two GPU runs, running out of memory; the parity runs above
-  (21 tests, ~1 400 checks);
+  several GPU nets and a CPU net trained at once in four threads, every
+  file identical to the sequential runs (22 tests, ~1 400 checks);
+* **threads**: six nets of four kinds trained in six threads give model
+  files byte-identical to sequential runs; a thread's device choice does
+  not leak into other threads; errors stay per thread; eight threads use
+  the backend registry at once; training stopped after three batches
+  equals one epoch over those three batches, bit for bit;
+* **models in words**: every preset and the layer grammar build the
+  models the program builds, errors are messages, data paths go through
+  the caller's callback, training options parse as the program's;
 * CSV and IDX parsing errors; every API entry point with `NULL`/bad input.
 * the training data a model remembers (path and item hashes) through
   save/load, and older files without it.
@@ -388,10 +439,13 @@ RNN with truncated BPTT, clipping, validation/early stopping and generation
 4); a decoder-only Transformer with AdamW, warm-up, a blocked matrix
 product, a KV cache and attention traces (phase 5); CMake, native Windows,
 CI, the first public release and the split into repositories (v2.0.0);
-device backends with CUDA (v2.1.0). Next, in their own repositories:
-`neuromz-protocol` (the trace events as a wire format), `neuromz-server`
-and `neuromz-web` (a GUI that consumes the trace events); in this one,
-more backends (HIP, Vulkan) on the same table of ops.
+device backends with CUDA (v2.1.0); threads and models described in
+words (v2.2.0), with
+[`neuromz-protocol`](https://github.com/mzprog/neuromz-protocol) v1.0.0 and
+[`neuromz-server`](https://github.com/mzprog/neuromz-server) v0.1.0 in their
+own repositories and the program's remote mode. Next: `neuromz-web` (a GUI
+that consumes the protocol and the trace events); in this repository, more
+backends (HIP, Vulkan) on the same table of ops.
 
 ## License
 

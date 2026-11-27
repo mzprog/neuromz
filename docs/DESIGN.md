@@ -17,7 +17,9 @@ decisions 71–90; phase 5 (a decoder-only Transformer, AdamW, warm-up,
 the blocked matrix product, the KV cache, attention traces) added
 decisions 91–110. Release 2.1 (device backends: the backend layer, the
 CPU and CUDA backends, devices in the program) added §11 and decisions
-127–157.
+127–157. Release 2.2 (threads, models described in words in the library,
+the program's remote mode; the server and the protocol have their own
+design documents) added §11.8 and decisions 158–165.
 
 ---
 
@@ -602,6 +604,11 @@ T [--pos P] [--layer N] [--head H]` shows attention at one position with
 real numbers; `show attention` a heatmap and the head patterns over any
 text; `show params` the parameters per component; `generate --context N
 --no-cache`; `compare` accepts Transformers.
+
+Remote mode (2.2, decisions 161–165): profiles in `client.conf`
+(`--profile NAME`, `--host`, `--token`); the same commands against a
+[neuromz-server](https://github.com/mzprog/neuromz-server) over the
+[NeuroMZ protocol](https://github.com/mzprog/neuromz-protocol).
 
 Devices (2.1, decisions 154–157): `--device auto|cpu|cuda` for one command
 or the shell, `set --device D` in the shell, `train … --device D` for one
@@ -1761,6 +1768,90 @@ attention traces):
     memory cap — and in a CUDA build with a GPU the whole script, every
     model type and view, runs on the GPU.
 
+### Release 2.2: threads, models in words, remote mode
+
+158. **Nets on several threads at once; the selection and the CUDA state
+    per thread.** A server runs jobs in parallel threads, each with its own
+    nmz_net. The audit found the library's state already per net, the
+    error message thread-local, and three shared things: the backend
+    registry (lazy initialisation), the process-wide selection, and the
+    CUDA backend's stream, cuBLAS handle, work buffers and pending
+    scalars. The registry and the selection now sit behind one lock (SRW
+    lock / pthread mutex; the library links Threads on POSIX), and a
+    thread may select a backend for itself (`nmz_backend_select_thread`),
+    which wins over the process-wide one in that thread only — a worker
+    runs its job on its job's device. The CUDA backend shares the device
+    context, cuBLAS and the allocation table (a mutex) and gives every
+    host thread its own stream, cuBLAS handle, pinned slots and work
+    buffers, created on the thread's first op and released when it ends:
+    nets on different threads run side by side on the GPU and never see
+    each other's buffers. The rules are in `neuromz.h`: a net, dataset,
+    vocabulary or recorder belongs to one thread at a time and may move
+    between calls (after `nmz_backend_sync` if the last call only queued
+    device work). Tested: six nets of four kinds trained in six threads
+    give byte-identical model files to sequential runs; three GPU jobs and
+    a CPU job at once give the files of sequential runs; a thread's
+    selection does not leak; errors stay per thread; eight threads call
+    the registry concurrently. CPU results are bit-identical to 2.1.0 (the
+    probe of decision 128: 75 lines and 11 model files).
+159. **Models described in words belong to the library.** The program's
+    `new` — the layer grammar, the presets, the explained defaults — was
+    the only place that turned a description into a model, and the
+    server must build exactly the same models (and the web client show
+    the same explanations). It moved to the library as `nmz_model_new`
+    (the arguments of `new`, an explanation line callback, a data-path
+    callback so a server can map dataset names to its files, and two
+    hooks the program uses for its device line), with
+    `nmz_model_format`, the preset list, `nmz_train_option` (the training
+    options as the program spells them) and `nmz_train_describe` (the
+    configuration in one line). The library still never prints. Moving
+    rather than rewriting kept every message: the program's `new` prints
+    byte for byte what it printed before (43 cases: presets, specs, text
+    and Transformer models, 15 errors; stdout, stderr and status).
+160. **Progress and stopping use the callbacks that exist.** `on_batch`
+    and `on_epoch` already let a caller stop training (a non-zero return,
+    `res.stopped`); a server's cancel returns non-zero from `on_batch`, so
+    training stops after the current batch with the weights of the
+    batches done. Now tested: stopped after three batches, the weights
+    equal a one-epoch run over the same three batches, bit for bit.
+161. **In remote mode the current model lives on the server.** The program
+    keeps one model; in remote mode it is a model on a neuromz-server,
+    named, and commands act on it there: `new` builds it on the server
+    (which explains it with the library's lines, decision 159), `load
+    FILE` uploads a file and `load NAME` picks a server model, `save FILE`
+    downloads it (`-m`/`-o` work the same way in one-shot use), and
+    `train`, `test`, `predict`, `generate` and `trace` compute on the
+    server. The views (`show`, and the printing of a trace) download the
+    model and use the program's own printers, so remote output reads like
+    local output; the trace's numbers come from the server's events. Every
+    command says which server it used, and the shell's prompt names the
+    server and the model.
+162. **Profiles in client.conf; local mode unchanged.** `client.conf`
+    (Linux `~/.config/neuromz/`, Windows `%APPDATA%\NeuroMZ\`, or
+    `$NEUROMZ_CLIENT_CONFIG`) holds named profiles: `mode = local`, or
+    `host`, `port`, `token`, `save`; `default = NAME` picks one when no
+    `--profile` is given. `--host` and `--token` override. Without a
+    file, or with a local profile, the program is exactly what it was:
+    the smoke test runs unchanged in local mode and passes.
+163. **Data goes to the server once.** A local data file a remote command
+    needs (CSV, text, MNIST's IDX pair) is uploaded as a dataset named by
+    its file name and SHA-256 (`xor.csv` becomes `xor-csv-` and ten hex
+    digits); a file the server already has is not sent again (its
+    `sha256` answers). The program counts samples from 1, the protocol
+    from 0: the program converts.
+164. **Remote training streams the server's events.** `train` starts a job
+    with the program's own option arguments (the server parses them with
+    the same library parser, so the same options mean the same thing and
+    a bad one gets the same message) and prints the server's epoch events
+    with the local epoch line. With `save = client` on a stored model the
+    result is a new client model (`NAME.jID`), which becomes the current
+    model.
+165. **Some commands stay local.** `step`, `gradcheck`, `compare`,
+    `reinit` and `set` (except `set --device`) change or examine a model
+    in ways the protocol 1.0 does not cover; in remote mode they say so
+    and suggest `save FILE` and a local profile. Plain HTTP only: TLS is
+    a reverse proxy's job (the server's README).
+
 ---
 
 ## 11. Device backends (release 2.1)
@@ -1861,3 +1952,13 @@ has none); several GPUs; a persistent kernel for whole recurrent stacks;
 cuDNN (another large run-time dependency, for convolutions that are
 already cuBLAS-bound here); CUDA graphs to cut the remaining launch cost of
 short batches.
+
+### 11.8 Threads
+
+The library's own state is per net; what is shared is the backend
+registry, the process-wide selection (one lock) and the CUDA device
+(decision 158). A thread chooses its device with
+`nmz_backend_select_thread`; the CUDA backend gives each thread a stream,
+a cuBLAS handle and buffers of its own, so nets on different threads run
+side by side, on the CPU and on the GPU, with the results of sequential
+runs. A net belongs to one thread at a time and may move between calls.

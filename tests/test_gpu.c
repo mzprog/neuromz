@@ -1224,6 +1224,67 @@ static void test_info_and_oom(void) {
     nmz_backend_select("cpu");
 }
 
+/* several nets on the GPU from several threads at once (each thread has
+ * its own stream): the same files as one after another; a CPU job beside
+ * them is not disturbed either (decision 158) */
+typedef struct gpu_job {
+    int kind;
+    const char *backend;
+    char path[600];
+    nmz_status status;
+    char err[300];
+} gpu_job;
+
+static void gpu_job_run(void *arg) {
+    gpu_job *j = (gpu_job *)arg;
+    nmz_dataset *ds = NULL;
+    nmz_net *net = NULL;
+    nmz_train_opts o = text_opts(j->kind);
+    nmz_train_result r;
+    o.max_epochs = 2;
+    if ((j->status = nmz_backend_select_thread(j->backend)) == NMZ_OK) {
+        ds = names(600);
+        net = ds ? text_net(ds, j->kind) : NULL;
+        j->status = net ? nmz_net_train(net, ds, &o, &r) : NMZ_ERR_NOMEM;
+        if (j->status == NMZ_OK) j->status = nmz_net_save(net, j->path);
+    }
+    if (j->status != NMZ_OK) snprintf(j->err, sizeof j->err, "%s", nmz_last_error());
+    nmz_net_free(net);
+    nmz_dataset_free(ds);
+    nmz_backend_select_thread(NULL);
+}
+
+static void test_concurrent_gpu(void) {
+    enum { N = 4 };
+    static const int kinds[N] = {0, 1, 1, 0};
+    static const char *const devs[N] = {"cuda", "cuda", "cuda", "cpu"};
+    gpu_job seq[N], par[N];
+    void *args[N];
+    int i;
+    memset(seq, 0, sizeof seq);
+    memset(par, 0, sizeof par);
+    for (i = 0; i < N; i++) {
+        char name[64];
+        seq[i].kind = par[i].kind = kinds[i];
+        seq[i].backend = par[i].backend = devs[i];
+        snprintf(name, sizeof name, "gpu_seq%d.nmz", i);
+        snprintf(seq[i].path, sizeof seq[i].path, "%s", test_path(name));
+        snprintf(name, sizeof name, "gpu_par%d.nmz", i);
+        snprintf(par[i].path, sizeof par[i].path, "%s", test_path(name));
+        args[i] = &par[i];
+    }
+    for (i = 0; i < N; i++) gpu_job_run(&seq[i]);
+    CHECK(test_run_threads(N, gpu_job_run, args));
+    for (i = 0; i < N; i++) {
+        CHECK_MSG(seq[i].status == NMZ_OK && par[i].status == NMZ_OK, "job %d on %s: %s %s", i, devs[i], seq[i].err,
+                  par[i].err);
+        CHECK_MSG(file_hash(seq[i].path) && file_hash(seq[i].path) == file_hash(par[i].path),
+                  "job %d (%s on %s): trained in parallel, the file differs", i, kinds[i] ? "transformer" : "lstm+gru",
+                  devs[i]);
+    }
+    test_note("3 GPU jobs and 1 CPU job in 4 threads at once: every file identical to the sequential run");
+}
+
 const test_case gpu_tests[] = {{"gpu/ops_elementwise", test_ops_elementwise},
                                {"gpu/ops_gemm", test_ops_gemm},
                                {"gpu/ops_reductions", test_ops_reductions},
@@ -1239,6 +1300,7 @@ const test_case gpu_tests[] = {{"gpu/ops_elementwise", test_ops_elementwise},
                                {"gpu/determinism_and_files", test_determinism_and_files},
                                {"gpu/kv_cache", test_kv_cache_gpu},
                                {"gpu/info_and_out_of_memory", test_info_and_oom},
+                               {"gpu/concurrent_threads", test_concurrent_gpu},
                                {NULL, NULL}};
 
 /* --------------------------------------------------------------- parity */

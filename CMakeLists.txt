@@ -17,7 +17,7 @@
 # CMake 3.21 is the minimum: it is the first version that passes C11/C17
 # to MSVC (/std:c11) — DESIGN decision 114.
 cmake_minimum_required(VERSION 3.21)
-project(neuromz VERSION 2.1.0 DESCRIPTION "Educational neural-network engine" LANGUAGES C)
+project(neuromz VERSION 2.2.0 DESCRIPTION "Educational neural-network engine" LANGUAGES C)
 
 set(NMZ_TOP ${PROJECT_IS_TOP_LEVEL})
 option(NMZ_OPENMP "Multi-threaded matrix products and attention heads (OpenMP)" OFF)
@@ -69,7 +69,7 @@ set(NMZ_LIB_SOURCES
     src/error.c src/tensor.c src/rng.c src/activation.c src/dense.c src/loss.c src/net.c src/train.c
     src/trace.c src/gradcheck.c src/io.c src/dataset.c src/defaults.c src/conv2d.c src/shape_layers.c
     src/normalize.c src/text.c src/recurrent.c src/lstm.c src/gru.c src/generate.c src/matmul.c
-    src/attention.c src/transformer.c src/backend.c src/backend_cpu.c)
+    src/attention.c src/transformer.c src/backend.c src/backend_cpu.c src/model.c)
 add_library(neuromz STATIC ${NMZ_LIB_SOURCES})
 add_library(neuromz::neuromz ALIAS neuromz)
 set_target_properties(neuromz PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
@@ -130,6 +130,13 @@ if(NMZ_CUDA)
   set(NMZ_CUDA_LINKED 1)
 endif()
 
+# the backend registry's lock: pthreads (Windows: SRW locks, no library)
+if(NOT WIN32)
+  set(THREADS_PREFER_PTHREAD_FLAG ON)
+  find_package(Threads REQUIRED)
+  target_link_libraries(neuromz PUBLIC Threads::Threads)
+endif()
+
 set(NMZ_OPENMP_LINKED 0)
 if(NMZ_OPENMP)
   find_package(OpenMP COMPONENTS C)
@@ -147,7 +154,7 @@ if(NMZ_BUILD_TESTS)
   add_executable(test_neuromz
       tests/test_main.c tests/test_core.c tests/test_math.c tests/test_train.c tests/test_io.c
       tests/test_layers.c tests/test_optim.c tests/test_text.c tests/test_seq.c tests/test_gated.c
-      tests/test_transformer.c tests/test_backend.c)
+      tests/test_transformer.c tests/test_backend.c tests/test_threads.c tests/test_threads_util.c tests/test_model.c)
   set_target_properties(test_neuromz PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
   target_include_directories(test_neuromz PRIVATE src)
   target_link_libraries(test_neuromz PRIVATE neuromz nmz_warnings)
@@ -163,7 +170,7 @@ if(NMZ_BUILD_TESTS)
   if(NMZ_CUDA)
     # the GPU tests (label gpu): every op against the CPU, gradient checks on
     # the GPU, training parity; exit 77 (skipped) without a usable GPU
-    add_executable(test_gpu tests/test_gpu.c tests/test_gpu_main.c)
+    add_executable(test_gpu tests/test_gpu.c tests/test_gpu_main.c tests/test_threads_util.c)
     set_target_properties(test_gpu PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
     target_include_directories(test_gpu PRIVATE src)
     target_link_libraries(test_gpu PRIVATE neuromz nmz_warnings)

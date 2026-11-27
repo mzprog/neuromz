@@ -2,8 +2,22 @@
  * neuromz.h — NeuroMZ v2 public API.
  *
  * An educational neural-network engine in C11. Every public name starts with
- * nmz_ / NMZ_. The library never prints, never exits, and keeps no global
- * state apart from a thread-local "last error" message.
+ * nmz_ / NMZ_. The library never prints and never exits. Its only global
+ * state is the backend registry and the process-wide backend selection
+ * (guarded by a lock); the "last error" message and a thread's own backend
+ * selection are thread-local.
+ *
+ * Threads (DESIGN §11.8): different nets may be used from different threads
+ * at the same time — each net, dataset, vocabulary and trace recorder
+ * belongs to one thread at a time, and a net may move to another thread
+ * between calls (after nmz_backend_sync on a device, if the last call only
+ * queued work: nmz_net_update, nmz_net_optimizer_step). Selection, queries
+ * and registration are safe from any thread. Changing the process-wide
+ * selection while other threads compute moves their nets at their next
+ * call; a server should give each worker thread its own selection instead
+ * (nmz_backend_select_thread). The CUDA backend shares one device context
+ * and gives every thread its own stream, cuBLAS handle and buffers, so nets
+ * on different threads run side by side; the memory cap is shared.
  *
  * See docs/DESIGN.md for the design and README.md for a tutorial.
  */
@@ -19,12 +33,15 @@ extern "C" {
 #endif
 
 #define NMZ_VERSION_MAJOR 2
-#define NMZ_VERSION_MINOR 1
+#define NMZ_VERSION_MINOR 2
 #define NMZ_VERSION_PATCH 0
-#define NMZ_VERSION_STRING "2.1.0"
+#define NMZ_VERSION_STRING "2.2.0"
 
 /* this library has nmz_backend_select & co. (2.1.0 on) */
 #define NMZ_HAVE_BACKENDS 1
+/* this library has nmz_backend_select_thread and nmz_model_new & co. (2.2.0 on) */
+#define NMZ_HAVE_THREADS 1
+#define NMZ_HAVE_MODEL_WORDS 1
 
 #define NMZ_MAX_RANK 4
 /* A per-sample dimension of 0 (first dimension only) means "any length":
@@ -115,7 +132,16 @@ typedef struct nmz_device_info {
  * NVIDIA GPU or driver, where "cuda" fails with NMZ_ERR_UNSUPPORTED and the
  * reason, and "auto" falls back to the CPU. */
 nmz_status nmz_backend_select(const char *name);
-/* The selected backend: device name, compute capability, memory. */
+/* The same for the calling thread only (it wins over nmz_backend_select in
+ * this thread); NULL returns the thread to the process-wide selection.
+ * Other threads are not affected. (2.2.0 on.) */
+nmz_status nmz_backend_select_thread(const char *name);
+/* Wait until the device work this thread queued is done (no-op on the CPU).
+ * Needed only before another thread uses a net whose last call queued work
+ * without returning a result (nmz_net_update, nmz_net_optimizer_step). */
+nmz_status nmz_backend_sync(void);
+/* The selected backend (this thread's, else the process-wide one): device
+ * name, compute capability, memory. */
 nmz_status nmz_backend_info(nmz_device_info *out);
 /* Any built-in backend by name (initialising it if needed); for one that
  * cannot be used: NMZ_ERR_UNSUPPORTED, the reason in out->note. */
@@ -833,6 +859,75 @@ int nmz_threads(void);
 /* Write a human-readable multi-line summary of the architecture. Returns the
  * number of characters that would have been written (like snprintf). */
 int nmz_net_summary(const nmz_net *net, char *buf, size_t n);
+
+
+/* ------------------------------------------- models described in words */
+
+/* The layer grammar, presets and explained defaults of the program's `new`
+ * command (DESIGN §8, decision 159), so that every program building a model
+ * from a description builds the same model and explains it in the same
+ * words: the command-line program, neuromz-server and its clients. */
+typedef void (*nmz_line_fn)(const char *line, void *user);
+typedef struct nmz_model_env {
+    nmz_line_fn print; /* each explanation line, without '\n' (NULL: quiet) */
+    void *user;
+    /* --data NAME -> the file to read into `path` (a server maps dataset
+     * names to its files); NULL: NAME is the path. Non-zero = not available,
+     * with a message in err. */
+    int (*data_path)(const char *name, char *path, size_t n, char *err, size_t errn, void *user);
+    /* called once the arguments are parsed, before anything is built; a
+     * non-zero return stops with NMZ_ERR_STATE and an empty message (the
+     * callback reported why) */
+    int (*ready)(void *user);
+    /* called after the last setting line (the program adds its device) */
+    void (*after_settings)(void *user);
+} nmz_model_env;
+
+/* Build a net from the arguments of `neuromz new` without the command name:
+ *   an input (784 | 1x28x28 | 28x28 | text) and layer specs
+ *   (64:relu conv:8:3:relu pool:2 embed:32 lstm:64 block:heads=4 vocab ...),
+ *   or --preset NAME; options --data FILE (text: builds the vocabulary),
+ *   --loss, --normalize, --seed, --items/--no-items, --strip-diacritics,
+ *   --unify-alef, and every training option of nmz_train_option.
+ * Every choice is explained through env->print, one line each. On success
+ * *out is the built net with its training configuration (and vocabulary). */
+nmz_status nmz_model_new(int argc, char *const *argv, const nmz_model_env *env, nmz_net **out);
+/* One explanation line: "  WHAT  VALUE  [TAG]  WHY" in the columns `new` uses. */
+void nmz_model_format(char *buf, size_t n, const char *what, const char *value, const char *tag, const char *why);
+/* The presets of nmz_model_new (--preset NAME). */
+int nmz_preset_count(void);
+const char *nmz_preset_name(int i);
+const char *nmz_preset_summary(int i);
+const char *nmz_preset_input(int i); /* "text" presets read --data (default: nmz_preset_data) */
+const char *nmz_preset_data(int i);  /* the preset's default text, or NULL */
+
+/* Training options as the program spells them: argv[*i] (and its value)
+ * into *o; *mask records which were given. Returns 1 if consumed (*i then
+ * points at its last argument), 0 if argv[*i] is not a training option, -1
+ * for a bad value (nmz_last_error says why). Options: --lr --momentum
+ * --batch --epochs --target-loss --optimizer --beta1 --beta2 --eps
+ * --schedule --step-size --gamma --min-lr --weight-decay --decay-all
+ * --warmup --shuffle --no-shuffle --carry --no-carry --val --clip
+ * --patience --seq-len. */
+#define NMZ_SET_LR 1u
+#define NMZ_SET_MOMENTUM 2u
+#define NMZ_SET_BATCH 4u
+#define NMZ_SET_EPOCHS 8u
+#define NMZ_SET_TARGET 16u
+#define NMZ_SET_SHUFFLE 32u
+#define NMZ_SET_OPTIMIZER 64u
+#define NMZ_SET_BETAS 128u
+#define NMZ_SET_SCHEDULE 256u
+#define NMZ_SET_VAL 512u
+#define NMZ_SET_CLIP 1024u
+#define NMZ_SET_CARRY 2048u
+#define NMZ_SET_PATIENCE 4096u
+#define NMZ_SET_SEQLEN 8192u
+#define NMZ_SET_DECAY 16384u
+#define NMZ_SET_WARMUP 32768u
+int nmz_train_option(int argc, char *const *argv, int *i, nmz_train_opts *o, unsigned *mask);
+/* The configuration in one line ("adam lr 0.001 (beta1 0.9, ...), batch 32, ..."). */
+void nmz_train_describe(const nmz_train_opts *o, char *buf, size_t n);
 
 #ifdef __cplusplus
 }

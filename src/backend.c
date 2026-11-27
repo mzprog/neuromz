@@ -1,12 +1,17 @@
 /* backend.c — the backend registry, selection, and the device copies of
  * tensors (DESIGN §11).
  *
- * Selection is process-wide: nmz_backend_select picks the backend every
- * net computes on from then on (a net notices at its next computation).
- * The CPU is the default, so a program that never selects anything runs
- * exactly as with v2.0.1. Device backends initialise lazily, the first
- * time they are selected or queried; until then nothing of theirs runs,
- * which is how a CUDA build works on a machine without a GPU or driver.
+ * Selection is process-wide by default: nmz_backend_select picks the
+ * backend every net computes on from then on (a net notices at its next
+ * computation). A thread can also choose for itself with
+ * nmz_backend_select_thread, which wins over the process-wide choice in
+ * that thread only (decision 158: a server's worker threads each run a job
+ * on its own device). The CPU is the default, so a program that never
+ * selects anything runs exactly as with v2.0.1. Device backends initialise
+ * lazily, once, the first time they are selected or queried; until then
+ * nothing of theirs runs, which is how a CUDA build works on a machine
+ * without a GPU or driver. The registry and the process-wide selection are
+ * guarded by one lock, so any thread may select, query or register.
  *
  * A tensor's `data` is host memory. When a device backend computes on a
  * tensor, the tensor gets a device copy (struct nmz_tensor_dev) and a note
@@ -14,11 +19,31 @@
  * only when that copy is out of date (nmz__acquire), and a write makes the
  * other copy stale. Host code that keeps calling the accessors never sees
  * stale data, whichever backend ran last. */
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 #include "internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ------------------------------------------------------------- the lock */
+
+#if defined(_WIN32)
+static SRWLOCK g_lock = SRWLOCK_INIT;
+static void lock(void) { AcquireSRWLockExclusive(&g_lock); }
+static void unlock(void) { ReleaseSRWLockExclusive(&g_lock); }
+#else
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static void lock(void) { pthread_mutex_lock(&g_lock); }
+static void unlock(void) { pthread_mutex_unlock(&g_lock); }
+#endif
 
 /* ------------------------------------------------------------- registry */
 
@@ -34,7 +59,12 @@ static slot g_slots[MAX_BACKENDS];
 static int g_n, g_builtins;
 static const nmz_backend *g_current; /* NULL: the CPU */
 static char g_note[256] = "default (the CPU unless another backend is selected)";
+/* the calling thread's own choice (nmz_backend_select_thread) */
+static NMZ_THREAD_LOCAL int t_selected;
+static NMZ_THREAD_LOCAL const nmz_backend *t_current;
+static NMZ_THREAD_LOCAL char t_note[256];
 
+/* everything below that touches g_* runs with the lock held */
 static void add_slot(const nmz_backend *be) {
     int i;
     for (i = 0; i < g_n; i++)
@@ -66,23 +96,36 @@ static slot *find(const char *name) {
 }
 
 nmz_status nmz_backend_register(const nmz_backend *be) {
-    builtins();
+    nmz_status s = NMZ_OK;
     if (!be || !be->name || be->abi != NMZ_BACKEND_ABI)
         return nmz__fail(NMZ_ERR_ARG, "backend table is NULL or built for another ABI (expected %d)", NMZ_BACKEND_ABI);
-    if (find(be->name)) return nmz__fail(NMZ_ERR_ARG, "a backend named '%s' is already registered", be->name);
-    if (g_n >= MAX_BACKENDS) return nmz__fail(NMZ_ERR_NOMEM, "too many backends");
-    add_slot(be);
-    return NMZ_OK;
+    lock();
+    if (find(be->name))
+        s = nmz__fail(NMZ_ERR_ARG, "a backend named '%s' is already registered", be->name);
+    else if (g_n >= MAX_BACKENDS)
+        s = nmz__fail(NMZ_ERR_NOMEM, "too many backends");
+    else
+        add_slot(be);
+    unlock();
+    return s;
 }
 
 int nmz_backend_count(void) {
+    int n;
+    lock();
     builtins();
-    return g_n;
+    n = g_n;
+    unlock();
+    return n;
 }
 
 const char *nmz_backend_name(int i) {
+    const char *name;
+    lock();
     builtins();
-    return i >= 0 && i < g_n ? g_slots[i].be->name : NULL;
+    name = i >= 0 && i < g_n ? g_slots[i].be->name : NULL;
+    unlock();
+    return name;
 }
 
 /* Initialise once; remember the answer (a missing driver will not appear
@@ -96,26 +139,31 @@ static int usable(slot *sl) {
     return sl->state == 1;
 }
 
-const nmz_backend *nmz_backend_current(void) { return g_current ? g_current : &nmz__cpu_backend; }
+const nmz_backend *nmz_backend_current(void) {
+    const nmz_backend *be;
+    if (t_selected) return t_current ? t_current : &nmz__cpu_backend;
+    lock();
+    be = g_current;
+    unlock();
+    return be ? be : &nmz__cpu_backend;
+}
 
-nmz_status nmz_backend_select(const char *name) {
+/* what `name` selects (NULL = the CPU) and the note for it; lock held */
+static nmz_status resolve(const char *name, const nmz_backend **out, char *note, size_t n) {
     slot *sl;
-    if (!name) return nmz__fail(NMZ_ERR_ARG, "backend name is NULL");
-    builtins();
     if (strcmp(name, "auto") == 0) {
         sl = find("cuda");
+        *out = NULL;
         if (!sl) {
-            g_current = NULL;
-            snprintf(g_note, sizeof g_note, "auto: this library was built without CUDA, using the CPU");
+            snprintf(note, n, "auto: this library was built without CUDA, using the CPU");
         } else if (usable(sl)) {
             nmz_device_info di;
             memset(&di, 0, sizeof di);
             sl->be->info(sl->be, &di);
-            g_current = sl->be;
-            snprintf(g_note, sizeof g_note, "auto: CUDA device found (%s)", di.device);
+            *out = sl->be;
+            snprintf(note, n, "auto: CUDA device found (%s)", di.device);
         } else {
-            g_current = NULL;
-            snprintf(g_note, sizeof g_note, "auto: no usable CUDA device (%.200s), using the CPU", sl->why);
+            snprintf(note, n, "auto: no usable CUDA device (%.200s), using the CPU", sl->why);
         }
         return NMZ_OK;
     }
@@ -127,15 +175,55 @@ nmz_status nmz_backend_select(const char *name) {
         return nmz__fail(NMZ_ERR_ARG, "unknown backend '%s' (expected auto, cpu or cuda)", name);
     }
     if (!usable(sl)) return nmz__fail(NMZ_ERR_UNSUPPORTED, "the %s backend cannot be used: %s", name, sl->why);
-    g_current = sl->be == &nmz__cpu_backend ? NULL : sl->be;
-    snprintf(g_note, sizeof g_note, "requested");
+    *out = sl->be == &nmz__cpu_backend ? NULL : sl->be;
+    snprintf(note, n, "requested");
     return NMZ_OK;
+}
+
+nmz_status nmz_backend_select(const char *name) {
+    const nmz_backend *be;
+    char note[256];
+    nmz_status s;
+    if (!name) return nmz__fail(NMZ_ERR_ARG, "backend name is NULL");
+    lock();
+    s = resolve(name, &be, note, sizeof note);
+    if (s == NMZ_OK) {
+        g_current = be;
+        snprintf(g_note, sizeof g_note, "%s", note);
+    }
+    unlock();
+    return s;
+}
+
+nmz_status nmz_backend_select_thread(const char *name) {
+    const nmz_backend *be;
+    char note[sizeof t_note - 16]; /* room for " (this thread)" */
+    nmz_status s;
+    if (!name) { /* back to the process-wide selection */
+        t_selected = 0;
+        t_current = NULL;
+        return NMZ_OK;
+    }
+    lock();
+    s = resolve(name, &be, note, sizeof note);
+    unlock();
+    if (s == NMZ_OK) {
+        t_selected = 1;
+        t_current = be;
+        snprintf(t_note, sizeof t_note, "%s (this thread)", note);
+    }
+    return s;
 }
 
 nmz_status nmz_backend_memory_limit(size_t bytes) {
     const nmz_backend *be = nmz_backend_current();
     if (be->host_memory || !be->memory_limit) return NMZ_OK;
     return be->memory_limit(be, bytes);
+}
+
+nmz_status nmz_backend_sync(void) {
+    const nmz_backend *be = nmz_backend_current();
+    return be->sync ? be->sync(be) : NMZ_OK;
 }
 
 static void fill_info(slot *sl, nmz_device_info *out) {
@@ -148,32 +236,38 @@ nmz_status nmz_backend_info(nmz_device_info *out) {
     const nmz_backend *be = nmz_backend_current();
     slot *sl;
     if (!out) return nmz__fail(NMZ_ERR_ARG, "out is NULL");
+    lock();
     sl = find(be->name);
     fill_info(sl, out);
-    snprintf(out->note, sizeof out->note, "%s", g_note);
+    snprintf(out->note, sizeof out->note, "%s", t_selected ? t_note : g_note);
+    unlock();
     return NMZ_OK;
 }
 
 nmz_status nmz_backend_query(const char *name, nmz_device_info *out) {
+    const nmz_backend *cur = nmz_backend_current();
+    nmz_status s = NMZ_OK;
     slot *sl;
     if (!name || !out) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
+    lock();
     sl = find(name);
     if (!sl) {
         memset(out, 0, sizeof *out);
         snprintf(out->backend, sizeof out->backend, "%.15s", name);
         snprintf(out->note, sizeof out->note, "%s",
                  strcmp(name, "cuda") == 0 ? "not built in (configure with -DNMZ_CUDA=ON)" : "unknown backend");
-        return nmz__fail(NMZ_ERR_UNSUPPORTED, "backend '%s': %s", name, out->note);
-    }
-    if (!usable(sl)) {
+        s = nmz__fail(NMZ_ERR_UNSUPPORTED, "backend '%s': %s", name, out->note);
+    } else if (!usable(sl)) {
         memset(out, 0, sizeof *out);
         snprintf(out->backend, sizeof out->backend, "%s", sl->be->name);
         snprintf(out->note, sizeof out->note, "%s", sl->why);
-        return nmz__fail(NMZ_ERR_UNSUPPORTED, "the %s backend cannot be used: %s", name, sl->why);
+        s = nmz__fail(NMZ_ERR_UNSUPPORTED, "the %s backend cannot be used: %s", name, sl->why);
+    } else {
+        fill_info(sl, out);
+        snprintf(out->note, sizeof out->note, "%s", cur == sl->be ? (t_selected ? t_note : g_note) : "available");
     }
-    fill_info(sl, out);
-    snprintf(out->note, sizeof out->note, "%s", nmz_backend_current() == sl->be ? g_note : "available");
-    return NMZ_OK;
+    unlock();
+    return s;
 }
 
 /* --------------------------------------------------------- device copies */
