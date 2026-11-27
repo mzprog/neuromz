@@ -99,11 +99,13 @@ nmz_status nmz__cpu_maxpool_forward(const nmz_backend *be, int planes, int H, in
     return NMZ_OK;
 }
 
-nmz_status nmz__cpu_maxpool_backward(const nmz_backend *be, int planes, int H, int W, int OH, int OW,
-                                     const float *dy, const float *argmax, float *dx) {
+nmz_status nmz__cpu_maxpool_backward(const nmz_backend *be, int planes, int H, int W, int size, int stride, int OH,
+                                     int OW, const float *dy, const float *argmax, float *dx) {
     int bc;
     size_t in_plane = (size_t)H * W, out_plane = (size_t)OH * OW, o;
     (void)be;
+    (void)size;
+    (void)stride; /* the winners are recorded: a scatter needs no window */
     memset(dx, 0, (size_t)planes * in_plane * sizeof(float));
     for (bc = 0; bc < planes; bc++) {
         const float *gp = dy + (size_t)bc * out_plane, *ap = argmax + (size_t)bc * out_plane;
@@ -147,7 +149,9 @@ static nmz_status pool_backward(nmz_layer *l, const nmz_tensor *x, const nmz_ten
     pa = nmz__r(be, &p->argmax);
     pdx = nmz__w(be, dx);
     if (!pdy || !pa || !pdx) return nmz__op_failed();
-    if ((s = be->maxpool_backward(be, x->shape[0] * p->C, p->H, p->W, p->OH, p->OW, pdy, pa, pdx)) != NMZ_OK) return s;
+    if ((s = be->maxpool_backward(be, x->shape[0] * p->C, p->H, p->W, p->size, p->stride, p->OH, p->OW, pdy, pa, pdx)) !=
+        NMZ_OK)
+        return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_item it[3] = {{"dL/dy", dy}, {"argmax", &p->argmax}, {"dL/dx", dx}};
         pool_emit(ctx, p, NMZ_TRACE_BACKWARD, 3, it);

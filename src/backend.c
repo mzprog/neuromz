@@ -132,6 +132,12 @@ nmz_status nmz_backend_select(const char *name) {
     return NMZ_OK;
 }
 
+nmz_status nmz_backend_memory_limit(size_t bytes) {
+    const nmz_backend *be = nmz_backend_current();
+    if (be->host_memory || !be->memory_limit) return NMZ_OK;
+    return be->memory_limit(be, bytes);
+}
+
 static void fill_info(slot *sl, nmz_device_info *out) {
     memset(out, 0, sizeof *out);
     snprintf(out->backend, sizeof out->backend, "%s", sl->be->name);

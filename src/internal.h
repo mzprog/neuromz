@@ -121,8 +121,8 @@ nmz_status nmz__cpu_embed_backward(const nmz_backend *be, size_t n, int V, int D
                                    float *dW);
 nmz_status nmz__cpu_maxpool_forward(const nmz_backend *be, int planes, int H, int W, int size, int stride, int OH,
                                     int OW, const float *x, float *y, float *argmax);
-nmz_status nmz__cpu_maxpool_backward(const nmz_backend *be, int planes, int H, int W, int OH, int OW,
-                                     const float *dy, const float *argmax, float *dx);
+nmz_status nmz__cpu_maxpool_backward(const nmz_backend *be, int planes, int H, int W, int size, int stride, int OH,
+                                     int OW, const float *dy, const float *argmax, float *dx);
 nmz_status nmz__cpu_posenc_forward(const nmz_backend *be, int B, int T, int D, const int *off, const float *x,
                                    const float *P, float *y);
 nmz_status nmz__cpu_posenc_backward(const nmz_backend *be, int B, int T, int D, const int *off, const float *dy,

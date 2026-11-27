@@ -93,6 +93,8 @@ struct nmz_backend {
     /* NMZ_OK when usable; otherwise NMZ_ERR_UNSUPPORTED and why (in why[n]). */
     nmz_status (*init)(const nmz_backend *be, char *why, size_t n);
     void (*info)(const nmz_backend *be, nmz_device_info *out);
+    /* optional: cap the memory alloc may hand out (0 = the backend's default) */
+    nmz_status (*memory_limit)(const nmz_backend *be, size_t bytes);
 
     /* ---- memory (unused when host_memory) */
     void *(*alloc)(const nmz_backend *be, size_t bytes); /* NULL + message on failure */
@@ -149,8 +151,8 @@ struct nmz_backend {
     /* planes = B·C; argmax = winner's flat index iy·W + ix (first max wins) */
     nmz_status (*maxpool_forward)(const nmz_backend *be, int planes, int H, int W, int size, int stride, int OH,
                                   int OW, const float *x, float *y, float *argmax);
-    nmz_status (*maxpool_backward)(const nmz_backend *be, int planes, int H, int W, int OH, int OW, const float *dy,
-                                   const float *argmax, float *dx);
+    nmz_status (*maxpool_backward)(const nmz_backend *be, int planes, int H, int W, int size, int stride, int OH,
+                                   int OW, const float *dy, const float *argmax, float *dx);
 
     /* ---- dropout, embeddings, positions */
     /* mask = 0 with probability rate, else 1/(1−rate); draws from rng (the

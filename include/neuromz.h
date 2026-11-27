@@ -104,6 +104,7 @@ typedef struct nmz_device_info {
     size_t mem_free;         /* of which free now                              */
     size_t mem_used;         /* bytes this library holds on the device now     */
     size_t mem_peak;         /* ... at most so far                              */
+    size_t mem_limit;        /* what it may hold (nmz_backend_memory_limit)     */
     int threads;             /* CPU threads (OpenMP); 0 for a device           */
     char note[256];          /* how it was chosen, or why it is unavailable    */
 } nmz_device_info;
@@ -119,6 +120,13 @@ nmz_status nmz_backend_info(nmz_device_info *out);
 /* Any built-in backend by name (initialising it if needed); for one that
  * cannot be used: NMZ_ERR_UNSUPPORTED, the reason in out->note. */
 nmz_status nmz_backend_query(const char *name, nmz_device_info *out);
+/* Cap the device memory the library may hold, in bytes (0 = the default:
+ * the memory that was free when the device was initialised). Allocations
+ * beyond it fail with NMZ_ERR_NOMEM and a message (a smaller batch size)
+ * instead of the driver paging memory out to the host (Windows does, and
+ * training then crawls). The environment variable NMZ_CUDA_MEMORY (MiB)
+ * sets it at start. No effect on the CPU. */
+nmz_status nmz_backend_memory_limit(size_t bytes);
 /* Backends compiled into this library ("cpu" always; "cuda" with NMZ_CUDA). */
 int nmz_backend_count(void);
 const char *nmz_backend_name(int i);

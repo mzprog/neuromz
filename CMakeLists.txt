@@ -9,9 +9,10 @@
 #   cmake --build build --target data-text download the texts (Alice; Kalila wa-Dimna) into data/
 #   cmake --install build --prefix DIR     headers, library and a CMake package: find_package(neuromz)
 #
-# Options: NMZ_OPENMP (multi-threaded matmul/attention, off), NMZ_WERROR (on when top-level),
-# NMZ_SANITIZE (ASan + UBSan, off), NMZ_BUILD_TESTS / NMZ_BUILD_EXAMPLES (on
-# when this is the top-level project).
+# Options: NMZ_OPENMP (multi-threaded matmul/attention, off), NMZ_CUDA (the CUDA
+# backend, off; NMZ_CUDA_ARCHITECTURES = GPUs to compile for, default the local
+# one), NMZ_WERROR (on when top-level), NMZ_SANITIZE (ASan + UBSan, off),
+# NMZ_BUILD_TESTS / NMZ_BUILD_EXAMPLES (on when this is the top-level project).
 #
 # CMake 3.21 is the minimum: it is the first version that passes C11/C17
 # to MSVC (/std:c11) — DESIGN decision 114.
@@ -20,6 +21,9 @@ project(neuromz VERSION 2.0.1 DESCRIPTION "Educational neural-network engine" LA
 
 set(NMZ_TOP ${PROJECT_IS_TOP_LEVEL})
 option(NMZ_OPENMP "Multi-threaded matrix products and attention heads (OpenMP)" OFF)
+option(NMZ_CUDA "CUDA backend: train on an NVIDIA GPU (needs the CUDA Toolkit; the library still runs without a GPU)" OFF)
+set(NMZ_CUDA_ARCHITECTURES "" CACHE STRING
+    "GPU architectures for NMZ_CUDA, e.g. 75;86;89 (each: machine code + PTX); empty = the local GPU (else 75)")
 option(NMZ_WERROR "Treat compiler warnings as errors (default: only when this is the top-level project)" ${NMZ_TOP})
 option(NMZ_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer (GCC/Clang)" OFF)
 option(NMZ_BUILD_TESTS "Build the test suite" ${NMZ_TOP})
@@ -35,26 +39,28 @@ endif()
 # plus -Wvla (MSVC has no VLAs). MSVC: /W4 minus the implicit-narrowing
 # warnings C4244/C4267/C4305, which GCC and Clang only give with -Wconversion
 # (not enabled there either) — decision 115.
+# (C sources only: the CUDA sources get nvcc's own set below.)
 add_library(nmz_warnings INTERFACE)
+set(NMZ_C "$<COMPILE_LANGUAGE:C>")
 if(MSVC)
-  target_compile_options(nmz_warnings INTERFACE /W4 /wd4244 /wd4267 /wd4305 /utf-8 $<$<BOOL:${NMZ_WERROR}>:/WX>)
+  target_compile_options(nmz_warnings INTERFACE $<${NMZ_C}:/W4 /wd4244 /wd4267 /wd4305 /utf-8 $<$<BOOL:${NMZ_WERROR}>:/WX>>)
   target_compile_definitions(nmz_warnings INTERFACE _CRT_SECURE_NO_WARNINGS)
 else()
-  target_compile_options(nmz_warnings INTERFACE -Wall -Wextra -pedantic -Wshadow -Wstrict-prototypes
-                                                -Wmissing-prototypes -Wvla $<$<BOOL:${NMZ_WERROR}>:-Werror>)
+  target_compile_options(nmz_warnings INTERFACE $<${NMZ_C}:-Wall -Wextra -pedantic -Wshadow -Wstrict-prototypes
+                                                -Wmissing-prototypes -Wvla $<$<BOOL:${NMZ_WERROR}>:-Werror>>)
   # no fused multiply-add contraction: a·b + c rounds twice everywhere, so
   # the blocked matmul stays bit-identical to the naive loops (and the KV
   # cache to recomputation) on CPUs with FMA too. GCC already does this in
   # ISO C mode; Clang (Apple's in particular, on arm64) contracts by
   # default — decision 120. MSVC does not contract under /fp:precise.
-  target_compile_options(nmz_warnings INTERFACE -ffp-contract=off)
+  target_compile_options(nmz_warnings INTERFACE $<${NMZ_C}:-ffp-contract=off>)
 endif()
 if(NMZ_SANITIZE)
   if(MSVC)
     message(FATAL_ERROR "NMZ_SANITIZE is for GCC/Clang (MSVC's /fsanitize=address has no UBSan)")
   endif()
   set(NMZ_SAN_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
-  target_compile_options(nmz_warnings INTERFACE ${NMZ_SAN_FLAGS})
+  target_compile_options(nmz_warnings INTERFACE $<${NMZ_C}:${NMZ_SAN_FLAGS}>)
   target_link_options(nmz_warnings INTERFACE ${NMZ_SAN_FLAGS})
 endif()
 
@@ -74,6 +80,56 @@ target_link_libraries(neuromz PRIVATE $<BUILD_INTERFACE:nmz_warnings>)
 if(NOT WIN32)
   target_link_libraries(neuromz PUBLIC m) # libm (part of the C runtime on Windows)
 endif()
+# ---------------------------------------------------------------- CUDA backend
+# The kernels are compiled by nvcc behind a C ABI (src/cuda/backend_cuda.cu,
+# one function seen by the C sources); the public headers stay pure C. The
+# CUDA runtime is linked statically (it finds the driver at run time and
+# reports a missing one); cuBLAS is loaded at run time, so a program built
+# with NMZ_CUDA starts on any machine and falls back to the CPU (decision 140).
+set(NMZ_CUDA_LINKED 0)
+if(NMZ_CUDA)
+  set(_nmz_arch "${NMZ_CUDA_ARCHITECTURES}")
+  if(NOT _nmz_arch)
+    find_program(NMZ_NVIDIA_SMI nvidia-smi)
+    if(NMZ_NVIDIA_SMI)
+      execute_process(COMMAND ${NMZ_NVIDIA_SMI} --query-gpu=compute_cap --format=csv,noheader
+                      OUTPUT_VARIABLE _nmz_cc RESULT_VARIABLE _nmz_r OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+      if(_nmz_r EQUAL 0 AND _nmz_cc MATCHES "^([0-9]+)\\.([0-9]+)")
+        set(_nmz_arch "${CMAKE_MATCH_1}${CMAKE_MATCH_2}")
+      endif()
+    endif()
+    if(NOT _nmz_arch)
+      set(_nmz_arch 75) # Turing: the oldest architecture CUDA 13 compiles for
+    endif()
+    message(STATUS "neuromz: CUDA architectures ${_nmz_arch} (the local GPU, or 75; set NMZ_CUDA_ARCHITECTURES for others)")
+  endif()
+  # every entry without -real/-virtual = machine code + PTX (the PTX of the
+  # newest one lets later GPUs run the library through the driver's JIT)
+  set(_nmz_min 9999)
+  foreach(_a IN LISTS _nmz_arch)
+    if(_a MATCHES "^([0-9]+)" AND CMAKE_MATCH_1 LESS _nmz_min)
+      set(_nmz_min ${CMAKE_MATCH_1})
+    endif()
+  endforeach()
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES ${_nmz_arch})
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  target_sources(neuromz PRIVATE src/cuda/backend_cuda.cu)
+  set_target_properties(neuromz PROPERTIES CUDA_ARCHITECTURES "${_nmz_arch}" CUDA_STANDARD 17
+                                           CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Static)
+  target_compile_definitions(neuromz PRIVATE NMZ_HAVE_CUDA=1 NMZ_CUDA_MIN_CC=${_nmz_min})
+  # --fmad=false: no fused multiply-add in the kernels, as on the CPU (decision 120): the optimizers then
+  # round exactly like the CPU's and the element-wise ops differ from it only where the math library does
+  target_compile_options(neuromz PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false $<$<BOOL:${NMZ_WERROR}>:-Werror=all-warnings>>)
+  target_link_libraries(neuromz PUBLIC CUDA::cudart_static)
+  if(NOT WIN32)
+    target_link_libraries(neuromz PUBLIC ${CMAKE_DL_LIBS}) # dlopen for cuBLAS
+  endif()
+  set(NMZ_CUDA_LINKED 1)
+endif()
+
 set(NMZ_OPENMP_LINKED 0)
 if(NMZ_OPENMP)
   find_package(OpenMP COMPONENTS C)
