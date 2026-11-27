@@ -74,6 +74,11 @@ extern const test_case seq_tests[];
 extern const test_case gated_tests[];
 extern const test_case transformer_tests[];
 extern const test_case backend_tests[];
+extern const test_case thread_tests[];
+
+/* run fn(args[i]) for i < n, each in its own thread; wait for all (1 = ok) */
+typedef void (*test_thread_fn)(void *arg);
+int test_run_threads(int n, test_thread_fn fn, void **args);
 
 /* Scratch file path inside the build directory. */
 const char *test_path(const char *name);

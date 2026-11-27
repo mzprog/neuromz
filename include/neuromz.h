@@ -2,8 +2,22 @@
  * neuromz.h — NeuroMZ v2 public API.
  *
  * An educational neural-network engine in C11. Every public name starts with
- * nmz_ / NMZ_. The library never prints, never exits, and keeps no global
- * state apart from a thread-local "last error" message.
+ * nmz_ / NMZ_. The library never prints and never exits. Its only global
+ * state is the backend registry and the process-wide backend selection
+ * (guarded by a lock); the "last error" message and a thread's own backend
+ * selection are thread-local.
+ *
+ * Threads (DESIGN §11.8): different nets may be used from different threads
+ * at the same time — each net, dataset, vocabulary and trace recorder
+ * belongs to one thread at a time, and a net may move to another thread
+ * between calls (after nmz_backend_sync on a device, if the last call only
+ * queued work: nmz_net_update, nmz_net_optimizer_step). Selection, queries
+ * and registration are safe from any thread. Changing the process-wide
+ * selection while other threads compute moves their nets at their next
+ * call; a server should give each worker thread its own selection instead
+ * (nmz_backend_select_thread). The CUDA backend shares one device context
+ * and gives every thread its own stream, cuBLAS handle and buffers, so nets
+ * on different threads run side by side; the memory cap is shared.
  *
  * See docs/DESIGN.md for the design and README.md for a tutorial.
  */
@@ -115,7 +129,16 @@ typedef struct nmz_device_info {
  * NVIDIA GPU or driver, where "cuda" fails with NMZ_ERR_UNSUPPORTED and the
  * reason, and "auto" falls back to the CPU. */
 nmz_status nmz_backend_select(const char *name);
-/* The selected backend: device name, compute capability, memory. */
+/* The same for the calling thread only (it wins over nmz_backend_select in
+ * this thread); NULL returns the thread to the process-wide selection.
+ * Other threads are not affected. (2.2.0 on.) */
+nmz_status nmz_backend_select_thread(const char *name);
+/* Wait until the device work this thread queued is done (no-op on the CPU).
+ * Needed only before another thread uses a net whose last call queued work
+ * without returning a result (nmz_net_update, nmz_net_optimizer_step). */
+nmz_status nmz_backend_sync(void);
+/* The selected backend (this thread's, else the process-wide one): device
+ * name, compute capability, memory. */
 nmz_status nmz_backend_info(nmz_device_info *out);
 /* Any built-in backend by name (initialising it if needed); for one that
  * cannot be used: NMZ_ERR_UNSUPPORTED, the reason in out->note. */
@@ -833,6 +856,8 @@ int nmz_threads(void);
 /* Write a human-readable multi-line summary of the architecture. Returns the
  * number of characters that would have been written (like snprintf). */
 int nmz_net_summary(const nmz_net *net, char *buf, size_t n);
+
+
 
 #ifdef __cplusplus
 }

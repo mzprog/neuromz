@@ -11,14 +11,6 @@
 #include <wchar.h>
 #endif
 
-#if defined(_MSC_VER)
-#define NMZ_THREAD_LOCAL __declspec(thread)
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-#define NMZ_THREAD_LOCAL _Thread_local
-#else
-#define NMZ_THREAD_LOCAL
-#endif
-
 static NMZ_THREAD_LOCAL char g_last_error[512];
 static NMZ_THREAD_LOCAL nmz_status g_last_status;
 

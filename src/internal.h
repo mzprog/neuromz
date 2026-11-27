@@ -13,6 +13,16 @@
 #define NMZ_MAX_ELEMS ((size_t)1 << 31)
 #define NMZ_MAX_VOCAB 65536
 
+/* thread-local storage: the last error message and a thread's own backend
+ * selection (decision 158) */
+#if defined(_MSC_VER)
+#define NMZ_THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define NMZ_THREAD_LOCAL _Thread_local
+#else
+#define NMZ_THREAD_LOCAL
+#endif
+
 /* Record a formatted message as the last error and return `s`. */
 nmz_status nmz__fail(nmz_status s, const char *fmt, ...)
 #if defined(__GNUC__)
