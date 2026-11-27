@@ -224,10 +224,18 @@ static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, resident *
     nmz_trace_fn saved_fn = net->trace;
     int saved_carry = net->carry;
     nmz_status s = NMZ_OK;
-    double total = 0.0;
+    double total = 0.0, *q = NULL; /* device: each chunk's loss and count, read at the end */
     long correct = 0;
-    int start, mode = accuracy_mode(net, ds), T = steps_of(ds);
-    const int chunk = carry ? 1 : ds->time_steps > 0 ? 64 : 256;
+    int start, mode = accuracy_mode(net, ds), T = steps_of(ds), c = 0;
+    int chunk = carry ? 1 : ds->time_steps > 0 ? 64 : 256;
+    /* on a device no larger than the training batch, whose activations fit (the
+     * CPU keeps v2.0.1's chunks: they decide the order the losses are summed in) */
+    if (rd && rd->x) {
+        int bsz = net->train_batch > 0 ? net->train_batch : net->train.batch_size; /* this run's, or the stored one */
+        if (bsz > 0 && chunk > bsz) chunk = bsz;
+    }
+    if (rd && rd->x && !(q = calloc((size_t)(count / chunk + 2) * 2, sizeof *q)))
+        return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
     net->trace = NULL; /* evaluation is not part of the traced math */
     net->carry = carry != 0;
     nmz_net_reset_state(net);
@@ -236,9 +244,11 @@ static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, resident *
         const nmz_tensor *y;
         double L, right = 0.0;
         if ((s = batch_shapes(net, ds, b, &xb, &tb)) != NMZ_OK) break;
-        if (rd && rd->x) {
+        if (rd && rd->x) { /* nothing waits for the device until the end (or a full result queue) */
             const nmz_backend *be = rd->be;
+            const nmz_tensor *z = nmz__net_fused_ce(net) ? &net->acts[net->n_layers - 1] : NULL;
             const float *py, *pt;
+            (void)right;
             if ((s = resident_gather(ds, rd, 0, start, b, &xb, &tb)) != NMZ_OK) break;
             if ((s = nmz__net_forward(net, &xb, 0, &y)) != NMZ_OK) break;
             py = nmz__r(be, y);
@@ -247,10 +257,10 @@ static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, resident *
                 s = nmz__op_failed();
                 break;
             }
-            if (mode && (s = be->count_correct(be, mode, (size_t)b * T, ds->n_outputs, py, pt, &right)) != NMZ_OK) break;
-            if ((s = nmz_net_compute_loss(net, &tb, &L)) != NMZ_OK) break; /* syncs: `right` is valid too */
-            total += L * b;
-            correct += (long)right;
+            if (mode && (s = be->count_correct(be, mode, (size_t)b * T, ds->n_outputs, py, pt, &q[2 * c + 1])) != NMZ_OK)
+                break;
+            if ((s = nmz__loss_value_queued(be, net->loss, y, &tb, z, &q[2 * c])) != NMZ_OK) break;
+            c++;
             continue;
         }
         if ((s = gather(ds, NULL, start, b, &xb, &tb)) != NMZ_OK) break;
@@ -270,6 +280,16 @@ static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, resident *
                 }
             }
         }
+    }
+    if (q) { /* the queued results: the mean over rows, × the chunk's samples */
+        int k;
+        if (s == NMZ_OK) s = rd->be->sync(rd->be);
+        for (k = 0; k < c && s == NMZ_OK; k++) {
+            int b = first + count - (first + k * chunk) < chunk ? first + count - (first + k * chunk) : chunk;
+            total += q[2 * k] * b;
+            correct += (long)q[2 * k + 1];
+        }
+        free(q);
     }
     net->trace = saved_fn;
     net->carry = saved_carry;
@@ -410,6 +430,7 @@ nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_data
         if (rd.x && (s = resident_order(&rd, perm, used)) != NMZ_OK) goto done;
         net->training = 1;
         net->carry = o.carry_state != 0;
+        net->train_batch = bs;
         for (start = 0; start < used; start += bs) {
             int b = used - start < bs ? used - start : bs;
             double gnorm = NAN, scale = 1.0;

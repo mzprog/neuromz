@@ -110,9 +110,10 @@ nmz_status nmz__cpu_loss_grad(const nmz_backend *be, nmz_loss kind, size_t rows,
     return NMZ_OK;
 }
 
-/* Tensor-level entry points: the value is read back (one sync). */
-nmz_status nmz__loss_value(const nmz_backend *be, nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
-                           const nmz_tensor *z, double *out) {
+/* Tensor-level entry points: the value is read back (one sync), or, for
+ * _queued, written to *out at the backend's next sync. */
+nmz_status nmz__loss_value_queued(const nmz_backend *be, nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
+                                  const nmz_tensor *z, double *out) {
     const float *py, *pt, *pz = NULL;
     nmz_status s = check_pair(y, t);
     if (s != NMZ_OK) return s;
@@ -121,8 +122,13 @@ nmz_status nmz__loss_value(const nmz_backend *be, nmz_loss kind, const nmz_tenso
     pt = nmz__r(be, t);
     if (z && !(pz = nmz__r(be, z))) return nmz__op_failed();
     if (!py || !pt) return nmz__op_failed();
-    if ((s = be->loss_value(be, kind, nmz_tensor_rows(y), nmz_tensor_cols(y), py, pt, pz, out)) != NMZ_OK) return s;
-    return be->sync(be);
+    return be->loss_value(be, kind, nmz_tensor_rows(y), nmz_tensor_cols(y), py, pt, pz, out);
+}
+
+nmz_status nmz__loss_value(const nmz_backend *be, nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
+                           const nmz_tensor *z, double *out) {
+    nmz_status s = nmz__loss_value_queued(be, kind, y, t, z, out);
+    return s == NMZ_OK ? be->sync(be) : s;
 }
 
 nmz_status nmz__loss_grad(const nmz_backend *be, nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,

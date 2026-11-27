@@ -237,6 +237,9 @@ float nmz__activation_layer_alpha(const nmz_layer *l);
  * `z` is the softmax input for cross-entropy (may be NULL → uses p). */
 nmz_status nmz__loss_value(const nmz_backend *be, nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
                            const nmz_tensor *z, double *out);
+/* the same, *out valid after the backend's next sync (no wait) */
+nmz_status nmz__loss_value_queued(const nmz_backend *be, nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
+                                  const nmz_tensor *z, double *out);
 /* MSE: g = ∂L/∂y = (y − t)/rows.
  * CE (fused with softmax): g = ∂L/∂z = (p·Σt − t)/rows. */
 nmz_status nmz__loss_grad(const nmz_backend *be, nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
@@ -284,6 +287,7 @@ struct nmz_net {
     int have_forward;
     int have_grads;
     int training;
+    int train_batch; /* the batch size of the last training run (device evaluation chunks) */
     nmz_rng rng;
     long step;
     nmz_train_opts train;
