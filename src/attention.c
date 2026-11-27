@@ -52,14 +52,17 @@ typedef struct attn_layer {
 /* columns col0 … col0+n−1 of a [B, R, C] tensor into [B, R, n] */
 static nmz_status cols3(const nmz_tensor *src, int col0, int n, nmz_tensor *dst) {
     int shape[3], b, r, B = src->shape[0], R = src->shape[1], C = src->shape[2];
+    const float *sp = nmz__hr(src);
+    float *dp;
     nmz_status s;
     shape[0] = B;
     shape[1] = R;
     shape[2] = n;
     if ((s = nmz_tensor_reshape(dst, 3, shape)) != NMZ_OK) return s;
+    dp = nmz__hw(dst);
     for (b = 0; b < B; b++)
         for (r = 0; r < R; r++)
-            memcpy(dst->data + ((size_t)b * R + r) * n, src->data + ((size_t)b * R + r) * C + col0, (size_t)n * sizeof(float));
+            memcpy(dp + ((size_t)b * R + r) * n, sp + ((size_t)b * R + r) * C + col0, (size_t)n * sizeof(float));
     return NMZ_OK;
 }
 
@@ -98,8 +101,9 @@ static nmz_status attn_setup(nmz_layer *l, int in_rank, const int *in_shape, int
 
 static void glorot(nmz_tensor *W, int fan_in, int fan_out, nmz_rng *rng) {
     double limit = sqrt(6.0 / (fan_in + fan_out));
+    float *w = nmz__hw(W);
     size_t i;
-    for (i = 0; i < W->size; i++) W->data[i] = (float)((2.0 * nmz_rng_uniform(rng) - 1.0) * limit);
+    for (i = 0; i < W->size; i++) w[i] = (float)((2.0 * nmz_rng_uniform(rng) - 1.0) * limit);
 }
 
 static nmz_status attn_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
@@ -112,23 +116,31 @@ static nmz_status attn_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
     return NMZ_OK;
 }
 
-/* the core for one (row b, head h): scores, softmax, weighted sum */
-static void attend(attn_layer *a, int b, int h, int T, int Tk, int Tp, int keep_scores) {
-    const int E = a->E, d = a->hd, H = a->heads;
+/* ------------------------------------------------- the CPU kernels
+ * The core for one (row b, head h): scores, softmax, weighted sum — the
+ * v2.0.1 loops, the dot products in double. */
+typedef struct core {
+    int H, T, Tk, Tp, d, E;
+    const float *qkv, *kv, *P, *dcv;
+    float *Pw, *S, *cv, *dP, *dqkv, *dkv;
+} core;
+
+static void attend(const core *a, int b, int h) {
+    const int E = a->E, d = a->d, H = a->H, T = a->T, Tk = a->Tk, Tp = a->Tp;
     const double scale = 1.0 / sqrt((double)d);
     int t, j, k;
     for (t = 0; t < T; t++) {
         const int last = Tp + t; /* keys 0 … last are visible */
-        const float *q = a->qkv.data + ((size_t)b * T + t) * 3 * E + (size_t)h * d;
-        float *p = a->P.data + (((size_t)b * H + h) * T + t) * Tk;
-        float *c = a->cv.data + ((size_t)b * T + t) * E + (size_t)h * d;
+        const float *q = a->qkv + ((size_t)b * T + t) * 3 * E + (size_t)h * d;
+        float *p = a->Pw + (((size_t)b * H + h) * T + t) * Tk;
+        float *c = a->cv + ((size_t)b * T + t) * E + (size_t)h * d;
         double mx = -HUGE_VAL, sum = 0.0;
         for (j = 0; j <= last; j++) {
-            const float *kj = a->kv.data + ((size_t)b * Tk + j) * 2 * E + (size_t)h * d;
+            const float *kj = a->kv + ((size_t)b * Tk + j) * 2 * E + (size_t)h * d;
             p[j] = (float)(nmz__dot(q, kj, d) * scale);
             if (p[j] > mx) mx = p[j];
         }
-        if (keep_scores) memcpy(a->S.data + (((size_t)b * H + h) * T + t) * Tk, p, (size_t)(last + 1) * sizeof(float));
+        if (a->S) memcpy(a->S + (((size_t)b * H + h) * T + t) * Tk, p, (size_t)(last + 1) * sizeof(float));
         for (j = 0; j <= last; j++) {
             double e = exp((double)p[j] - mx);
             sum += e;
@@ -138,24 +150,104 @@ static void attend(attn_layer *a, int b, int h, int T, int Tk, int Tp, int keep_
         for (j = last + 1; j < Tk; j++) p[j] = 0.0f; /* masked: the future */
         for (k = 0; k < d; k++) c[k] = 0.0f;
         for (j = 0; j <= last; j++) {
-            const float pj = p[j], *v = a->kv.data + ((size_t)b * Tk + j) * 2 * E + E + (size_t)h * d;
+            const float pj = p[j], *v = a->kv + ((size_t)b * Tk + j) * 2 * E + E + (size_t)h * d;
             for (k = 0; k < d; k++) c[k] += pj * v[k];
         }
     }
 }
 
-static void add_rows(float *Y, int rows, int cols, const float *bias) {
-    int r, j;
-    for (r = 0; r < rows; r++) {
-        float *y = Y + (size_t)r * cols;
-        for (j = 0; j < cols; j++) y[j] += bias[j];
+nmz_status nmz__cpu_attention_forward(const nmz_backend *be, int B, int H, int T, int Tk, int Tp, int d, int E,
+                                      const float *qkv, const float *kv, float *P, float *S, float *ctx) {
+    core a;
+    int bh;
+    (void)be;
+    memset(&a, 0, sizeof a);
+    a.H = H, a.T = T, a.Tk = Tk, a.Tp = Tp, a.d = d, a.E = E;
+    a.qkv = qkv, a.kv = kv, a.Pw = P, a.S = S, a.cv = ctx;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (B * H > 1 && (double)T * Tk * d > 2e4)
+#endif
+    for (bh = 0; bh < B * H; bh++) attend(&a, bh / H, bh % H);
+    return NMZ_OK;
+}
+
+/* backward of the core for one (row b, head h) */
+static void attend_back(const core *a, int b, int h) {
+    const int E = a->E, d = a->d, H = a->H, T = a->T, Tk = a->Tk, Tp = a->Tp;
+    const double scale = 1.0 / sqrt((double)d);
+    int t, j, k;
+    for (t = 0; t < T; t++) {
+        const int last = Tp + t;
+        const float *q = a->qkv + ((size_t)b * T + t) * 3 * E + (size_t)h * d;
+        const float *p = a->P + (((size_t)b * H + h) * T + t) * Tk;
+        const float *dc = a->dcv + ((size_t)b * T + t) * E + (size_t)h * d;
+        float *dp = a->dP + (((size_t)b * H + h) * T + t) * Tk;
+        float *dq = a->dqkv + ((size_t)b * T + t) * 3 * E + (size_t)h * d;
+        double dot = 0.0;
+        for (j = 0; j <= last; j++) {
+            const float *v = a->kv + ((size_t)b * Tk + j) * 2 * E + E + (size_t)h * d;
+            float *dv = a->dkv + ((size_t)b * Tk + j) * 2 * E + E + (size_t)h * d;
+            const float pj = p[j];
+            double g = nmz__dot(dc, v, d); /* ∂L/∂a_tj */
+            dot += pj * g;
+            dp[j] = (float)g;
+            for (k = 0; k < d; k++) dv[k] += pj * dc[k];
+        }
+        for (j = 0; j <= last; j++) {
+            const float *kj = a->kv + ((size_t)b * Tk + j) * 2 * E + (size_t)h * d;
+            float *dk = a->dkv + ((size_t)b * Tk + j) * 2 * E + (size_t)h * d;
+            const float ds = (float)(p[j] * (dp[j] - dot)); /* ∂L/∂s_tj */
+            const float g = (float)(ds * scale);
+            dp[j] = ds;
+            for (k = 0; k < d; k++) {
+                dq[k] += g * kj[k];
+                dk[k] += g * q[k];
+            }
+        }
+        for (j = last + 1; j < Tk; j++) dp[j] = 0.0f;
     }
+}
+
+nmz_status nmz__cpu_attention_backward(const nmz_backend *be, int B, int H, int T, int Tk, int Tp, int d, int E,
+                                       const float *qkv, const float *kv, const float *P, const float *dctx,
+                                       float *dP, float *dqkv, float *dkv) {
+    core a;
+    int bh;
+    (void)be;
+    memset(&a, 0, sizeof a);
+    a.H = H, a.T = T, a.Tk = Tk, a.Tp = Tp, a.d = d, a.E = E;
+    a.qkv = qkv, a.kv = kv, a.P = P, a.dcv = dctx, a.dP = dP, a.dqkv = dqkv, a.dkv = dkv;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (B * H > 1 && (double)T * Tk * d > 2e4)
+#endif
+    for (bh = 0; bh < B * H; bh++) attend_back(&a, bh / H, bh % H);
+    return NMZ_OK;
+}
+
+/* rows of keys | values: kv[b, Tp + t] = qkv[b, t] columns E … 3E (and back
+ * for the gradient, to_kv = 0) */
+static nmz_status kv_rows(const nmz_backend *be, int B, int T, int Tk, int Tp, int E, float *qkv, float *kv,
+                          int to_kv) {
+    int b;
+    nmz_status s = NMZ_OK;
+    if (Tp == 0) /* all rows line up: one strided copy */
+        return to_kv ? be->copy(be, (size_t)B * T, (size_t)2 * E, qkv + E, (size_t)3 * E, kv, (size_t)2 * E)
+                     : be->copy(be, (size_t)B * T, (size_t)2 * E, kv, (size_t)2 * E, qkv + E, (size_t)3 * E);
+    for (b = 0; b < B && s == NMZ_OK; b++) {
+        float *q = qkv + (size_t)b * T * 3 * E + E, *k = kv + ((size_t)b * Tk + Tp) * 2 * E;
+        s = to_kv ? be->copy(be, (size_t)T, (size_t)2 * E, q, (size_t)3 * E, k, (size_t)2 * E)
+                  : be->copy(be, (size_t)T, (size_t)2 * E, k, (size_t)2 * E, q, (size_t)3 * E);
+    }
+    return s;
 }
 
 static nmz_status attn_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, const nmz_ctx *ctx) {
     attn_layer *a = l->self;
+    const nmz_backend *be = ctx->backend;
     const int B = x->shape[0], T = x->shape[1], D = a->D, E = a->E, H = a->heads;
-    int Tp = 0, Tk, b, t, bh, shape[4], tracing = NMZ_TRACING(ctx);
+    int Tp = 0, Tk, shape[4], tracing = NMZ_TRACING(ctx);
+    const float *px, *pWqkv, *pbqkv, *pWo, *pbo;
+    float *pqkv, *pkv, *pP, *pS = NULL, *pcv, *py;
     nmz_status s;
     if (ctx->carry && ctx->training)
         return nmz__fail(NMZ_ERR_UNSUPPORTED, "attention layers do not carry state in training (the cache would hold "
@@ -167,35 +259,47 @@ static nmz_status attn_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y,
     shape[1] = T;
     shape[2] = 3 * E;
     if ((s = nmz_tensor_reshape(&a->qkv, 3, shape)) != NMZ_OK) return s;
-    if ((s = nmz_matmul(B * T, 3 * E, D, x->data, a->Wqkv.data, a->qkv.data, 0)) != NMZ_OK) return s;
-    add_rows(a->qkv.data, B * T, 3 * E, a->bqkv.data);
     shape[1] = Tk;
     shape[2] = 2 * E;
     if ((s = nmz_tensor_reshape(&a->kv, 3, shape)) != NMZ_OK) return s;
-    for (b = 0; b < B; b++) { /* the cached positions, then the new keys | values */
-        if (Tp) memcpy(a->kv.data + (size_t)b * Tk * 2 * E, a->state.data + (size_t)b * Tp * 2 * E, (size_t)Tp * 2 * E * sizeof(float));
-        for (t = 0; t < T; t++)
-            memcpy(a->kv.data + ((size_t)b * Tk + Tp + t) * 2 * E, a->qkv.data + ((size_t)b * T + t) * 3 * E + E,
-                   (size_t)2 * E * sizeof(float));
-    }
     shape[0] = B;
     shape[1] = H;
     shape[2] = T;
     shape[3] = Tk;
     if ((s = nmz_tensor_reshape(&a->P, 4, shape)) != NMZ_OK) return s;
     if (tracing) {
-        if ((s = nmz_tensor_reshape(&a->S, 4, shape)) != NMZ_OK) return s;
-        nmz_tensor_zero(&a->S);
+        if ((s = nmz_tensor_reshape(&a->S, 4, shape)) != NMZ_OK || (s = nmz__zero_on(be, &a->S)) != NMZ_OK) return s;
+        if (!(pS = nmz__u(be, &a->S))) return nmz__op_failed();
     }
     shape[1] = T;
     shape[2] = E;
     if ((s = nmz_tensor_reshape(&a->cv, 3, shape)) != NMZ_OK) return s;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (B * H > 1 && (double)T * Tk * a->hd > 2e4)
-#endif
-    for (bh = 0; bh < B * H; bh++) attend(a, bh / H, bh % H, T, Tk, Tp, tracing);
-    if ((s = nmz_matmul(B * T, D, E, a->cv.data, a->Wo.data, y->data, 0)) != NMZ_OK) return s;
-    add_rows(y->data, B * T, D, a->bo.data);
+    px = nmz__r(be, x);
+    pWqkv = nmz__r(be, &a->Wqkv);
+    pbqkv = nmz__r(be, &a->bqkv);
+    pWo = nmz__r(be, &a->Wo);
+    pbo = nmz__r(be, &a->bo);
+    pqkv = nmz__w(be, &a->qkv);
+    pkv = nmz__w(be, &a->kv);
+    pP = nmz__w(be, &a->P);
+    pcv = nmz__w(be, &a->cv);
+    py = nmz__w(be, y);
+    if (!px || !pWqkv || !pbqkv || !pWo || !pbo || !pqkv || !pkv || !pP || !pcv || !py) return nmz__op_failed();
+    /* [q | k | v] = x·W_qkv + b_qkv */
+    if ((s = be->gemm(be, 0, B * T, 3 * E, D, px, D, pWqkv, 3 * E, pqkv, 3 * E)) != NMZ_OK ||
+        (s = be->add_bias(be, (size_t)B * T, 3 * E, pqkv, pbqkv)) != NMZ_OK)
+        return s;
+    if (Tp) { /* the cached positions, then the new keys | values */
+        const float *pst = nmz__r(be, &a->state);
+        if (!pst) return nmz__op_failed();
+        if ((s = be->copy(be, (size_t)B, (size_t)Tp * 2 * E, pst, (size_t)Tp * 2 * E, pkv, (size_t)Tk * 2 * E)) != NMZ_OK)
+            return s;
+    }
+    if ((s = kv_rows(be, B, T, Tk, Tp, E, pqkv, pkv, 1)) != NMZ_OK) return s;
+    if ((s = be->attention_forward(be, B, H, T, Tk, Tp, a->hd, E, pqkv, pkv, pP, pS, pcv)) != NMZ_OK) return s;
+    if ((s = be->gemm(be, 0, B * T, D, E, pcv, E, pWo, D, py, D)) != NMZ_OK ||
+        (s = be->add_bias(be, (size_t)B * T, D, py, pbo)) != NMZ_OK)
+        return s;
     if (ctx->carry && (s = nmz_tensor_copy(&a->state, &a->kv)) != NMZ_OK) return s;
     if (tracing) {
         nmz_tensor *tp = a->tmp;
@@ -213,91 +317,58 @@ static nmz_status attn_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y,
     return NMZ_OK;
 }
 
-/* out[j] += Σ_r A[r][j], summed in double */
-static nmz_status colsum_add(const float *A, int rows, int cols, float *out) {
-    double *acc = calloc((size_t)cols, sizeof *acc);
-    int r, j;
-    if (!acc) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
-    for (r = 0; r < rows; r++) {
-        const float *ar = A + (size_t)r * cols;
-        for (j = 0; j < cols; j++) acc[j] += ar[j];
-    }
-    for (j = 0; j < cols; j++) out[j] += (float)acc[j];
-    free(acc);
-    return NMZ_OK;
-}
-
-/* backward of the core for one (row b, head h) */
-static void attend_back(attn_layer *a, int b, int h, int T, int Tk, int Tp) {
-    const int E = a->E, d = a->hd, H = a->heads;
-    const double scale = 1.0 / sqrt((double)d);
-    int t, j, k;
-    for (t = 0; t < T; t++) {
-        const int last = Tp + t;
-        const float *q = a->qkv.data + ((size_t)b * T + t) * 3 * E + (size_t)h * d;
-        const float *p = a->P.data + (((size_t)b * H + h) * T + t) * Tk;
-        const float *dc = a->dcv.data + ((size_t)b * T + t) * E + (size_t)h * d;
-        float *dp = a->dP.data + (((size_t)b * H + h) * T + t) * Tk;
-        float *dq = a->dqkv.data + ((size_t)b * T + t) * 3 * E + (size_t)h * d;
-        double dot = 0.0;
-        for (j = 0; j <= last; j++) {
-            const float *v = a->kv.data + ((size_t)b * Tk + j) * 2 * E + E + (size_t)h * d;
-            float *dv = a->dkv.data + ((size_t)b * Tk + j) * 2 * E + E + (size_t)h * d;
-            const float pj = p[j];
-            double g = nmz__dot(dc, v, d); /* ∂L/∂a_tj */
-            dot += pj * g;
-            dp[j] = (float)g;
-            for (k = 0; k < d; k++) dv[k] += pj * dc[k];
-        }
-        for (j = 0; j <= last; j++) {
-            const float *kj = a->kv.data + ((size_t)b * Tk + j) * 2 * E + (size_t)h * d;
-            float *dk = a->dkv.data + ((size_t)b * Tk + j) * 2 * E + (size_t)h * d;
-            const float ds = (float)(p[j] * (dp[j] - dot)); /* ∂L/∂s_tj */
-            const float g = (float)(ds * scale);
-            dp[j] = ds;
-            for (k = 0; k < d; k++) {
-                dq[k] += g * kj[k];
-                dk[k] += g * q[k];
-            }
-        }
-        for (j = last + 1; j < Tk; j++) dp[j] = 0.0f;
-    }
-}
-
 static nmz_status attn_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tensor *y, const nmz_tensor *dy,
                                 nmz_tensor *dx, const nmz_ctx *ctx) {
     attn_layer *a = l->self;
+    const nmz_backend *be = ctx->backend;
     const int B = x->shape[0], T = x->shape[1], D = a->D, E = a->E, H = a->heads, Tp = a->past, Tk = Tp + T;
-    int b, t, bh;
+    const float *px, *pdy, *pcv, *pWo, *pqkv, *pkv, *pP, *pWqkv;
+    float *pdWo, *pdbo, *pdcv, *pdkv, *pdqkv, *pdP, *pdWqkv, *pdbqkv, *pdx = NULL;
     nmz_status s;
     (void)y;
     if (a->P.rank != 4 || a->P.shape[0] != B || a->P.shape[2] != T || a->P.shape[3] != Tk)
         return nmz__fail(NMZ_ERR_STATE, "attention: backward without a matching forward");
-    /* output projection */
-    if ((s = nmz_matmul(E, D, B * T, a->cv.data, dy->data, a->dWo.data, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE)) != NMZ_OK ||
-        (s = colsum_add(dy->data, B * T, D, a->dbo.data)) != NMZ_OK)
-        return s;
-    if ((s = nmz_tensor_reshape(&a->dcv, 3, a->cv.shape)) != NMZ_OK) return s;
-    if ((s = nmz_matmul(B * T, E, D, dy->data, a->Wo.data, a->dcv.data, NMZ_MM_TRANS_B)) != NMZ_OK) return s;
-    /* the heads */
-    if ((s = nmz_tensor_reshape(&a->dkv, 3, a->kv.shape)) != NMZ_OK ||
+    if ((s = nmz_tensor_reshape(&a->dcv, 3, a->cv.shape)) != NMZ_OK || (s = nmz_tensor_reshape(&a->dkv, 3, a->kv.shape)) != NMZ_OK ||
         (s = nmz_tensor_reshape(&a->dqkv, 3, a->qkv.shape)) != NMZ_OK || (s = nmz_tensor_reshape(&a->dP, 4, a->P.shape)) != NMZ_OK)
         return s;
-    nmz_tensor_zero(&a->dkv);
-    nmz_tensor_zero(&a->dqkv);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (B * H > 1 && (double)T * Tk * a->hd > 2e4)
-#endif
-    for (bh = 0; bh < B * H; bh++) attend_back(a, bh / H, bh % H, T, Tk, Tp);
-    for (b = 0; b < B; b++) /* the new positions' keys | values (cached ones get no gradient) */
-        for (t = 0; t < T; t++)
-            memcpy(a->dqkv.data + ((size_t)b * T + t) * 3 * E + E, a->dkv.data + ((size_t)b * Tk + Tp + t) * 2 * E,
-                   (size_t)2 * E * sizeof(float));
-    /* input projection */
-    if ((s = nmz_matmul(D, 3 * E, B * T, x->data, a->dqkv.data, a->dWqkv.data, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE)) != NMZ_OK ||
-        (s = colsum_add(a->dqkv.data, B * T, 3 * E, a->dbqkv.data)) != NMZ_OK)
+    px = nmz__r(be, x);
+    pdy = nmz__r(be, dy);
+    pcv = nmz__r(be, &a->cv);
+    pWo = nmz__r(be, &a->Wo);
+    pqkv = nmz__r(be, &a->qkv);
+    pkv = nmz__r(be, &a->kv);
+    pP = nmz__r(be, &a->P);
+    pWqkv = nmz__r(be, &a->Wqkv);
+    pdWo = nmz__u(be, &a->dWo);
+    pdbo = nmz__u(be, &a->dbo);
+    pdcv = nmz__w(be, &a->dcv);
+    pdkv = nmz__w(be, &a->dkv);
+    pdqkv = nmz__w(be, &a->dqkv);
+    pdP = nmz__w(be, &a->dP);
+    pdWqkv = nmz__u(be, &a->dWqkv);
+    pdbqkv = nmz__u(be, &a->dbqkv);
+    if (dx) pdx = nmz__w(be, dx);
+    if (!px || !pdy || !pcv || !pWo || !pqkv || !pkv || !pP || !pWqkv || !pdWo || !pdbo || !pdcv || !pdkv || !pdqkv ||
+        !pdP || !pdWqkv || !pdbqkv || (dx && !pdx))
+        return nmz__op_failed();
+    /* output projection */
+    if ((s = be->gemm(be, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE, E, D, B * T, pcv, E, pdy, D, pdWo, D)) != NMZ_OK ||
+        (s = be->colsum_add(be, (size_t)B * T, D, pdy, pdbo)) != NMZ_OK)
         return s;
-    if (dx && (s = nmz_matmul(B * T, D, 3 * E, a->dqkv.data, a->Wqkv.data, dx->data, NMZ_MM_TRANS_B)) != NMZ_OK) return s;
+    if ((s = be->gemm(be, NMZ_MM_TRANS_B, B * T, E, D, pdy, D, pWo, D, pdcv, E)) != NMZ_OK) return s;
+    /* the heads */
+    if ((s = be->fill(be, a->dkv.size, 0.0f, pdkv)) != NMZ_OK || (s = be->fill(be, a->dqkv.size, 0.0f, pdqkv)) != NMZ_OK)
+        return s;
+    if ((s = be->attention_backward(be, B, H, T, Tk, Tp, a->hd, E, pqkv, pkv, pP, pdcv, pdP, pdqkv, pdkv)) != NMZ_OK)
+        return s;
+    /* the new positions' keys | values (cached ones get no gradient) */
+    if ((s = kv_rows(be, B, T, Tk, Tp, E, pdqkv, pdkv, 0)) != NMZ_OK) return s;
+    /* input projection */
+    if ((s = be->gemm(be, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE, D, 3 * E, B * T, px, D, pdqkv, 3 * E, pdWqkv, 3 * E)) !=
+            NMZ_OK ||
+        (s = be->colsum_add(be, (size_t)B * T, 3 * E, pdqkv, pdbqkv)) != NMZ_OK)
+        return s;
+    if (dx && (s = be->gemm(be, NMZ_MM_TRANS_B, B * T, D, 3 * E, pdqkv, 3 * E, pWqkv, 3 * E, pdx, D)) != NMZ_OK) return s;
     if (NMZ_TRACING(ctx)) {
         nmz_tensor *tp = a->tmp;
         if ((s = cols3(&a->dqkv, 0, E, &tp[3])) != NMZ_OK || (s = cols3(&a->dkv, 0, E, &tp[4])) != NMZ_OK ||
@@ -364,9 +435,15 @@ static void attn_destroy(nmz_layer *l) {
     free(a);
 }
 
+static int attn_buffers(nmz_layer *l, nmz_tensor **out, int max) {
+    attn_layer *a = l->self;
+    nmz_tensor *all[] = {&a->qkv, &a->kv, &a->P, &a->S, &a->cv, &a->state, &a->dcv, &a->dqkv, &a->dkv, &a->dP, &a->tmp[0], &a->tmp[1], &a->tmp[2], &a->tmp[3], &a->tmp[4], &a->tmp[5]};
+    return nmz__list(out, max, (int)(sizeof all / sizeof all[0]), all);
+}
+
 const nmz_layer_ops nmz__attention_ops = {"attention",  attn_setup, attn_init,     attn_forward, attn_backward,
                                           attn_param_count, attn_param, attn_save, attn_load,    attn_describe,
-                                          attn_destroy, attn_state, 0,             NULL};
+                                          attn_destroy, attn_state, NMZ_LAYER_BACKEND, NULL, attn_buffers};
 
 nmz_layer *nmz_layer_attention(int heads, int head_dim) {
     attn_layer *a;
@@ -393,7 +470,3 @@ void nmz__attention_dims(const nmz_layer *l, int *heads, int *head_dim, int *hea
     if (head_dim) *head_dim = a->hd;
     if (head_dim_req) *head_dim_req = a->hd_req;
 }
-
-nmz_status nmz__colsum_add(const float *A, int rows, int cols, float *out) { return colsum_add(A, rows, cols, out); }
-
-void nmz__add_rows(float *Y, int rows, int cols, const float *bias) { add_rows(Y, rows, cols, bias); }

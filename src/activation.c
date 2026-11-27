@@ -106,29 +106,71 @@ static nmz_status act_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
     return NMZ_OK;
 }
 
-static void softmax_rows(const nmz_tensor *x, nmz_tensor *y) {
-    size_t rows = nmz_tensor_rows(x), r;
-    int k, cols = nmz_tensor_cols(x);
+/* The CPU kernels (the v2.0.1 loops). */
+nmz_status nmz__cpu_softmax_forward(const nmz_backend *be, size_t rows, int cols, const float *z, float *p) {
+    size_t r;
+    int k;
+    (void)be;
     for (r = 0; r < rows; r++) {
-        const float *zr = x->data + r * (size_t)cols;
-        float *ar = y->data + r * (size_t)cols;
+        const float *zr = z + r * (size_t)cols;
+        float *ar = p + r * (size_t)cols;
         double mx = zr[0], sum = 0.0;
         for (k = 1; k < cols; k++)
             if (zr[k] > mx) mx = zr[k];
         for (k = 0; k < cols; k++) sum += exp((double)zr[k] - mx); /* shift for stability */
         for (k = 0; k < cols; k++) ar[k] = (float)(exp((double)zr[k] - mx) / sum);
     }
+    return NMZ_OK;
+}
+
+/* Jacobian-vector product: dz_i = a_i (g_i − Σ_j g_j a_j) */
+nmz_status nmz__cpu_softmax_backward(const nmz_backend *be, size_t rows, int cols, const float *p, const float *dy,
+                                     float *dz) {
+    size_t r;
+    int k;
+    (void)be;
+    for (r = 0; r < rows; r++) {
+        const float *ar = p + r * (size_t)cols, *gr = dy + r * (size_t)cols;
+        float *dr = dz + r * (size_t)cols;
+        double dot = 0.0;
+        for (k = 0; k < cols; k++) dot += (double)gr[k] * ar[k];
+        for (k = 0; k < cols; k++) dr[k] = (float)(ar[k] * ((double)gr[k] - dot));
+    }
+    return NMZ_OK;
+}
+
+nmz_status nmz__cpu_act_forward(const nmz_backend *be, nmz_act act, float alpha, size_t n, const float *z, float *a) {
+    size_t i;
+    (void)be;
+    for (i = 0; i < n; i++) a[i] = nmz_act_apply(act, z[i], alpha);
+    return NMZ_OK;
+}
+
+nmz_status nmz__cpu_act_backward(const nmz_backend *be, nmz_act act, float alpha, size_t n, const float *z,
+                                 const float *dy, float *dz, float *fprime) {
+    size_t i;
+    (void)be;
+    for (i = 0; i < n; i++) {
+        float d = nmz_act_derivative(act, z[i], alpha);
+        if (fprime) fprime[i] = d;
+        dz[i] = dy[i] * d;
+    }
+    return NMZ_OK;
 }
 
 static nmz_status act_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y,
                               const nmz_ctx *ctx) {
     act_layer *a = l->self;
-    size_t i;
-    if (a->act == NMZ_ACT_SOFTMAX) {
-        softmax_rows(x, y);
-    } else {
-        for (i = 0; i < x->size; i++) y->data[i] = nmz_act_apply(a->act, x->data[i], a->alpha);
-    }
+    const nmz_backend *be = ctx->backend;
+    const float *px = nmz__r(be, x);
+    float *py = nmz__w(be, y);
+    nmz_status s;
+    if (!px || !py) return nmz__op_failed();
+    if (a->act == NMZ_ACT_SOFTMAX)
+        s = be->softmax_forward(be, nmz_tensor_rows(x), nmz_tensor_cols(x), px, py);
+    else
+        s = be->act_forward(be, a->act, a->alpha, x->size, px, py);
+    if (s != NMZ_OK) return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_item it[2] = {{"z", x}, {"a", y}};
         nmz_trace_emit(ctx, NMZ_TRACE_FORWARD, "activation", nmz_act_name(a->act), 0, NULL, 2, it);
@@ -139,20 +181,18 @@ static nmz_status act_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y,
 static nmz_status act_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tensor *y,
                                const nmz_tensor *dy, nmz_tensor *dx, const nmz_ctx *ctx) {
     act_layer *a = l->self;
-    size_t i;
+    const nmz_backend *be = ctx->backend;
     int tracing = NMZ_TRACING(ctx);
+    float *pdx, *pf = NULL;
+    const float *pdy;
+    nmz_status s;
     if (!dx) return NMZ_OK; /* no params, nothing else to do */
+    pdy = nmz__r(be, dy);
     if (a->act == NMZ_ACT_SOFTMAX) {
-        /* Jacobian-vector product: dz_i = a_i (g_i − Σ_j g_j a_j) */
-        size_t rows = nmz_tensor_rows(y), r;
-        int k, cols = nmz_tensor_cols(y);
-        for (r = 0; r < rows; r++) {
-            const float *ar = y->data + r * (size_t)cols, *gr = dy->data + r * (size_t)cols;
-            float *dr = dx->data + r * (size_t)cols;
-            double dot = 0.0;
-            for (k = 0; k < cols; k++) dot += (double)gr[k] * ar[k];
-            for (k = 0; k < cols; k++) dr[k] = (float)(ar[k] * ((double)gr[k] - dot));
-        }
+        const float *py = nmz__r(be, y);
+        pdx = nmz__w(be, dx);
+        if (!py || !pdy || !pdx) return nmz__op_failed();
+        if ((s = be->softmax_backward(be, nmz_tensor_rows(y), nmz_tensor_cols(y), py, pdy, pdx)) != NMZ_OK) return s;
         if (tracing) {
             nmz_trace_item it[2] = {{"dL/da", dy}, {"dL/dz", dx}};
             nmz_trace_emit(ctx, NMZ_TRACE_BACKWARD, "activation", "softmax", 0, NULL, 2, it);
@@ -160,13 +200,15 @@ static nmz_status act_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tens
         return NMZ_OK;
     }
     if (tracing) {
-        nmz_status s = nmz_tensor_reshape(&a->fprime, x->rank, x->shape);
+        s = nmz_tensor_reshape(&a->fprime, x->rank, x->shape);
         if (s != NMZ_OK) return s;
+        if (!(pf = nmz__w(be, &a->fprime))) return nmz__op_failed();
     }
-    for (i = 0; i < x->size; i++) {
-        float d = nmz_act_derivative(a->act, x->data[i], a->alpha);
-        if (tracing) a->fprime.data[i] = d;
-        dx->data[i] = dy->data[i] * d;
+    {
+        const float *px = nmz__r(be, x);
+        pdx = nmz__w(be, dx);
+        if (!px || !pdy || !pdx) return nmz__op_failed();
+        if ((s = be->act_backward(be, a->act, a->alpha, x->size, px, pdy, pdx, pf)) != NMZ_OK) return s;
     }
     if (tracing) {
         nmz_trace_item it[3] = {{"dL/da", dy}, {"f'(z)", &a->fprime}, {"dL/dz", dx}};
@@ -216,9 +258,15 @@ static void act_destroy(nmz_layer *l) {
     free(a);
 }
 
+static int act_buffers(nmz_layer *l, nmz_tensor **out, int max) {
+    act_layer *a = l->self;
+    nmz_tensor *all[] = {&a->fprime};
+    return nmz__list(out, max, (int)(sizeof all / sizeof all[0]), all);
+}
+
 const nmz_layer_ops nmz__activation_ops = {
     "activation", act_setup, act_init, act_forward, act_backward, act_param_count, act_param,
-    act_save, act_load, act_describe, act_destroy, NULL, 0, NULL};
+    act_save, act_load, act_describe, act_destroy, NULL, NMZ_LAYER_BACKEND, NULL, act_buffers};
 
 nmz_layer *nmz_layer_activation(nmz_act act, float alpha) {
     act_layer *a;

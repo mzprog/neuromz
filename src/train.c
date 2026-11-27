@@ -9,7 +9,13 @@
  * to one-hot rows only for the batch being processed. With carry_state the
  * batches are cut into B parallel streams so that row r of batch k+1 is the
  * text right after row r of batch k, and recurrent layers keep their hidden
- * state between batches (truncated BPTT). */
+ * state between batches (truncated BPTT).
+ *
+ * On a device backend the data set is copied to the device once per run
+ * (`resident`) and every batch is gathered there, so nothing but the
+ * shuffled order crosses to the device during an epoch, and only the
+ * batch loss and the epoch's metrics come back. If it does not fit, the
+ * batches are gathered on the host and copied one by one. */
 #include "internal.h"
 
 #include <math.h>
@@ -78,13 +84,14 @@ static nmz_status batch_shapes(const nmz_net *net, const nmz_dataset *ds, int b,
 
 static nmz_status gather(const nmz_dataset *ds, const int *idx, int start, int b, nmz_tensor *xb, nmz_tensor *tb) {
     int r, t, T = steps_of(ds);
+    float *xd = nmz__hw(xb), *td;
     if (ds->y_index) nmz_tensor_zero(tb);
+    td = nmz__hu(tb);
     for (r = 0; r < b; r++) {
         int k = idx ? idx[start + r] : start + r;
-        memcpy(xb->data + (size_t)r * ds->n_inputs, ds->x + (size_t)k * ds->n_inputs,
-               (size_t)ds->n_inputs * sizeof(float));
+        memcpy(xd + (size_t)r * ds->n_inputs, ds->x + (size_t)k * ds->n_inputs, (size_t)ds->n_inputs * sizeof(float));
         if (!ds->y_index) {
-            memcpy(tb->data + (size_t)r * ds->n_outputs, ds->y + (size_t)k * ds->n_outputs,
+            memcpy(td + (size_t)r * ds->n_outputs, ds->y + (size_t)k * ds->n_outputs,
                    (size_t)ds->n_outputs * sizeof(float));
             continue;
         }
@@ -92,10 +99,100 @@ static nmz_status gather(const nmz_dataset *ds, const int *idx, int start, int b
             float id = ds->y[(size_t)k * T + t];
             if (!(id >= 0.0f && id < (float)ds->n_outputs))
                 return nmz__fail(NMZ_ERR_FORMAT, "target id %g out of range 0..%d", (double)id, ds->n_outputs - 1);
-            tb->data[((size_t)r * T + t) * ds->n_outputs + (size_t)id] = 1.0f;
+            td[((size_t)r * T + t) * ds->n_outputs + (size_t)id] = 1.0f;
         }
     }
     return NMZ_OK;
+}
+
+/* ------------------------------------------------- data on the device */
+
+typedef struct resident {
+    const nmz_backend *be;
+    float *x, *y;   /* every sample's inputs [n, n_inputs], targets [n, n_outputs] (or ids [n, T]) */
+    float *idx;     /* the epoch's order (floats), n                                         */
+    nmz_tensor ids; /* target ids of a batch [b, T]                                          */
+    int n;
+} resident;
+
+static size_t y_width(const nmz_dataset *ds) { return ds->y_index ? (size_t)steps_of(ds) : (size_t)ds->n_outputs; }
+
+static void resident_free(resident *r) {
+    if (r->be) {
+        if (r->x) r->be->release(r->be, r->x);
+        if (r->y) r->be->release(r->be, r->y);
+        if (r->idx) r->be->release(r->be, r->idx);
+    }
+    nmz_tensor_free(&r->ids);
+    memset(r, 0, sizeof *r);
+}
+
+/* Copy a data set to the device: 1 = done, 0 = keep it on the host (a host
+ * backend, or it does not fit: then batches are copied one at a time). */
+static int resident_load(nmz_net *net, const nmz_dataset *ds, resident *r, nmz_status *s) {
+    const nmz_backend *be = net->be;
+    size_t nx = (size_t)ds->n_samples * ds->n_inputs, ny = (size_t)ds->n_samples * y_width(ds);
+    memset(r, 0, sizeof *r);
+    *s = NMZ_OK;
+    if (be->host_memory) return 0;
+    /* ids are checked once here: a device kernel cannot report a bad one */
+    if ((net->layers[0]->ops->flags & NMZ_LAYER_DISCRETE_INPUT) &&
+        (*s = nmz__check_ids(net->layers[0], ds->x, nx)) != NMZ_OK)
+        return 0;
+    r->be = be;
+    r->n = ds->n_samples;
+    r->x = be->alloc(be, nx * sizeof(float));
+    r->y = r->x ? be->alloc(be, ny * sizeof(float)) : NULL;
+    r->idx = r->y ? be->alloc(be, (size_t)ds->n_samples * sizeof(float)) : NULL;
+    if (!r->idx || be->upload(be, r->x, ds->x, nx * sizeof(float)) != NMZ_OK ||
+        be->upload(be, r->y, ds->y, ny * sizeof(float)) != NMZ_OK) {
+        resident_free(r); /* too big for the device: gather on the host */
+        return 0;
+    }
+    return 1;
+}
+
+/* the epoch's order to the device (floats are exact below 2^24 samples) */
+static nmz_status resident_order(resident *r, const int *perm, int n) {
+    float *f = malloc((size_t)n * sizeof *f);
+    nmz_status s;
+    int i;
+    if (!f) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+    for (i = 0; i < n; i++) f[i] = (float)perm[i];
+    s = r->be->upload(r->be, r->idx, f, (size_t)n * sizeof *f);
+    if (s == NMZ_OK) s = r->be->sync(r->be); /* f is freed below */
+    free(f);
+    return s;
+}
+
+/* samples idx[start …] (in order) or start … (perm = 0) into xb, tb */
+static nmz_status resident_gather(const nmz_dataset *ds, resident *r, int ordered, int start, int b, nmz_tensor *xb,
+                                  nmz_tensor *tb) {
+    const nmz_backend *be = r->be;
+    float *px = nmz__w(be, xb), *pt = nmz__w(be, tb), *py;
+    size_t yw = y_width(ds);
+    nmz_status s;
+    if (!px || !pt) return nmz__op_failed();
+    if (ds->y_index) {
+        int shape[2];
+        shape[0] = b;
+        shape[1] = (int)yw;
+        if ((s = nmz_tensor_reshape(&r->ids, 2, shape)) != NMZ_OK) return s;
+        if (!(py = nmz__w(be, &r->ids))) return nmz__op_failed();
+    } else {
+        py = pt;
+    }
+    if (ordered) {
+        if ((s = be->gather_rows(be, b, (size_t)ds->n_inputs, r->idx + start, r->x, px)) != NMZ_OK ||
+            (s = be->gather_rows(be, b, yw, r->idx + start, r->y, py)) != NMZ_OK)
+            return s;
+    } else {
+        if ((s = be->copy(be, 1, (size_t)b * ds->n_inputs, r->x + (size_t)start * ds->n_inputs, (size_t)b * ds->n_inputs,
+                          px, (size_t)b * ds->n_inputs)) != NMZ_OK ||
+            (s = be->copy(be, 1, (size_t)b * yw, r->y + (size_t)start * yw, (size_t)b * yw, py, (size_t)b * yw)) != NMZ_OK)
+            return s;
+    }
+    return ds->y_index ? be->onehot(be, (size_t)b * yw, ds->n_outputs, py, pt) : NMZ_OK;
 }
 
 static int argmax(const float *v, int n) {
@@ -119,9 +216,10 @@ static int accuracy_mode(const nmz_net *net, const nmz_dataset *ds) {
 /* loss/accuracy over samples [first, first+count). Stateless (every sample
  * from a zero state) unless `carry`: then the samples are read in order as
  * one stream, one at a time, with the recurrent state carried — the way a
- * model trained with carry_state is meant to run. */
-static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, int first, int count, int carry, double *loss,
-                                 double *accuracy) {
+ * model trained with carry_state is meant to run. `rd` (may be NULL): the
+ * data set on the device. */
+static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, resident *rd, int first, int count, int carry,
+                                 double *loss, double *accuracy) {
     nmz_tensor xb = NMZ_TENSOR_EMPTY, tb = NMZ_TENSOR_EMPTY;
     nmz_trace_fn saved_fn = net->trace;
     int saved_carry = net->carry;
@@ -136,20 +234,40 @@ static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, int first,
     for (start = first; start < first + count; start += chunk) {
         int b = first + count - start < chunk ? first + count - start : chunk, r, k;
         const nmz_tensor *y;
-        double L;
+        double L, right = 0.0;
         if ((s = batch_shapes(net, ds, b, &xb, &tb)) != NMZ_OK) break;
+        if (rd && rd->x) {
+            const nmz_backend *be = rd->be;
+            const float *py, *pt;
+            if ((s = resident_gather(ds, rd, 0, start, b, &xb, &tb)) != NMZ_OK) break;
+            if ((s = nmz__net_forward(net, &xb, 0, &y)) != NMZ_OK) break;
+            py = nmz__r(be, y);
+            pt = nmz__r(be, &tb);
+            if (!py || !pt) {
+                s = nmz__op_failed();
+                break;
+            }
+            if (mode && (s = be->count_correct(be, mode, (size_t)b * T, ds->n_outputs, py, pt, &right)) != NMZ_OK) break;
+            if ((s = nmz_net_compute_loss(net, &tb, &L)) != NMZ_OK) break; /* syncs: `right` is valid too */
+            total += L * b;
+            correct += (long)right;
+            continue;
+        }
         if ((s = gather(ds, NULL, start, b, &xb, &tb)) != NMZ_OK) break;
         if ((s = nmz__net_forward(net, &xb, 0, &y)) != NMZ_OK) break;
         if ((s = nmz_net_compute_loss(net, &tb, &L)) != NMZ_OK) break;
         total += L * b; /* the loss is a mean over rows; every sample has T rows */
-        for (r = 0; r < b * T; r++) {
-            const float *yr = y->data + (size_t)r * ds->n_outputs, *tr = tb.data + (size_t)r * ds->n_outputs;
-            if (mode == 1) {
-                correct += argmax(yr, ds->n_outputs) == argmax(tr, ds->n_outputs);
-            } else if (mode == 2) {
-                int ok = 1;
-                for (k = 0; k < ds->n_outputs; k++) ok &= (yr[k] >= 0.5f) == (tr[k] >= 0.5f);
-                correct += ok;
+        {
+            const float *yd = nmz__hr(y), *td = nmz__hr(&tb);
+            for (r = 0; r < b * T; r++) {
+                const float *yr = yd + (size_t)r * ds->n_outputs, *tr = td + (size_t)r * ds->n_outputs;
+                if (mode == 1) {
+                    correct += argmax(yr, ds->n_outputs) == argmax(tr, ds->n_outputs);
+                } else if (mode == 2) {
+                    int ok = 1;
+                    for (k = 0; k < ds->n_outputs; k++) ok &= (yr[k] >= 0.5f) == (tr[k] >= 0.5f);
+                    correct += ok;
+                }
             }
         }
     }
@@ -165,25 +283,39 @@ static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, int first,
 }
 
 nmz_status nmz_net_evaluate(nmz_net *net, const nmz_dataset *ds, double *loss, double *accuracy) {
+    resident rd;
     nmz_status s;
     if (!net) return nmz__fail(NMZ_ERR_ARG, "net is NULL");
     if ((s = nmz_net_build(net)) != NMZ_OK) return s;
     if ((s = nmz__net_check_dataset(net, ds)) != NMZ_OK) return s;
-    return evaluate_range(net, ds, 0, ds->n_samples, net->train.carry_state && ds->time_steps > 0, loss, accuracy);
+    nmz__net_backend(net);
+    resident_load(net, ds, &rd, &s);
+    if (s != NMZ_OK) return s;
+    s = evaluate_range(net, ds, &rd, 0, ds->n_samples, net->train.carry_state && ds->time_steps > 0, loss, accuracy);
+    resident_free(&rd);
+    if (s == NMZ_ERR_NOMEM) nmz__net_drop_buffers(net);
+    return s;
 }
 
-/* copy all parameters to/from one flat buffer (early stopping) */
-static void params_copy(nmz_net *net, float *buf, int to_buf) {
+/* copy all parameters to/from one flat buffer in be's memory (early stopping) */
+static nmz_status params_copy(nmz_net *net, nmz_tensor *buf, int to_buf) {
+    const nmz_backend *be = net->be;
+    float *b = to_buf ? nmz__u(be, buf) : (float *)nmz__r(be, buf);
+    nmz_status s = NMZ_OK;
     int k;
     size_t off = 0;
-    for (k = 0; k < net->n_params; k++) {
-        nmz_tensor *w = nmz_layer_param_value(net->layers[net->param_refs[k].layer], net->param_refs[k].index);
+    if (!b) return nmz__op_failed();
+    for (k = 0; k < net->n_params && s == NMZ_OK; k++) {
+        nmz_tensor *w = nmz__param(net->layers[net->param_refs[k].layer], net->param_refs[k].index).value;
+        float *pw = to_buf ? (float *)nmz__r(be, w) : nmz__w(be, w);
+        if (!pw) return nmz__op_failed();
         if (to_buf)
-            memcpy(buf + off, w->data, w->size * sizeof(float));
+            s = be->copy(be, 1, w->size, pw, w->size, b + off, w->size);
         else
-            memcpy(w->data, buf + off, w->size * sizeof(float));
+            s = be->copy(be, 1, w->size, b + off, w->size, pw, w->size);
         off += w->size;
     }
+    return s;
 }
 
 nmz_status nmz_net_train(nmz_net *net, const nmz_dataset *ds, const nmz_train_opts *opts,
@@ -195,17 +327,20 @@ nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_data
                              nmz_train_result *result) {
     nmz_train_opts o;
     nmz_train_result res;
-    nmz_tensor xb = NMZ_TENSOR_EMPTY, tb = NMZ_TENSOR_EMPTY;
-    int *perm = NULL, epoch, i, bs, n, n_val = 0, vfirst = 0, used, best_epoch = 0;
+    nmz_tensor xb = NMZ_TENSOR_EMPTY, tb = NMZ_TENSOR_EMPTY, best = NMZ_TENSOR_EMPTY;
+    int *perm = NULL, epoch, i, bs, n, n_val = 0, vfirst = 0, used, best_epoch = 0, keep_best = 0;
     double bl = 0.0, best_val = HUGE_VAL;
-    float *best = NULL;
     const nmz_dataset *vds = val ? val : ds; /* validation samples [vfirst, vfirst + n_val) of vds */
+    resident rd, rv, *rvp;
     nmz_status s;
+    memset(&rd, 0, sizeof rd);
+    memset(&rv, 0, sizeof rv);
     if (!net) return nmz__fail(NMZ_ERR_ARG, "net is NULL");
     o = opts ? *opts : net->train;
     if ((s = nmz__train_opts_validate(&o)) != NMZ_OK) return s;
     if ((s = nmz_net_build(net)) != NMZ_OK) return s;
     if ((s = nmz__net_check_dataset(net, ds)) != NMZ_OK) return s;
+    nmz__net_backend(net);
     if (val) { /* a separate validation set: all of ds trains, val_fraction is ignored */
         if ((s = nmz__net_check_dataset(net, val)) != NMZ_OK) return s;
         if (val->n_samples < 1) return nmz__fail(NMZ_ERR_ARG, "the validation data set is empty");
@@ -238,12 +373,18 @@ nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_data
     perm = malloc((size_t)n * sizeof *perm);
     if (!perm) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
     if (o.patience > 0 && n_val > 0) {
-        best = malloc(nmz_net_param_count(net) * sizeof *best + 1);
-        if (!best) {
+        int total = (int)nmz_net_param_count(net) + 1;
+        keep_best = 1;
+        if ((s = nmz_tensor_reshape(&best, 1, &total)) != NMZ_OK) {
             free(perm);
-            return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+            return s;
         }
     }
+    /* on a device: the data sets live there for the whole run */
+    resident_load(net, ds, &rd, &s);
+    if (s == NMZ_OK && val) resident_load(net, val, &rv, &s);
+    if (s != NMZ_OK) goto done;
+    rvp = val ? &rv : &rd;
 
     for (epoch = 1; epoch <= o.max_epochs; epoch++) {
         int start, batch = 0, n_batches = (used + bs - 1) / bs, clipped = 0;
@@ -266,6 +407,7 @@ nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_data
                     perm[j] = t;
                 }
         }
+        if (rd.x && (s = resident_order(&rd, perm, used)) != NMZ_OK) goto done;
         net->training = 1;
         net->carry = o.carry_state != 0;
         for (start = 0; start < used; start += bs) {
@@ -274,7 +416,11 @@ nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_data
             if (o.schedule == NMZ_SCHED_WARMUP_COSINE) /* per batch */
                 lr = nmz_schedule_lr_step(&o, (long)(epoch - 1) * n_batches + start / bs + 1, total_steps, n_batches);
             if ((s = batch_shapes(net, ds, b, &xb, &tb)) != NMZ_OK) goto done;
-            if ((s = gather(ds, perm, start, b, &xb, &tb)) != NMZ_OK) goto done;
+            if (rd.x)
+                s = resident_gather(ds, &rd, 1, start, b, &xb, &tb);
+            else
+                s = gather(ds, perm, start, b, &xb, &tb);
+            if (s != NMZ_OK) goto done;
             if ((s = nmz__net_forward(net, &xb, 1, NULL)) != NMZ_OK) goto done;
             if ((s = nmz_net_backward(net, &tb, &bl)) != NMZ_OK) {
                 if (s == NMZ_ERR_NUMERIC)
@@ -306,8 +452,10 @@ nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_data
         net->training = 0;
         net->carry = 0;
         nmz_net_reset_state(net);
-        if ((s = evaluate_range(net, ds, 0, n, o.carry_state, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
-        if (n_val && (s = evaluate_range(net, vds, vfirst, n_val, o.carry_state, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
+        if ((s = evaluate_range(net, ds, &rd, 0, n, o.carry_state, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
+        if (n_val && (s = evaluate_range(net, vds, rvp, vfirst, n_val, o.carry_state, &res.val_loss, &res.val_accuracy)) !=
+                         NMZ_OK)
+            goto done;
         res.epochs = epoch;
         if (!isfinite(res.loss)) {
             s = nmz__fail(NMZ_ERR_NUMERIC, "loss became NaN/Inf in epoch %d — the learning rate (%g) is probably too high",
@@ -325,19 +473,20 @@ nmz_status nmz_net_train_val(nmz_net *net, const nmz_dataset *ds, const nmz_data
         if (info.improved) {
             best_val = res.val_loss;
             best_epoch = epoch;
-            if (best) params_copy(net, best, 1);
+            if (keep_best && (s = params_copy(net, &best, 1)) != NMZ_OK) goto done;
         }
         if (res.loss <= o.target_loss) res.converged = 1;
         if (o.on_epoch && o.on_epoch(&info, o.user)) res.stopped = 1;
         if (res.converged || res.stopped) break;
-        if (best && epoch - best_epoch >= o.patience) break; /* early stopping */
+        if (keep_best && epoch - best_epoch >= o.patience) break; /* early stopping */
     }
-    if (best && best_epoch > 0 && best_epoch != res.epochs) { /* go back to the best weights */
-        params_copy(net, best, 0);
+    if (keep_best && best_epoch > 0 && best_epoch != res.epochs) { /* go back to the best weights */
+        if ((s = params_copy(net, &best, 0)) != NMZ_OK) goto done;
         res.best_epoch = best_epoch;
-        if ((s = evaluate_range(net, ds, 0, n, o.carry_state, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
-        if ((s = evaluate_range(net, vds, vfirst, n_val, o.carry_state, &res.val_loss, &res.val_accuracy)) != NMZ_OK) goto done;
-    } else if (best) {
+        if ((s = evaluate_range(net, ds, &rd, 0, n, o.carry_state, &res.loss, &res.accuracy)) != NMZ_OK) goto done;
+        if ((s = evaluate_range(net, vds, rvp, vfirst, n_val, o.carry_state, &res.val_loss, &res.val_accuracy)) != NMZ_OK)
+            goto done;
+    } else if (keep_best) {
         res.best_epoch = best_epoch;
     }
     s = NMZ_OK;
@@ -345,8 +494,11 @@ done:
     net->training = 0;
     net->carry = 0;
     nmz_net_reset_state(net);
+    resident_free(&rd);
+    resident_free(&rv);
+    if (s == NMZ_ERR_NOMEM) nmz__net_drop_buffers(net); /* a retry with a smaller batch starts from nothing */
     free(perm);
-    free(best);
+    nmz_tensor_free(&best);
     nmz_tensor_free(&xb);
     nmz_tensor_free(&tb);
     if (result) *result = res;

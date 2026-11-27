@@ -50,8 +50,18 @@ static nmz_status need_rank2(int in_rank, const char *what) {
 }
 
 static void uniform(nmz_tensor *W, double limit, nmz_rng *rng) {
+    float *w = nmz__hw(W);
     size_t i;
-    for (i = 0; i < W->size; i++) W->data[i] = (float)((2.0 * nmz_rng_uniform(rng) - 1.0) * limit);
+    for (i = 0; i < W->size; i++) w[i] = (float)((2.0 * nmz_rng_uniform(rng) - 1.0) * limit);
+}
+
+/* a 1-row copy in the backend's memory */
+static nmz_status copy_all(const nmz_backend *be, const nmz_tensor *src, nmz_tensor *dst) {
+    const float *ps = nmz__r(be, src);
+    float *pd = nmz__w(be, dst);
+    if (!src->size) return NMZ_OK;
+    if (!ps || !pd) return nmz__op_failed();
+    return be->copy(be, 1, src->size, ps, src->size, pd, src->size);
 }
 
 static nmz_param mkparam(const char *name, nmz_tensor *v, nmz_tensor *g) {
@@ -88,12 +98,14 @@ static nmz_status pos_setup(nmz_layer *l, int in_rank, const int *in_shape, int 
     s2[1] = p->D;
     if ((s = nmz_tensor_init(&p->P, 2, s2)) != NMZ_OK) return s;
     if (p->kind == NMZ_POS_LEARNED && (s = nmz_tensor_init(&p->dP, 2, s2)) != NMZ_OK) return s;
-    if (p->kind == NMZ_POS_SINUSOIDAL)
+    if (p->kind == NMZ_POS_SINUSOIDAL) {
+        float *P = nmz__hw(&p->P);
         for (t = 0; t < p->max_len; t++)
             for (i = 0; i < p->D; i++) {
                 double freq = pow(10000.0, -(double)(i - i % 2) / p->D); /* 1/10000^(2k/D) for columns 2k, 2k+1 */
-                p->P.data[(size_t)t * p->D + i] = (float)(i % 2 ? cos(t * freq) : sin(t * freq));
+                P[(size_t)t * p->D + i] = (float)(i % 2 ? cos(t * freq) : sin(t * freq));
             }
+    }
     *out_rank = 2;
     out_shape[0] = in_shape[0];
     out_shape[1] = p->D;
@@ -104,15 +116,47 @@ static nmz_status pos_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
     pos_layer *p = l->self;
     size_t i;
     (void)next;
-    if (p->kind == NMZ_POS_LEARNED) /* small: positions start as a hint, tokens dominate (GPT-2 uses 0.01–0.02) */
-        for (i = 0; i < p->P.size; i++) p->P.data[i] = (float)(0.02 * nmz_rng_normal(rng));
+    if (p->kind == NMZ_POS_LEARNED) { /* small: positions start as a hint, tokens dominate (GPT-2 uses 0.01–0.02) */
+        float *P = nmz__hw(&p->P);
+        for (i = 0; i < p->P.size; i++) P[i] = (float)(0.02 * nmz_rng_normal(rng));
+    }
+    return NMZ_OK;
+}
+
+/* The CPU kernels (the v2.0.1 loops). */
+nmz_status nmz__cpu_posenc_forward(const nmz_backend *be, int B, int T, int D, const int *off, const float *x,
+                                   const float *P, float *y) {
+    int b, t, k;
+    (void)be;
+    for (b = 0; b < B; b++)
+        for (t = 0; t < T; t++) {
+            const float *xt = x + ((size_t)b * T + t) * D, *pt = P + (size_t)(off[b] + t) * D;
+            float *yt = y + ((size_t)b * T + t) * D;
+            for (k = 0; k < D; k++) yt[k] = xt[k] + pt[k];
+        }
+    return NMZ_OK;
+}
+
+nmz_status nmz__cpu_posenc_backward(const nmz_backend *be, int B, int T, int D, const int *off, const float *dy,
+                                    float *dP) {
+    int b, t, k;
+    (void)be;
+    for (b = 0; b < B; b++)
+        for (t = 0; t < T; t++) {
+            const float *g = dy + ((size_t)b * T + t) * D;
+            float *dp = dP + (size_t)(off[b] + t) * D;
+            for (k = 0; k < D; k++) dp[k] += g[k];
+        }
     return NMZ_OK;
 }
 
 static nmz_status pos_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, const nmz_ctx *ctx) {
     pos_layer *p = l->self;
+    const nmz_backend *be = ctx->backend;
     const int B = x->shape[0], T = x->shape[1], D = p->D;
-    int b, t, k, shape[2];
+    int b, shape[2];
+    const float *px, *pP;
+    float *py;
     nmz_status s;
     if (B > p->n_off) {
         int *o = realloc(p->off, (size_t)B * sizeof *o);
@@ -120,29 +164,33 @@ static nmz_status pos_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, 
         p->off = o;
         p->n_off = B;
     }
-    for (b = 0; b < B; b++) {
-        p->off[b] = ctx->carry && p->state.size == (size_t)B ? (int)p->state.data[b] : 0;
-        if (p->off[b] + T > p->max_len)
-            return nmz__fail(NMZ_ERR_SHAPE, "%d positions do not fit the context window of %d (posenc max_len)",
-                             p->off[b] + T, p->max_len);
-    }
-    for (b = 0; b < B; b++)
-        for (t = 0; t < T; t++) {
-            const float *xt = x->data + ((size_t)b * T + t) * D, *pt = p->P.data + (size_t)(p->off[b] + t) * D;
-            float *yt = y->data + ((size_t)b * T + t) * D;
-            for (k = 0; k < D; k++) yt[k] = xt[k] + pt[k];
+    {
+        const float *st = ctx->carry && p->state.size == (size_t)B ? nmz__hr(&p->state) : NULL;
+        for (b = 0; b < B; b++) {
+            p->off[b] = st ? (int)st[b] : 0;
+            if (p->off[b] + T > p->max_len)
+                return nmz__fail(NMZ_ERR_SHAPE, "%d positions do not fit the context window of %d (posenc max_len)",
+                                 p->off[b] + T, p->max_len);
         }
+    }
+    px = nmz__r(be, x);
+    pP = nmz__r(be, &p->P);
+    py = nmz__w(be, y);
+    if (!px || !pP || !py) return nmz__op_failed();
+    if ((s = be->posenc_forward(be, B, T, D, p->off, px, pP, py)) != NMZ_OK) return s;
     if (ctx->carry) {
+        float *st;
         shape[0] = B;
         shape[1] = 1;
         if ((s = nmz_tensor_reshape(&p->state, 2, shape)) != NMZ_OK) return s;
-        for (b = 0; b < B; b++) p->state.data[b] = (float)(p->off[b] + T);
+        st = nmz__hw(&p->state);
+        for (b = 0; b < B; b++) st[b] = (float)(p->off[b] + T);
     }
     if (NMZ_TRACING(ctx)) {
         shape[0] = T;
         shape[1] = D;
         if ((s = nmz_tensor_reshape(&p->tmp, 2, shape)) != NMZ_OK) return s;
-        memcpy(p->tmp.data, p->P.data + (size_t)p->off[0] * D, (size_t)T * D * sizeof(float));
+        memcpy(nmz__hw(&p->tmp), nmz__hr(&p->P) + (size_t)p->off[0] * D, (size_t)T * D * sizeof(float));
         {
             nmz_trace_scalar sc[2] = {{"offset", p->off[0]}, {"max_len", p->max_len}};
             nmz_trace_item it[3] = {{"x", x}, {"P", &p->tmp}, {"y", y}};
@@ -155,17 +203,17 @@ static nmz_status pos_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, 
 static nmz_status pos_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tensor *y, const nmz_tensor *dy,
                                nmz_tensor *dx, const nmz_ctx *ctx) {
     pos_layer *p = l->self;
+    const nmz_backend *be = ctx->backend;
     const int B = x->shape[0], T = x->shape[1], D = p->D;
-    int b, t, k;
+    nmz_status s;
     (void)y;
-    if (dx) memcpy(dx->data, dy->data, dy->size * sizeof(float));
-    if (p->kind == NMZ_POS_LEARNED)
-        for (b = 0; b < B; b++)
-            for (t = 0; t < T; t++) {
-                const float *g = dy->data + ((size_t)b * T + t) * D;
-                float *dp = p->dP.data + (size_t)(p->off[b] + t) * D;
-                for (k = 0; k < D; k++) dp[k] += g[k];
-            }
+    if (dx && (s = copy_all(be, dy, dx)) != NMZ_OK) return s;
+    if (p->kind == NMZ_POS_LEARNED) {
+        const float *pdy = nmz__r(be, dy);
+        float *pdP = nmz__u(be, &p->dP);
+        if (!pdy || !pdP) return nmz__op_failed();
+        if ((s = be->posenc_backward(be, B, T, D, p->off, pdy, pdP)) != NMZ_OK) return s;
+    }
     if (NMZ_TRACING(ctx)) {
         nmz_trace_item it[3] = {{"dL/dy", dy}, {"dL/dP", &p->dP}, {"dL/dx", dx}};
         if (p->kind == NMZ_POS_LEARNED)
@@ -219,9 +267,16 @@ static void pos_destroy(nmz_layer *l) {
     free(p);
 }
 
+static int pos_buffers(nmz_layer *l, nmz_tensor **out, int max) {
+    pos_layer *p = l->self;
+    nmz_tensor *all[] = {&p->state, &p->tmp};
+    return nmz__list(out, max, (int)(sizeof all / sizeof all[0]), all);
+}
+
 const nmz_layer_ops nmz__posenc_ops = {"posenc",        pos_setup, pos_init,     pos_forward, pos_backward,
                                        pos_param_count, pos_param, pos_save,     pos_load,    pos_describe,
-                                       pos_destroy,     pos_state, NMZ_LAYER_NO_DECAY, NULL};
+                                       pos_destroy,     pos_state, NMZ_LAYER_NO_DECAY | NMZ_LAYER_BACKEND, NULL,
+                                       pos_buffers};
 
 nmz_layer *nmz_layer_posenc(nmz_posenc kind, int max_len) {
     pos_layer *p;
@@ -250,7 +305,6 @@ typedef struct ln_layer {
     nmz_tensor g, b, dg, db;
     nmz_tensor xhat, mean, rstd; /* of the last forward: [B,T,D], [B,T], [B,T] */
     nmz_tensor dxhat;
-    double *acc; /* 2D */
 } ln_layer;
 
 static nmz_status ln_setup(nmz_layer *l, int in_rank, const int *in_shape, int *out_rank, int *out_shape) {
@@ -262,9 +316,6 @@ static nmz_status ln_setup(nmz_layer *l, int in_rank, const int *in_shape, int *
     if ((s = nmz_tensor_init(&n->g, 1, &n->D)) != NMZ_OK || (s = nmz_tensor_init(&n->b, 1, &n->D)) != NMZ_OK ||
         (s = nmz_tensor_init(&n->dg, 1, &n->D)) != NMZ_OK || (s = nmz_tensor_init(&n->db, 1, &n->D)) != NMZ_OK)
         return s;
-    free(n->acc);
-    n->acc = malloc((size_t)2 * n->D * sizeof *n->acc);
-    if (!n->acc) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
     *out_rank = in_rank;
     for (i = 0; i < in_rank; i++) out_shape[i] = in_shape[i];
     return NMZ_OK;
@@ -275,38 +326,100 @@ static nmz_status ln_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
     size_t i;
     (void)rng;
     (void)next;
-    for (i = 0; i < n->g.size; i++) n->g.data[i] = 1.0f; /* starts as a pure normalisation */
+    {
+        float *g = nmz__hw(&n->g);
+        for (i = 0; i < n->g.size; i++) g[i] = 1.0f; /* starts as a pure normalisation */
+    }
     nmz_tensor_zero(&n->b);
+    return NMZ_OK;
+}
+
+/* The CPU kernels: the v2.0.1 loops (statistics in double). */
+nmz_status nmz__cpu_layernorm_forward(const nmz_backend *be, size_t rows, int D, float eps, const float *x,
+                                      const float *g, const float *b, float *y, float *xhat, float *mean,
+                                      float *rstd) {
+    size_t r;
+    int k;
+    (void)be;
+    for (r = 0; r < rows; r++) {
+        const float *xr = x + r * D;
+        float *xh = xhat + r * D, *yr = y + r * D;
+        double mu = 0.0, var = 0.0, rs;
+        for (k = 0; k < D; k++) mu += xr[k];
+        mu /= D;
+        for (k = 0; k < D; k++) var += ((double)xr[k] - mu) * ((double)xr[k] - mu);
+        var /= D;
+        rs = 1.0 / sqrt(var + eps);
+        mean[r] = (float)mu;
+        rstd[r] = (float)rs;
+        for (k = 0; k < D; k++) {
+            xh[k] = (float)(((double)xr[k] - mu) * rs);
+            yr[k] = g[k] * xh[k] + b[k];
+        }
+    }
+    return NMZ_OK;
+}
+
+nmz_status nmz__cpu_layernorm_backward(const nmz_backend *be, size_t rows, int D, const float *dy, const float *xhat,
+                                       const float *rstd, const float *gain, float *dx, float *dg, float *db,
+                                       float *dxhat) {
+    double stack[1024], *acc = 2 * D <= 1024 ? stack : malloc((size_t)2 * D * sizeof *acc), *ag, *ab;
+    size_t r;
+    int k;
+    (void)be;
+    if (!acc) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+    ag = acc;
+    ab = acc + D;
+    for (k = 0; k < 2 * D; k++) acc[k] = 0.0;
+    for (r = 0; r < rows; r++) {
+        const float *g = dy + r * D, *xh = xhat + r * D;
+        double m1 = 0.0, m2 = 0.0, rs = rstd[r];
+        for (k = 0; k < D; k++) {
+            double dxh = (double)g[k] * gain[k];
+            ag[k] += (double)g[k] * xh[k];
+            ab[k] += g[k];
+            m1 += dxh;
+            m2 += dxh * xh[k];
+            if (dxhat) dxhat[r * D + k] = (float)dxh;
+        }
+        m1 /= D;
+        m2 /= D;
+        if (dx) {
+            float *o = dx + r * D;
+            for (k = 0; k < D; k++) o[k] = (float)(rs * ((double)g[k] * gain[k] - m1 - xh[k] * m2));
+        }
+    }
+    for (k = 0; k < D; k++) {
+        dg[k] += (float)ag[k];
+        db[k] += (float)ab[k];
+    }
+    if (acc != stack) free(acc);
     return NMZ_OK;
 }
 
 static nmz_status ln_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, const nmz_ctx *ctx) {
     ln_layer *n = l->self;
+    const nmz_backend *be = ctx->backend;
     const int D = n->D;
-    size_t rows = x->size / (size_t)D, r;
-    int k, shape[NMZ_MAX_RANK];
+    size_t rows = x->size / (size_t)D;
+    int shape[NMZ_MAX_RANK];
+    const float *px, *pg, *pb;
+    float *py, *pxh, *pm, *pr;
     nmz_status s;
     if ((s = shape_like(&n->xhat, x)) != NMZ_OK) return s;
     memcpy(shape, x->shape, sizeof shape);
     if ((s = nmz_tensor_reshape(&n->mean, x->rank - 1, shape)) != NMZ_OK ||
         (s = nmz_tensor_reshape(&n->rstd, x->rank - 1, shape)) != NMZ_OK)
         return s;
-    for (r = 0; r < rows; r++) {
-        const float *xr = x->data + r * D;
-        float *xh = n->xhat.data + r * D, *yr = y->data + r * D;
-        double mu = 0.0, var = 0.0, rs;
-        for (k = 0; k < D; k++) mu += xr[k];
-        mu /= D;
-        for (k = 0; k < D; k++) var += ((double)xr[k] - mu) * ((double)xr[k] - mu);
-        var /= D;
-        rs = 1.0 / sqrt(var + n->eps);
-        n->mean.data[r] = (float)mu;
-        n->rstd.data[r] = (float)rs;
-        for (k = 0; k < D; k++) {
-            xh[k] = (float)(((double)xr[k] - mu) * rs);
-            yr[k] = n->g.data[k] * xh[k] + n->b.data[k];
-        }
-    }
+    px = nmz__r(be, x);
+    pg = nmz__r(be, &n->g);
+    pb = nmz__r(be, &n->b);
+    py = nmz__w(be, y);
+    pxh = nmz__w(be, &n->xhat);
+    pm = nmz__w(be, &n->mean);
+    pr = nmz__w(be, &n->rstd);
+    if (!px || !pg || !pb || !py || !pxh || !pm || !pr) return nmz__op_failed();
+    if ((s = be->layernorm_forward(be, rows, D, n->eps, px, pg, pb, py, pxh, pm, pr)) != NMZ_OK) return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_scalar sc[1] = {{"epsilon", n->eps}};
         nmz_trace_item it[7] = {{"x", x}, {"mean", &n->mean}, {"rstd", &n->rstd}, {"x_hat", &n->xhat},
@@ -319,37 +432,28 @@ static nmz_status ln_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, c
 static nmz_status ln_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tensor *y, const nmz_tensor *dy,
                               nmz_tensor *dx, const nmz_ctx *ctx) {
     ln_layer *n = l->self;
+    const nmz_backend *be = ctx->backend;
     const int D = n->D;
-    size_t rows = x->size / (size_t)D, r;
-    double *ag = n->acc, *ab = n->acc + D;
-    int k, tracing = NMZ_TRACING(ctx);
+    size_t rows = x->size / (size_t)D;
+    int tracing = NMZ_TRACING(ctx);
+    const float *pdy, *pxh, *pr, *pg;
+    float *pdx = NULL, *pdg, *pdb, *pdxh = NULL;
     nmz_status s;
     (void)y;
     if (n->xhat.size != x->size) return nmz__fail(NMZ_ERR_STATE, "layernorm: backward without a matching forward");
-    if (tracing && (s = shape_like(&n->dxhat, x)) != NMZ_OK) return s;
-    for (k = 0; k < 2 * D; k++) n->acc[k] = 0.0;
-    for (r = 0; r < rows; r++) {
-        const float *g = dy->data + r * D, *xh = n->xhat.data + r * D;
-        double m1 = 0.0, m2 = 0.0, rs = n->rstd.data[r];
-        for (k = 0; k < D; k++) {
-            double dxh = (double)g[k] * n->g.data[k];
-            ag[k] += (double)g[k] * xh[k];
-            ab[k] += g[k];
-            m1 += dxh;
-            m2 += dxh * xh[k];
-            if (tracing) n->dxhat.data[r * D + k] = (float)dxh;
-        }
-        m1 /= D;
-        m2 /= D;
-        if (dx) {
-            float *o = dx->data + r * D;
-            for (k = 0; k < D; k++) o[k] = (float)(rs * ((double)g[k] * n->g.data[k] - m1 - xh[k] * m2));
-        }
+    if (tracing) {
+        if ((s = shape_like(&n->dxhat, x)) != NMZ_OK) return s;
+        if (!(pdxh = nmz__w(be, &n->dxhat))) return nmz__op_failed();
     }
-    for (k = 0; k < D; k++) {
-        n->dg.data[k] += (float)ag[k];
-        n->db.data[k] += (float)ab[k];
-    }
+    pdy = nmz__r(be, dy);
+    pxh = nmz__r(be, &n->xhat);
+    pr = nmz__r(be, &n->rstd);
+    pg = nmz__r(be, &n->g);
+    pdg = nmz__u(be, &n->dg);
+    pdb = nmz__u(be, &n->db);
+    if (dx) pdx = nmz__w(be, dx);
+    if (!pdy || !pxh || !pr || !pg || !pdg || !pdb || (dx && !pdx)) return nmz__op_failed();
+    if ((s = be->layernorm_backward(be, rows, D, pdy, pxh, pr, pg, pdx, pdg, pdb, pdxh)) != NMZ_OK) return s;
     if (tracing) {
         nmz_trace_item it[5] = {{"dL/dy", dy}, {"dL/dx_hat", &n->dxhat}, {"dL/dg", &n->dg}, {"dL/db", &n->db},
                                 {"dL/dx", dx}};
@@ -396,13 +500,19 @@ static void ln_destroy(nmz_layer *l) {
     nmz_tensor_free(&n->mean);
     nmz_tensor_free(&n->rstd);
     nmz_tensor_free(&n->dxhat);
-    free(n->acc);
     free(n);
+}
+
+static int ln_buffers(nmz_layer *l, nmz_tensor **out, int max) {
+    ln_layer *n = l->self;
+    nmz_tensor *all[] = {&n->xhat, &n->mean, &n->rstd, &n->dxhat};
+    return nmz__list(out, max, (int)(sizeof all / sizeof all[0]), all);
 }
 
 const nmz_layer_ops nmz__layernorm_ops = {"layernorm",    ln_setup, ln_init, ln_forward, ln_backward,
                                           ln_param_count, ln_param, ln_save, ln_load,    ln_describe,
-                                          ln_destroy,     NULL,     0,       NULL};
+                                          ln_destroy,     NULL,     NMZ_LAYER_BACKEND, NULL,
+                                          ln_buffers};
 
 nmz_layer *nmz_layer_layernorm(void) {
     ln_layer *n = calloc(1, sizeof *n);
@@ -461,20 +571,32 @@ static nmz_status ffn_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
 
 static nmz_status ffn_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, const nmz_ctx *ctx) {
     ffn_layer *f = l->self;
+    const nmz_backend *be = ctx->backend;
     const int B = x->shape[0], T = x->shape[1], rows = B * T;
     int shape[3];
-    size_t e;
+    const float *px, *pW1, *pb1, *pW2, *pb2;
+    float *pz, *pa, *py;
     nmz_status s;
     shape[0] = B;
     shape[1] = T;
     shape[2] = f->F;
     if ((s = nmz_tensor_reshape(&f->z, 3, shape)) != NMZ_OK || (s = nmz_tensor_reshape(&f->a, 3, shape)) != NMZ_OK)
         return s;
-    if ((s = nmz_matmul(rows, f->F, f->D, x->data, f->W1.data, f->z.data, 0)) != NMZ_OK) return s;
-    nmz__add_rows(f->z.data, rows, f->F, f->b1.data);
-    for (e = 0; e < f->z.size; e++) f->a.data[e] = nmz_act_apply(f->act, f->z.data[e], 0.0f);
-    if ((s = nmz_matmul(rows, f->D, f->F, f->a.data, f->W2.data, y->data, 0)) != NMZ_OK) return s;
-    nmz__add_rows(y->data, rows, f->D, f->b2.data);
+    px = nmz__r(be, x);
+    pW1 = nmz__r(be, &f->W1);
+    pb1 = nmz__r(be, &f->b1);
+    pW2 = nmz__r(be, &f->W2);
+    pb2 = nmz__r(be, &f->b2);
+    pz = nmz__w(be, &f->z);
+    pa = nmz__w(be, &f->a);
+    py = nmz__w(be, y);
+    if (!px || !pW1 || !pb1 || !pW2 || !pb2 || !pz || !pa || !py) return nmz__op_failed();
+    if ((s = be->gemm(be, 0, rows, f->F, f->D, px, f->D, pW1, f->F, pz, f->F)) != NMZ_OK ||
+        (s = be->add_bias(be, (size_t)rows, f->F, pz, pb1)) != NMZ_OK ||
+        (s = be->act_forward(be, f->act, 0.0f, f->z.size, pz, pa)) != NMZ_OK ||
+        (s = be->gemm(be, 0, rows, f->D, f->F, pa, f->F, pW2, f->D, py, f->D)) != NMZ_OK ||
+        (s = be->add_bias(be, (size_t)rows, f->D, py, pb2)) != NMZ_OK)
+        return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_item it[6] = {{"x", x}, {"W1", &f->W1}, {"z", &f->z}, {"a", &f->a}, {"W2", &f->W2}, {"y", y}};
         nmz_trace_emit(ctx, NMZ_TRACE_FORWARD, "ffn", NULL, 0, NULL, 6, it);
@@ -485,25 +607,44 @@ static nmz_status ffn_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, 
 static nmz_status ffn_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tensor *y, const nmz_tensor *dy,
                                nmz_tensor *dx, const nmz_ctx *ctx) {
     ffn_layer *f = l->self;
+    const nmz_backend *be = ctx->backend;
     const int rows = x->shape[0] * x->shape[1];
-    size_t e;
+    const float *px, *pdy, *pa, *pz, *pW1, *pW2;
+    float *pdW1, *pdb1, *pdW2, *pdb2, *pdz, *pdx = NULL;
     nmz_status s;
     (void)y;
     if (f->z.size != (size_t)rows * f->F) return nmz__fail(NMZ_ERR_STATE, "ffn: backward without a matching forward");
-    if ((s = nmz_matmul(f->F, f->D, rows, f->a.data, dy->data, f->dW2.data, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE)) != NMZ_OK ||
-        (s = nmz__colsum_add(dy->data, rows, f->D, f->db2.data)) != NMZ_OK)
-        return s;
     if ((s = shape_like(&f->dz, &f->z)) != NMZ_OK) return s;
-    if ((s = nmz_matmul(rows, f->F, f->D, dy->data, f->W2.data, f->dz.data, NMZ_MM_TRANS_B)) != NMZ_OK) return s;
+    px = nmz__r(be, x);
+    pdy = nmz__r(be, dy);
+    pa = nmz__r(be, &f->a);
+    pz = nmz__r(be, &f->z);
+    pW1 = nmz__r(be, &f->W1);
+    pW2 = nmz__r(be, &f->W2);
+    pdW1 = nmz__u(be, &f->dW1);
+    pdb1 = nmz__u(be, &f->db1);
+    pdW2 = nmz__u(be, &f->dW2);
+    pdb2 = nmz__u(be, &f->db2);
+    pdz = nmz__w(be, &f->dz);
+    if (dx) pdx = nmz__w(be, dx);
+    if (!px || !pdy || !pa || !pz || !pW1 || !pW2 || !pdW1 || !pdb1 || !pdW2 || !pdb2 || !pdz || (dx && !pdx))
+        return nmz__op_failed();
+    if ((s = be->gemm(be, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE, f->F, f->D, rows, pa, f->F, pdy, f->D, pdW2, f->D)) !=
+            NMZ_OK ||
+        (s = be->colsum_add(be, (size_t)rows, f->D, pdy, pdb2)) != NMZ_OK)
+        return s;
+    if ((s = be->gemm(be, NMZ_MM_TRANS_B, rows, f->F, f->D, pdy, f->D, pW2, f->D, pdz, f->F)) != NMZ_OK) return s;
     if (NMZ_TRACING(ctx)) { /* dz holds ∂L/∂a for a moment */
         nmz_trace_item it[2] = {{"dL/dy", dy}, {"dL/da", &f->dz}};
         nmz_trace_emit(ctx, NMZ_TRACE_BACKWARD, "ffn", NULL, 0, NULL, 2, it);
+        if (!(pdz = nmz__u(be, &f->dz))) return nmz__op_failed(); /* the trace may have moved it to the host */
     }
-    for (e = 0; e < f->dz.size; e++) f->dz.data[e] *= nmz_act_derivative(f->act, f->z.data[e], 0.0f);
-    if ((s = nmz_matmul(f->D, f->F, rows, x->data, f->dz.data, f->dW1.data, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE)) != NMZ_OK ||
-        (s = nmz__colsum_add(f->dz.data, rows, f->F, f->db1.data)) != NMZ_OK)
+    if ((s = be->act_backward(be, f->act, 0.0f, f->dz.size, pz, pdz, pdz, NULL)) != NMZ_OK) return s;
+    if ((s = be->gemm(be, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE, f->D, f->F, rows, px, f->D, pdz, f->F, pdW1, f->F)) !=
+            NMZ_OK ||
+        (s = be->colsum_add(be, (size_t)rows, f->F, pdz, pdb1)) != NMZ_OK)
         return s;
-    if (dx && (s = nmz_matmul(rows, f->D, f->F, f->dz.data, f->W1.data, dx->data, NMZ_MM_TRANS_B)) != NMZ_OK) return s;
+    if (dx && (s = be->gemm(be, NMZ_MM_TRANS_B, rows, f->D, f->F, pdz, f->F, pW1, f->F, pdx, f->D)) != NMZ_OK) return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_item it[2] = {{"dL/dz", &f->dz}, {"dL/dx", dx}};
         nmz_trace_emit(ctx, NMZ_TRACE_BACKWARD, "ffn", NULL, 0, NULL, dx ? 2 : 1, it);
@@ -557,9 +698,16 @@ static void ffn_destroy(nmz_layer *l) {
     free(f);
 }
 
+static int ffn_buffers(nmz_layer *l, nmz_tensor **out, int max) {
+    ffn_layer *f = l->self;
+    nmz_tensor *all[] = {&f->z, &f->a, &f->dz};
+    return nmz__list(out, max, (int)(sizeof all / sizeof all[0]), all);
+}
+
 const nmz_layer_ops nmz__ffn_ops = {"ffn",           ffn_setup, ffn_init, ffn_forward, ffn_backward,
                                     ffn_param_count, ffn_param, ffn_save, ffn_load,    ffn_describe,
-                                    ffn_destroy,     NULL,      0,        NULL};
+                                    ffn_destroy,     NULL,      NMZ_LAYER_BACKEND, NULL,
+                                    ffn_buffers};
 
 nmz_layer *nmz_layer_ffn(int hidden, nmz_act act) {
     ffn_layer *f;
@@ -650,18 +798,40 @@ static nmz_status block_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) 
 }
 
 /* r = o ⊙ mask (training with dropout) or o */
-static void residual_dropout(const nmz_tensor *o, nmz_tensor *mask, nmz_tensor *r, float rate, const nmz_ctx *ctx) {
-    size_t e;
+static nmz_status residual_dropout(const nmz_tensor *o, nmz_tensor *mask, nmz_tensor *r, float rate,
+                                   const nmz_ctx *ctx) {
+    const nmz_backend *be = ctx->backend;
+    nmz_status s;
     if (ctx->training && rate > 0.0f) {
-        const float keep = 1.0f / (1.0f - rate);
-        for (e = 0; e < o->size; e++) {
-            mask->data[e] = nmz_rng_uniform(ctx->rng) < rate ? 0.0f : keep;
-            r->data[e] = o->data[e] * mask->data[e];
-        }
-    } else {
-        memcpy(r->data, o->data, o->size * sizeof(float));
-        mask->size = 0; /* marks "no mask" for backward */
+        const float *po = nmz__r(be, o);
+        float *pm = nmz__w(be, mask), *pr = nmz__w(be, r);
+        if (!po || !pm || !pr) return nmz__op_failed();
+        if ((s = be->dropout_mask(be, o->size, rate, ctx->rng, pm)) != NMZ_OK) return s;
+        return be->mul(be, o->size, po, pm, pr);
     }
+    if ((s = copy_all(be, o, r)) != NMZ_OK) return s;
+    mask->size = 0; /* marks "no mask" for backward */
+    return NMZ_OK;
+}
+
+/* out = a + b in the backend's memory */
+static nmz_status add_t(const nmz_backend *be, const nmz_tensor *a, const nmz_tensor *b, nmz_tensor *out) {
+    const float *pa = nmz__r(be, a), *pb = nmz__r(be, b);
+    float *po = out == a || out == b ? nmz__u(be, out) : nmz__w(be, out);
+    if (!pa || !pb || !po) return nmz__op_failed();
+    return be->add(be, a->size, pa, pb, po);
+}
+
+/* out = a ⊙ mask, or a when there is no mask */
+static nmz_status masked(const nmz_backend *be, const nmz_tensor *a, const nmz_tensor *mask, nmz_tensor *out) {
+    const float *pa, *pm;
+    float *po;
+    if (!mask->size) return copy_all(be, a, out);
+    pa = nmz__r(be, a);
+    pm = nmz__r(be, mask);
+    po = nmz__w(be, out);
+    if (!pa || !pm || !po) return nmz__op_failed();
+    return be->mul(be, a->size, pa, pm, po);
 }
 
 static nmz_status block_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, const nmz_ctx *ctx) {
@@ -669,7 +839,7 @@ static nmz_status block_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y
     nmz_tensor *bufs[] = {&k->a1, &k->o1, &k->r1, &k->h, &k->a2, &k->o2, &k->r2, &k->m1, &k->m2};
     relay rl;
     nmz_ctx c;
-    size_t i, e;
+    size_t i;
     nmz_status s;
     for (i = 0; i < sizeof bufs / sizeof bufs[0]; i++)
         if ((s = shape_like(bufs[i], x)) != NMZ_OK) return s;
@@ -677,14 +847,14 @@ static nmz_status block_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y
     if ((s = k->sub[SUB_LN1]->ops->forward(k->sub[SUB_LN1], x, &k->a1, &c)) != NMZ_OK) return s;
     c = sub_ctx(ctx, &rl, SUB_ATTN);
     if ((s = k->sub[SUB_ATTN]->ops->forward(k->sub[SUB_ATTN], &k->a1, &k->o1, &c)) != NMZ_OK) return s;
-    residual_dropout(&k->o1, &k->m1, &k->r1, k->rate, ctx);
-    for (e = 0; e < x->size; e++) k->h.data[e] = x->data[e] + k->r1.data[e];
+    if ((s = residual_dropout(&k->o1, &k->m1, &k->r1, k->rate, ctx)) != NMZ_OK) return s;
+    if ((s = add_t(ctx->backend, x, &k->r1, &k->h)) != NMZ_OK) return s;
     c = sub_ctx(ctx, &rl, SUB_LN2);
     if ((s = k->sub[SUB_LN2]->ops->forward(k->sub[SUB_LN2], &k->h, &k->a2, &c)) != NMZ_OK) return s;
     c = sub_ctx(ctx, &rl, SUB_FFN);
     if ((s = k->sub[SUB_FFN]->ops->forward(k->sub[SUB_FFN], &k->a2, &k->o2, &c)) != NMZ_OK) return s;
-    residual_dropout(&k->o2, &k->m2, &k->r2, k->rate, ctx);
-    for (e = 0; e < x->size; e++) y->data[e] = k->h.data[e] + k->r2.data[e];
+    if ((s = residual_dropout(&k->o2, &k->m2, &k->r2, k->rate, ctx)) != NMZ_OK) return s;
+    if ((s = add_t(ctx->backend, &k->h, &k->r2, y)) != NMZ_OK) return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_scalar sc[1] = {{"dropout", k->rate}};
         nmz_trace_item it[5] = {{"x", x}, {"attn_out", &k->r1}, {"h", &k->h}, {"ffn_out", &k->r2}, {"y", y}};
@@ -696,30 +866,30 @@ static nmz_status block_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y
 static nmz_status block_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tensor *y, const nmz_tensor *dy,
                                  nmz_tensor *dx, const nmz_ctx *ctx) {
     block_layer *k = l->self;
+    const nmz_backend *be = ctx->backend;
     nmz_tensor *bufs[] = {&k->d_o, &k->d_a, &k->d_h, &k->d_x};
     relay rl;
     nmz_ctx c;
-    size_t i, e;
+    size_t i;
     nmz_status s;
     (void)y;
     if (k->h.size != x->size) return nmz__fail(NMZ_ERR_STATE, "block: backward without a matching forward");
     for (i = 0; i < sizeof bufs / sizeof bufs[0]; i++)
         if ((s = shape_like(bufs[i], x)) != NMZ_OK) return s;
     /* y = h + drop(ffn(LN2(h))) */
-    for (e = 0; e < dy->size; e++) k->d_o.data[e] = k->m2.size ? dy->data[e] * k->m2.data[e] : dy->data[e];
+    if ((s = masked(be, dy, &k->m2, &k->d_o)) != NMZ_OK) return s;
     c = sub_ctx(ctx, &rl, SUB_FFN);
     if ((s = k->sub[SUB_FFN]->ops->backward(k->sub[SUB_FFN], &k->a2, &k->o2, &k->d_o, &k->d_a, &c)) != NMZ_OK) return s;
     c = sub_ctx(ctx, &rl, SUB_LN2);
     if ((s = k->sub[SUB_LN2]->ops->backward(k->sub[SUB_LN2], &k->h, &k->a2, &k->d_a, &k->d_h, &c)) != NMZ_OK) return s;
-    for (e = 0; e < dy->size; e++) k->d_h.data[e] += dy->data[e]; /* + the residual path */
+    if ((s = add_t(be, &k->d_h, dy, &k->d_h)) != NMZ_OK) return s; /* + the residual path */
     /* h = x + drop(attention(LN1(x))) */
-    for (e = 0; e < dy->size; e++) k->d_o.data[e] = k->m1.size ? k->d_h.data[e] * k->m1.data[e] : k->d_h.data[e];
+    if ((s = masked(be, &k->d_h, &k->m1, &k->d_o)) != NMZ_OK) return s;
     c = sub_ctx(ctx, &rl, SUB_ATTN);
     if ((s = k->sub[SUB_ATTN]->ops->backward(k->sub[SUB_ATTN], &k->a1, &k->o1, &k->d_o, &k->d_a, &c)) != NMZ_OK) return s;
     c = sub_ctx(ctx, &rl, SUB_LN1);
     if ((s = k->sub[SUB_LN1]->ops->backward(k->sub[SUB_LN1], x, &k->a1, &k->d_a, &k->d_x, &c)) != NMZ_OK) return s;
-    if (dx)
-        for (e = 0; e < dy->size; e++) dx->data[e] = k->d_h.data[e] + k->d_x.data[e];
+    if (dx && (s = add_t(be, &k->d_h, &k->d_x, dx)) != NMZ_OK) return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_item it[3] = {{"dL/dy", dy}, {"dL/dh", &k->d_h}, {"dL/dx", dx}};
         nmz_trace_emit(ctx, NMZ_TRACE_BACKWARD, "block", NULL, 0, NULL, dx ? 3 : 2, it);
@@ -804,9 +974,23 @@ static void block_destroy(nmz_layer *l) {
     free(k);
 }
 
+/* its own residual buffers, then those of its four parts */
+static int block_buffers(nmz_layer *l, nmz_tensor **out, int max) {
+    block_layer *k = l->self;
+    nmz_tensor *all[] = {&k->a1, &k->o1, &k->r1, &k->h,   &k->a2,  &k->o2, &k->r2,
+                         &k->m1, &k->m2, &k->d_o, &k->d_a, &k->d_h, &k->d_x};
+    int n = nmz__list(out, max, (int)(sizeof all / sizeof all[0]), all), i;
+    for (i = 0; i < N_SUB; i++) {
+        nmz_layer *s = k->sub[i];
+        if (s->ops->buffers) n += s->ops->buffers(s, out + (n < max ? n : max), n < max ? max - n : 0);
+    }
+    return n;
+}
+
 const nmz_layer_ops nmz__block_ops = {"block",           block_setup, block_init, block_forward, block_backward,
                                       block_param_count, block_param, block_save, block_load,    block_describe,
-                                      block_destroy,     block_state, 0,          NULL};
+                                      block_destroy,     block_state, NMZ_LAYER_BACKEND, NULL,
+                                      block_buffers};
 
 nmz_layer *nmz_layer_block(int heads, int head_dim, int ff_hidden, nmz_act act, float dropout) {
     block_layer *k;
@@ -871,13 +1055,13 @@ static nmz_status tied_bind(nmz_layer *l, nmz_layer *const *layers, int n_layers
     (void)n_layers;
     for (i = self_index - 1; i >= 0; i--)
         if (layers[i]->ops == &nmz__embedding_ops) {
-            nmz_tensor *W = nmz_layer_param_value(layers[i], 0);
+            nmz_tensor *W = nmz__param(layers[i], 0).value;
             if (!W || W->rank != 2 || W->shape[0] != t->V || W->shape[1] != t->D)
                 return nmz__fail(NMZ_ERR_SHAPE, "tied output: the embedding is %dx%d, the output needs %dx%d (vocabulary "
                                                 "x features)",
                                  W ? W->shape[0] : 0, W ? W->shape[1] : 0, t->V, t->D);
             t->E = W;
-            t->dE = nmz_layer_param_grad(layers[i], 0);
+            t->dE = nmz__param(layers[i], 0).grad;
             t->emb_index = i;
             return NMZ_OK;
         }
@@ -893,11 +1077,20 @@ static nmz_status tied_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
 
 static nmz_status tied_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y, const nmz_ctx *ctx) {
     tied_layer *t = l->self;
+    const nmz_backend *be = ctx->backend;
     const int rows = x->shape[0] * x->shape[1];
+    const float *px, *pE, *pb;
+    float *py;
     nmz_status s;
     if (!t->E) return nmz__fail(NMZ_ERR_STATE, "tied output is not bound to an embedding (build the net first)");
-    if ((s = nmz_matmul(rows, t->V, t->D, x->data, t->E->data, y->data, NMZ_MM_TRANS_B)) != NMZ_OK) return s;
-    nmz__add_rows(y->data, rows, t->V, t->b.data);
+    px = nmz__r(be, x);
+    pE = nmz__r(be, t->E);
+    pb = nmz__r(be, &t->b);
+    py = nmz__w(be, y);
+    if (!px || !pE || !pb || !py) return nmz__op_failed();
+    if ((s = be->gemm(be, NMZ_MM_TRANS_B, rows, t->V, t->D, px, t->D, pE, t->D, py, t->V)) != NMZ_OK ||
+        (s = be->add_bias(be, (size_t)rows, t->V, py, pb)) != NMZ_OK)
+        return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_scalar sc[1] = {{"embedding_layer", t->emb_index}};
         nmz_trace_item it[4] = {{"x", x}, {"W", t->E}, {"b", &t->b}, {"z", y}};
@@ -909,15 +1102,26 @@ static nmz_status tied_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y,
 static nmz_status tied_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tensor *y, const nmz_tensor *dy,
                                 nmz_tensor *dx, const nmz_ctx *ctx) {
     tied_layer *t = l->self;
+    const nmz_backend *be = ctx->backend;
     const int rows = x->shape[0] * x->shape[1];
+    const float *px, *pdy, *pE;
+    float *pdE, *pdb, *pdx = NULL;
     nmz_status s;
     (void)y;
     if (!t->E) return nmz__fail(NMZ_ERR_STATE, "tied output is not bound to an embedding");
+    px = nmz__r(be, x);
+    pdy = nmz__r(be, dy);
+    pE = nmz__r(be, t->E);
+    pdE = nmz__u(be, t->dE);
+    pdb = nmz__u(be, &t->db);
+    if (dx) pdx = nmz__w(be, dx);
+    if (!px || !pdy || !pE || !pdE || !pdb || (dx && !pdx)) return nmz__op_failed();
     /* ∂L/∂E += ∂L/∂zᵀ·x: ADDED to what the embedding itself contributes */
-    if ((s = nmz_matmul(t->V, t->D, rows, dy->data, x->data, t->dE->data, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE)) != NMZ_OK ||
-        (s = nmz__colsum_add(dy->data, rows, t->V, t->db.data)) != NMZ_OK)
+    if ((s = be->gemm(be, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE, t->V, t->D, rows, pdy, t->V, px, t->D, pdE, t->D)) !=
+            NMZ_OK ||
+        (s = be->colsum_add(be, (size_t)rows, t->V, pdy, pdb)) != NMZ_OK)
         return s;
-    if (dx && (s = nmz_matmul(rows, t->D, t->V, dy->data, t->E->data, dx->data, 0)) != NMZ_OK) return s;
+    if (dx && (s = be->gemm(be, 0, rows, t->D, t->V, pdy, t->V, pE, t->D, pdx, t->D)) != NMZ_OK) return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_item it[3] = {{"dL/dz", dy}, {"dL/dW", t->dE}, {"dL/dx", dx}};
         nmz_trace_emit(ctx, NMZ_TRACE_BACKWARD, "tied_output", NULL, 0, NULL, dx ? 3 : 2, it);
@@ -961,7 +1165,7 @@ static void tied_destroy(nmz_layer *l) {
 
 const nmz_layer_ops nmz__tied_output_ops = {"tied_output",    tied_setup, tied_init, tied_forward, tied_backward,
                                             tied_param_count, tied_param, tied_save, tied_load,    tied_describe,
-                                            tied_destroy,     NULL,       0,         tied_bind};
+                                            tied_destroy,     NULL,       NMZ_LAYER_BACKEND, tied_bind, NULL};
 
 nmz_layer *nmz_layer_tied_output(int vocab) {
     tied_layer *t;
@@ -1008,8 +1212,10 @@ size_t nmz__kink_signature(const nmz_layer *l, float *out) {
     if (!l || l->ops != &nmz__ffn_ops) return 0;
     f = l->self;
     if (f->act != NMZ_ACT_RELU && f->act != NMZ_ACT_LEAKY_RELU) return 0;
-    if (out)
-        for (e = 0; e < f->z.size; e++) out[e] = f->z.data[e] > 0.0f ? 1.0f : 0.0f;
+    if (out) {
+        const float *z = nmz__hr(&f->z);
+        for (e = 0; e < f->z.size; e++) out[e] = z[e] > 0.0f ? 1.0f : 0.0f;
+    }
     return f->z.size;
 }
 

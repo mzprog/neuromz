@@ -6,7 +6,12 @@
  *
  * backward() computes EVERY gradient first; update() changes weights in a
  * separate pass, so no gradient is ever computed from already-updated
- * weights (a v1 bug). */
+ * weights (a v1 bug).
+ *
+ * Every computation goes through the backend the net is on (net->be, which
+ * follows nmz_backend_select): layers get it in their nmz_ctx, and the
+ * optimizer and clipping call its ops. On the CPU these are the v2.0.1
+ * loops; nothing else changes (DESIGN §11). */
 #include "internal.h"
 
 #include <math.h>
@@ -53,9 +58,22 @@ static nmz_param layer_param(const nmz_layer *l, int i) {
     return l->ops->param((nmz_layer *)l, i);
 }
 
+nmz_param nmz__param(const nmz_layer *l, int i) { return layer_param(l, i); }
+
 const char *nmz_layer_param_name(const nmz_layer *l, int i) { return layer_param(l, i).name; }
-nmz_tensor *nmz_layer_param_value(nmz_layer *l, int i) { return layer_param(l, i).value; }
-nmz_tensor *nmz_layer_param_grad(nmz_layer *l, int i) { return layer_param(l, i).grad; }
+/* The public accessors hand out host data the caller may change: the host
+ * copy becomes the newer one (a device copy is refreshed before its next
+ * use). */
+nmz_tensor *nmz_layer_param_value(nmz_layer *l, int i) {
+    nmz_tensor *t = layer_param(l, i).value;
+    nmz__hu(t);
+    return t;
+}
+nmz_tensor *nmz_layer_param_grad(nmz_layer *l, int i) {
+    nmz_tensor *t = layer_param(l, i).grad;
+    nmz__hu(t);
+    return t;
+}
 
 int nmz_layer_activation_kind(const nmz_layer *l) {
     if (!l || l->ops != &nmz__activation_ops) return -1;
@@ -119,6 +137,7 @@ nmz_status nmz_net_create(nmz_net **out, int input_rank, const int *input_shape,
     if (!net) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
     net->in_rank = input_rank;
     for (i = 0; i < input_rank; i++) net->in_shape[i] = input_shape[i];
+    net->be = &nmz__cpu_backend;
     net->loss = NMZ_LOSS_MSE;
     net->train = nmz_train_defaults();
     net->opt_kind = -1;
@@ -159,6 +178,8 @@ void nmz_net_free(nmz_net *net) {
     nmz__norm_free(net);
     nmz_tensor_free(&net->in1);
     nmz_tensor_free(&net->out1);
+    nmz_tensor_free(&net->norm_t);
+    nmz_tensor_free(&net->tgt);
     nmz_vocab_free(net->vocab);
     free(net->data_path);
     free(net->item_hash);
@@ -257,7 +278,7 @@ nmz_status nmz__net_finish_build(nmz_net *net) {
     for (i = 0, k = 0; i < net->n_layers; i++) {
         int np = nmz_layer_param_count(net->layers[i]);
         for (j = 0; j < np; j++, k++) {
-            nmz_tensor *v = nmz_layer_param_value(net->layers[i], j);
+            nmz_tensor *v = layer_param(net->layers[i], j).value;
             net->param_refs[k].layer = i;
             net->param_refs[k].index = j;
             if ((s = nmz_tensor_init(&net->opt_m[k], v->rank, v->shape)) != NMZ_OK) return s;
@@ -335,7 +356,7 @@ size_t nmz_net_param_count(const nmz_net *net) {
     if (!net) return 0;
     for (i = 0; i < net->n_layers; i++)
         for (j = 0; j < nmz_layer_param_count(net->layers[i]); j++)
-            total += nmz_layer_param_value(net->layers[i], j)->size;
+            total += layer_param(net->layers[i], j).value->size;
     return total;
 }
 
@@ -375,18 +396,22 @@ void nmz_net_set_trace(nmz_net *net, nmz_trace_fn fn, void *user) {
     net->trace_user = user;
 }
 
+/* host copies are brought up to date (the tensors are the net's own) */
 const nmz_tensor *nmz_net_input_grad(const nmz_net *net) {
     if (!net || !net->have_grads) return NULL;
+    nmz__hr(&net->dacts[0]);
     return &net->dacts[0];
 }
 
 const nmz_tensor *nmz_net_activation(const nmz_net *net, int i) {
     if (!net || !net->have_forward || i < -1 || i >= net->n_layers) return NULL;
+    nmz__hr(&net->acts[i + 1]);
     return &net->acts[i + 1];
 }
 
 const nmz_tensor *nmz_net_activation_grad(const nmz_net *net, int i) {
     if (!net || !net->have_grads || i < -1 || i >= net->n_layers) return NULL;
+    nmz__hr(&net->dacts[i + 1]);
     return &net->dacts[i + 1];
 }
 
@@ -408,6 +433,7 @@ int nmz_layer_param_decays(const nmz_layer *l, int i, int decay_all) {
  * follows it will increment step to that number). */
 static nmz_ctx make_ctx_step(nmz_net *net, int layer, int training, long step) {
     nmz_ctx c;
+    c.backend = net->be;
     c.rng = &net->rng;
     c.carry = net->carry;
     c.trace = net->trace;
@@ -420,6 +446,7 @@ static nmz_ctx make_ctx_step(nmz_net *net, int layer, int training, long step) {
 
 static nmz_ctx make_ctx(nmz_net *net, int layer, int training) {
     nmz_ctx c;
+    c.backend = net->be;
     c.rng = &net->rng;
     c.carry = net->carry;
     c.trace = net->trace;
@@ -452,12 +479,115 @@ static int input_fits(const nmz_net *net, const nmz_tensor *x) {
     return 1;
 }
 
+/* ------------------------------------------------------------- backends */
+
+/* Give device memory back: the activations and the layers' caches (keep:
+ * their contents come to the host first) and, unless only_buffers, the
+ * parameters, gradients and optimizer state (always kept). */
+static void release_device(nmz_net *net, int only_buffers, int keep) {
+    int i, j, n;
+    for (i = 0; net->acts && i <= net->n_layers; i++) {
+        nmz__tensor_drop_device(&net->acts[i], keep);
+        nmz__tensor_drop_device(&net->dacts[i], keep);
+    }
+    for (i = 0; i < 6; i++) nmz__tensor_drop_device(&net->scratch[i], keep);
+    nmz__tensor_drop_device(&net->tgt, keep);
+    for (i = 0; i < net->n_layers; i++) {
+        nmz_layer *l = net->layers[i];
+        nmz_tensor *buf[64];
+        if (!l->ops->buffers) continue;
+        n = l->ops->buffers(l, buf, 64);
+        for (j = 0; j < n && j < 64; j++) nmz__tensor_drop_device(buf[j], keep);
+    }
+    if (only_buffers) return;
+    for (i = 0; i < net->n_params; i++) {
+        nmz__tensor_to_host(&net->opt_m[i]);
+        nmz__tensor_to_host(&net->opt_v[i]);
+    }
+    for (i = 0; i < net->n_layers; i++)
+        for (j = 0; j < nmz_layer_param_count(net->layers[i]); j++) {
+            nmz_param p = layer_param(net->layers[i], j);
+            nmz__tensor_to_host(p.value);
+            nmz__tensor_to_host(p.grad);
+        }
+    nmz__tensor_to_host(&net->norm_t);
+}
+
+/* Moving to a host backend: every tensor comes back to the host. */
+static void to_host(nmz_net *net) { release_device(net, 0, 1); }
+
+void nmz__net_drop_buffers(nmz_net *net) {
+    if (net && !net->be->host_memory) release_device(net, 1, 0);
+}
+
+const nmz_backend *nmz__net_backend(nmz_net *net) {
+    const nmz_backend *be = nmz_backend_current();
+    if (net->be != be) {
+        if (!net->be->host_memory && be->host_memory) to_host(net);
+        net->be = be;
+    }
+    return be;
+}
+
+/* the normalization's offset and scale in be's memory */
+static nmz_status norm_ptrs(nmz_net *net, const nmz_backend *be, const float **off, const float **sc) {
+    if (be->host_memory) {
+        *off = net->norm_offset;
+        *sc = net->norm_scale;
+        return NMZ_OK;
+    }
+    if (net->norm_t_ver != net->norm_ver || net->norm_t.size != (size_t)2 * net->norm_groups) {
+        int n = 2 * net->norm_groups;
+        nmz_status s;
+        float *h;
+        if ((s = nmz_tensor_reshape(&net->norm_t, 1, &n)) != NMZ_OK) return s;
+        h = nmz__hw(&net->norm_t);
+        memcpy(h, net->norm_offset, (size_t)net->norm_groups * sizeof(float));
+        memcpy(h + net->norm_groups, net->norm_scale, (size_t)net->norm_groups * sizeof(float));
+        net->norm_t_ver = net->norm_ver;
+    }
+    *off = nmz__r(be, &net->norm_t);
+    *sc = *off ? *off + net->norm_groups : NULL;
+    return *off ? NMZ_OK : nmz__op_failed();
+}
+
+static nmz_status norm_apply(nmz_net *net, const nmz_backend *be, nmz_tensor *t, int grad) {
+    const float *off, *sc;
+    size_t per = 1, div = 1;
+    float *p;
+    nmz_status s;
+    int i;
+    if (!net->norm_fitted || net->norm == NMZ_NORM_NONE) return NMZ_OK;
+    for (i = 0; i < net->in_rank; i++) per *= (size_t)net->in_shape[i];
+    if (net->in_rank == 3) div = (size_t)net->in_shape[1] * net->in_shape[2];
+    if ((s = norm_ptrs(net, be, &off, &sc)) != NMZ_OK) return s;
+    if (!(p = nmz__u(be, t))) return nmz__op_failed();
+    return be->norm_apply(be, t->size, per, div, net->norm_groups, off, sc, p, grad);
+}
+
+/* A layer without NMZ_LAYER_BACKEND is host code: on a device, its input
+ * (and gradient) and parameters come to the host first, and what it writes
+ * is marked as changed there. */
+static int host_layer(const nmz_net *net, const nmz_layer *l) {
+    return !net->be->host_memory && !(l->ops->flags & NMZ_LAYER_BACKEND);
+}
+
+static void layer_params_to_host(nmz_layer *l, int grads) {
+    int j;
+    for (j = 0; j < nmz_layer_param_count(l); j++) {
+        nmz_param p = layer_param(l, j);
+        nmz__hu(p.value);
+        if (grads) nmz__hu(p.grad);
+    }
+}
+
 nmz_status nmz__net_forward(nmz_net *net, const nmz_tensor *x, int training,
                             const nmz_tensor **y) {
     int i, shape[NMZ_MAX_RANK];
     nmz_status s;
     if (!net || !x) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
     if ((s = nmz_net_build(net)) != NMZ_OK) return s;
+    nmz__net_backend(net);
     if (!input_fits(net, x)) {
         if (nmz_net_is_sequence(net))
             return nmz__fail(NMZ_ERR_SHAPE, "a sequence net needs input of shape [batch, steps%s]",
@@ -466,12 +596,15 @@ nmz_status nmz__net_forward(nmz_net *net, const nmz_tensor *x, int training,
                          nmz_net_input_size(net), x->rank >= 1 ? (int)(x->size / (size_t)x->shape[0]) : 0);
     }
     net->have_forward = net->have_grads = 0;
+    if (!net->be->host_memory && !x->dev && (net->layers[0]->ops->flags & NMZ_LAYER_DISCRETE_INPUT) &&
+        (s = nmz__check_ids(net->layers[0], x->data, x->size)) != NMZ_OK) /* a device kernel cannot report a bad id */
+        return s;
     if ((s = nmz_tensor_copy(&net->acts[0], x)) != NMZ_OK) return s;
     if (net->norm != NMZ_NORM_NONE) {
         if (!net->norm_fitted)
             return nmz__fail(NMZ_ERR_STATE, "input normalization (%s) is not fitted yet: train the network first "
                                             "(or call nmz_net_fit_normalization)", nmz_norm_name(net->norm));
-        nmz__norm_apply(net, &net->acts[0]);
+        if ((s = norm_apply(net, net->be, &net->acts[0], 0)) != NMZ_OK) return s;
         if (net->trace) {
             nmz_ctx ctx = make_ctx_step(net, -1, training, net->step + 1);
             nmz_tensor off, sc;
@@ -495,6 +628,12 @@ nmz_status nmz__net_forward(nmz_net *net, const nmz_tensor *x, int training,
             NMZ_OK)
             return s;
         if ((s = nmz_tensor_reshape(&net->acts[i + 1], l->out_rank + 1, shape)) != NMZ_OK) return s;
+        if (host_layer(net, l)) {
+            nmz__hr(&net->acts[i]);
+            layer_params_to_host(l, 0);
+            nmz__hw(&net->acts[i + 1]);
+            ctx.backend = &nmz__cpu_backend;
+        }
         if ((s = l->ops->forward(l, &net->acts[i], &net->acts[i + 1], &ctx)) != NMZ_OK) return s;
     }
     net->have_forward = 1;
@@ -503,7 +642,9 @@ nmz_status nmz__net_forward(nmz_net *net, const nmz_tensor *x, int training,
 }
 
 nmz_status nmz_net_forward(nmz_net *net, const nmz_tensor *x, const nmz_tensor **y) {
-    return nmz__net_forward(net, x, 0, y);
+    nmz_status s = nmz__net_forward(net, x, 0, y);
+    if (s == NMZ_OK && y) nmz__hr(*y); /* the caller reads the output on the host */
+    return s;
 }
 
 nmz_status nmz_net_forward_mode(nmz_net *net, const nmz_tensor *x, int training, const nmz_tensor **y) {
@@ -511,6 +652,7 @@ nmz_status nmz_net_forward_mode(nmz_net *net, const nmz_tensor *x, int training,
     if (!net) return nmz__fail(NMZ_ERR_ARG, "net is NULL");
     s = nmz__net_forward(net, x, training != 0, y);
     net->training = training != 0; /* the backward pass that follows is traced with the same mode */
+    if (s == NMZ_OK && y) nmz__hr(*y);
     return s;
 }
 
@@ -524,9 +666,9 @@ nmz_status nmz_net_predict(nmz_net *net, const float *x, float *y) {
                                               "nmz_net_forward with [1, steps] or nmz_net_generate");
     if ((s = shape_with_batch(1, net->in_rank, net->in_shape, shape)) != NMZ_OK) return s;
     if ((s = nmz_tensor_reshape(&net->in1, net->in_rank + 1, shape)) != NMZ_OK) return s;
-    memcpy(net->in1.data, x, net->in1.size * sizeof(float));
+    memcpy(nmz__hw(&net->in1), x, net->in1.size * sizeof(float));
     if ((s = nmz_net_forward(net, &net->in1, &out)) != NMZ_OK) return s;
-    memcpy(y, out->data, out->size * sizeof(float));
+    memcpy(y, nmz__hr(out), out->size * sizeof(float));
     return NMZ_OK;
 }
 
@@ -539,14 +681,25 @@ static nmz_status check_target(const nmz_net *net, const nmz_tensor *t) {
     return NMZ_OK;
 }
 
+/* The target in the net's memory: a caller's host tensor is copied into the
+ * net (never given a device copy of its own: the caller owns it). */
+static const nmz_tensor *target_on(nmz_net *net, const nmz_tensor *t, nmz_status *s) {
+    *s = NMZ_OK;
+    if (net->be->host_memory || t->dev) return t;
+    *s = nmz_tensor_copy(&net->tgt, t);
+    return &net->tgt;
+}
+
 nmz_status nmz_net_compute_loss(nmz_net *net, const nmz_tensor *t, double *loss) {
     const nmz_tensor *z;
     nmz_status s;
     if (!net || !loss) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
     if (!net->have_forward) return nmz__fail(NMZ_ERR_STATE, "call forward before computing the loss");
     if ((s = check_target(net, t)) != NMZ_OK) return s;
+    t = target_on(net, t, &s);
+    if (s != NMZ_OK) return s;
     z = nmz__net_fused_ce(net) ? &net->acts[net->n_layers - 1] : NULL;
-    return nmz__loss_value(net->loss, &net->acts[net->n_layers], t, z, loss);
+    return nmz__loss_value(net->be, net->loss, &net->acts[net->n_layers], t, z, loss);
 }
 
 nmz_status nmz_net_backward(nmz_net *net, const nmz_tensor *t, double *loss) {
@@ -559,16 +712,22 @@ nmz_status nmz_net_backward(nmz_net *net, const nmz_tensor *t, double *loss) {
     if ((s = check_target(net, t)) != NMZ_OK) return s;
     y = &net->acts[net->n_layers];
     fused = nmz__net_fused_ce(net);
-    net->step++;
-
-    /* 1. zero every gradient: layers ADD into them */
-    for (i = 0; i < net->n_params; i++)
-        nmz_tensor_zero(nmz_layer_param_grad(net->layers[net->param_refs[i].layer],
-                                             net->param_refs[i].index));
-
-    /* 2. loss and its gradient */
-    if ((s = nmz__loss_value(net->loss, y, t, fused ? &net->acts[net->n_layers - 1] : NULL, &L)) != NMZ_OK)
-        return s;
+    {
+        const nmz_tensor *user_t = t;
+        t = target_on(net, t, &s);
+        if (s != NMZ_OK) return s;
+        net->step++;
+        /* 1. zero every gradient: layers ADD into them */
+        for (i = 0; i < net->n_params; i++)
+            if ((s = nmz__zero_on(net->be, layer_param(net->layers[net->param_refs[i].layer], net->param_refs[i].index)
+                                          .grad)) != NMZ_OK)
+                return s;
+        /* 2. loss and its gradient */
+        if ((s = nmz__loss_value(net->be, net->loss, y, t, fused ? &net->acts[net->n_layers - 1] : NULL, &L)) !=
+            NMZ_OK)
+            return s;
+        t = net->trace ? user_t : t; /* trace items: the caller's own tensor */
+    }
     if (net->trace) {
         nmz_ctx ctx = make_ctx(net, -1, net->training);
         nmz_trace_scalar sc = {"L", L};
@@ -578,7 +737,9 @@ nmz_status nmz_net_backward(nmz_net *net, const nmz_tensor *t, double *loss) {
     if (fused) {
         /* ∂L/∂z for the softmax input; the softmax layer itself is skipped */
         start = net->n_layers - 2;
-        if ((s = nmz__loss_grad(net->loss, y, t, &net->dacts[net->n_layers - 1])) != NMZ_OK) return s;
+        if ((s = nmz__loss_grad(net->be, net->loss, y, target_on(net, t, &s), &net->dacts[net->n_layers - 1])) !=
+            NMZ_OK)
+            return s;
         if (net->trace) {
             nmz_ctx ctx = make_ctx(net, -1, net->training);
             nmz_trace_item it[3] = {{"p", y}, {"t", t}, {"dL/dz", &net->dacts[net->n_layers - 1]}};
@@ -586,7 +747,8 @@ nmz_status nmz_net_backward(nmz_net *net, const nmz_tensor *t, double *loss) {
         }
     } else {
         start = net->n_layers - 1;
-        if ((s = nmz__loss_grad(net->loss, y, t, &net->dacts[net->n_layers])) != NMZ_OK) return s;
+        if ((s = nmz__loss_grad(net->be, net->loss, y, target_on(net, t, &s), &net->dacts[net->n_layers])) != NMZ_OK)
+            return s;
         if (net->trace) {
             nmz_ctx ctx = make_ctx(net, -1, net->training);
             nmz_trace_item it[3] = {{"y", y}, {"t", t}, {"dL/dy", &net->dacts[net->n_layers]}};
@@ -600,10 +762,18 @@ nmz_status nmz_net_backward(nmz_net *net, const nmz_tensor *t, double *loss) {
         nmz_ctx ctx = make_ctx(net, i, net->training);
         if ((s = nmz_tensor_reshape(&net->dacts[i], net->acts[i].rank, net->acts[i].shape)) != NMZ_OK)
             return s;
+        if (host_layer(net, l)) {
+            nmz__hr(&net->acts[i]);
+            nmz__hr(&net->acts[i + 1]);
+            nmz__hr(&net->dacts[i + 1]);
+            layer_params_to_host(l, 1);
+            nmz__hw(&net->dacts[i]);
+            ctx.backend = &nmz__cpu_backend;
+        }
         s = l->ops->backward(l, &net->acts[i], &net->acts[i + 1], &net->dacts[i + 1], &net->dacts[i], &ctx);
         if (s != NMZ_OK) return s;
     }
-    nmz__norm_scale_grad(net, &net->dacts[0]); /* ∂L/∂(raw input) */
+    if ((s = norm_apply(net, net->be, &net->dacts[0], 1)) != NMZ_OK) return s; /* ∂L/∂(raw input) */
     net->have_grads = 1;
     if (loss) *loss = L;
     if (!isfinite(L)) return nmz__fail(NMZ_ERR_NUMERIC, "loss became %g (try a smaller learning rate)", L);
@@ -622,13 +792,16 @@ nmz_status nmz_net_backward(nmz_net *net, const nmz_tensor *t, double *loss) {
 
 /* fresh: treat the stored state as zero (preview after an optimizer switch) */
 static nmz_status sgd_param(nmz_net *net, int k, float lr, float mu, int apply, int fresh) {
+    const nmz_backend *be = net->be;
     nmz_layer *l = net->layers[net->param_refs[k].layer];
     int pi = net->param_refs[k].index;
-    nmz_tensor *w = nmz_layer_param_value(l, pi), *g = nmz_layer_param_grad(l, pi);
+    nmz_param pr = layer_param(l, pi);
+    nmz_tensor *w = pr.value, *g = pr.grad;
     nmz_tensor *v = &net->opt_m[k], *v_new = v;
     const nmz_tensor *v_prev = v;
+    const float *pg, *pv;
+    float *pn;
     nmz_status s;
-    size_t e;
     if (!w || !g) return nmz__fail(NMZ_ERR_STATE, "layer %d returned no parameter %d", net->param_refs[k].layer, pi);
     if (net->trace) {
         /* keep a copy of the old velocity (apply) or compute the new one aside (preview) */
@@ -639,15 +812,23 @@ static nmz_status sgd_param(nmz_net *net, int k, float lr, float mu, int apply, 
         else
             v_new = &net->scratch[0];
     }
-    for (e = 0; e < w->size; e++) v_new->data[e] = (fresh ? 0.0f : mu * v_prev->data[e]) - lr * g->data[e];
+    pg = nmz__r(be, g);
+    pv = nmz__r(be, v_prev);
+    pn = v_new == v_prev ? nmz__u(be, v_new) : nmz__w(be, v_new);
+    if (!pg || !pv || !pn) return nmz__op_failed();
+    if ((s = be->sgd_velocity(be, w->size, lr, mu, fresh, pg, pv, pn)) != NMZ_OK) return s;
     if (net->trace) {
         nmz_ctx ctx = make_ctx(net, net->param_refs[k].layer, 1);
         nmz_trace_scalar sc[2] = {{"lr", lr}, {"momentum", mu}};
         nmz_trace_item it[4] = {{"value", w}, {"grad", g}, {"velocity_prev", v_prev}, {"delta", v_new}};
         nmz_trace_emit(&ctx, NMZ_TRACE_UPDATE, nmz_layer_type(l), nmz_layer_param_name(l, pi), 2, sc, 4, it);
     }
-    if (apply)
-        for (e = 0; e < w->size; e++) w->data[e] += v->data[e];
+    if (apply) {
+        float *pw = nmz__u(be, w);
+        const float *pvel = nmz__r(be, v);
+        if (!pw || !pvel) return nmz__op_failed();
+        return be->add(be, w->size, pw, pvel, pw);
+    }
     return NMZ_OK;
 }
 
@@ -655,38 +836,39 @@ static nmz_status sgd_param(nmz_net *net, int k, float lr, float mu, int apply, 
  * step, using the weight before the step: Δ = −η·(m̂/(√v̂ + ε) + λ·w). */
 static nmz_status adam_param(nmz_net *net, int k, const nmz_train_opts *o, float lr, long t, int apply,
                              int fresh, double decay) {
+    const nmz_backend *be = net->be;
     nmz_layer *l = net->layers[net->param_refs[k].layer];
     int pi = net->param_refs[k].index, j;
-    nmz_tensor *w = nmz_layer_param_value(l, pi), *g = nmz_layer_param_grad(l, pi);
+    nmz_param pr = layer_param(l, pi);
+    nmz_tensor *w = pr.value, *g = pr.grad;
     nmz_tensor *m = &net->opt_m[k], *v = &net->opt_v[k];
     const double b1 = o->beta1, b2 = o->beta2, eps = o->epsilon;
     const double bc1 = 1.0 - pow(b1, (double)t), bc2 = 1.0 - pow(b2, (double)t);
+    float *sp[5];
     nmz_status s;
-    size_t e;
     if (!w || !g) return nmz__fail(NMZ_ERR_STATE, "layer %d returned no parameter %d", net->param_refs[k].layer, pi);
     if (!net->trace) {
+        float *pw, *pm, *pv;
+        const float *pg;
         if (!apply) return NMZ_OK;
-        for (e = 0; e < w->size; e++) { /* fast path: in place */
-            double gi = g->data[e];
-            double mi = b1 * m->data[e] + (1.0 - b1) * gi, vi = b2 * v->data[e] + (1.0 - b2) * gi * gi;
-            m->data[e] = (float)mi;
-            v->data[e] = (float)vi;
-            w->data[e] += (float)(-lr * ((mi / bc1) / (sqrt(vi / bc2) + eps) + decay * w->data[e]));
-        }
-        return NMZ_OK;
+        pw = nmz__u(be, w); /* fast path: in place */
+        pg = nmz__r(be, g);
+        pm = nmz__u(be, m);
+        pv = nmz__u(be, v);
+        if (!pw || !pg || !pm || !pv) return nmz__op_failed();
+        return be->adam_update(be, w->size, (double)lr, b1, b2, eps, bc1, bc2, decay, pw, pg, pm, pv);
     }
     /* traced (or preview): compute m, v, m̂, v̂, Δ aside, emit, then apply */
-    for (j = 0; j < 5; j++)
+    for (j = 0; j < 5; j++) {
         if ((s = nmz_tensor_reshape(&net->scratch[j], w->rank, w->shape)) != NMZ_OK) return s;
-    for (e = 0; e < w->size; e++) {
-        double gi = g->data[e], m0 = fresh ? 0.0 : m->data[e], v0 = fresh ? 0.0 : v->data[e];
-        double mi = b1 * m0 + (1.0 - b1) * gi, vi = b2 * v0 + (1.0 - b2) * gi * gi;
-        double mhat = mi / bc1, vhat = vi / bc2;
-        net->scratch[0].data[e] = (float)mi;
-        net->scratch[1].data[e] = (float)vi;
-        net->scratch[2].data[e] = (float)mhat;
-        net->scratch[3].data[e] = (float)vhat;
-        net->scratch[4].data[e] = (float)(-lr * (mhat / (sqrt(vhat) + eps) + decay * w->data[e]));
+        if (!(sp[j] = nmz__w(be, &net->scratch[j]))) return nmz__op_failed();
+    }
+    {
+        const float *pw = nmz__r(be, w), *pg = nmz__r(be, g), *pm = nmz__r(be, m), *pv = nmz__r(be, v);
+        if (!pw || !pg || !pm || !pv) return nmz__op_failed();
+        if ((s = be->adam_preview(be, w->size, (double)lr, b1, b2, eps, bc1, bc2, decay, fresh, pw, pg, pm, pv, sp[0],
+                                  sp[1], sp[2], sp[3], sp[4])) != NMZ_OK)
+            return s;
     }
     {
         nmz_ctx ctx = make_ctx(net, net->param_refs[k].layer, 1);
@@ -698,12 +880,16 @@ static nmz_status adam_param(nmz_net *net, int k, const nmz_train_opts *o, float
         nmz_trace_emit(&ctx, NMZ_TRACE_UPDATE, nmz_layer_type(l), nmz_layer_param_name(l, pi),
                        o->optimizer == NMZ_OPT_ADAMW ? 6 : 5, sc, 7, it);
     }
-    if (apply)
-        for (e = 0; e < w->size; e++) {
-            m->data[e] = net->scratch[0].data[e];
-            v->data[e] = net->scratch[1].data[e];
-            w->data[e] += net->scratch[4].data[e];
-        }
+    if (apply) {
+        size_t n = w->size;
+        float *pm = nmz__w(be, m), *pv = nmz__w(be, v), *pw = nmz__u(be, w);
+        const float *s0 = nmz__r(be, &net->scratch[0]), *s1 = nmz__r(be, &net->scratch[1]),
+                    *s4 = nmz__r(be, &net->scratch[4]);
+        if (!pm || !pv || !pw || !s0 || !s1 || !s4) return nmz__op_failed();
+        if ((s = be->copy(be, 1, n, s0, n, pm, n)) != NMZ_OK || (s = be->copy(be, 1, n, s1, n, pv, n)) != NMZ_OK)
+            return s;
+        return be->add(be, n, pw, s4, pw);
+    }
     return NMZ_OK;
 }
 
@@ -713,6 +899,7 @@ static nmz_status optimize(nmz_net *net, const nmz_train_opts *o, float lr, int 
     nmz_status s;
     if (!net || !o) return nmz__fail(NMZ_ERR_ARG, "NULL argument");
     if (!net->built) return nmz__fail(NMZ_ERR_STATE, "network is not built");
+    nmz__net_backend(net);
     if (!(lr > 0.0f) || !isfinite(lr)) return nmz__fail(NMZ_ERR_ARG, "learning rate must be > 0");
     if ((int)o->optimizer < 0 || o->optimizer >= NMZ_OPT_COUNT) return nmz__fail(NMZ_ERR_ARG, "invalid optimizer");
     if (o->optimizer == NMZ_OPT_SGD && !(o->momentum >= 0.0f && o->momentum < 1.0f))
@@ -727,8 +914,8 @@ static nmz_status optimize(nmz_net *net, const nmz_train_opts *o, float lr, int 
     if (fresh && apply) {
         /* the stored state belongs to another optimizer (or none): start over */
         for (k = 0; k < net->n_params; k++) {
-            nmz_tensor_zero(&net->opt_m[k]);
-            nmz_tensor_zero(&net->opt_v[k]);
+            if ((s = nmz__zero_on(net->be, &net->opt_m[k])) != NMZ_OK || (s = nmz__zero_on(net->be, &net->opt_v[k])) != NMZ_OK)
+                return s;
         }
         net->opt_t = 0;
         net->opt_kind = (int)o->optimizer;
@@ -786,22 +973,37 @@ int nmz_net_optimizer_state(const nmz_net *net, long *t) {
 
 nmz_status nmz_net_clip_gradients(nmz_net *net, double max_norm, double *norm, double *scale) {
     double sq = 0.0, n, f = 1.0;
+    float *stack_p[64], **gp = stack_p;
+    size_t stack_n[64], *gn = stack_n;
+    const nmz_backend *be;
+    nmz_status s = NMZ_OK;
     int k;
-    size_t e;
     if (!net || !(max_norm > 0)) return nmz__fail(NMZ_ERR_ARG, "clip norm must be > 0");
     if (!net->built) return nmz__fail(NMZ_ERR_STATE, "network is not built");
-    for (k = 0; k < net->n_params; k++) {
-        const nmz_tensor *g = nmz_layer_param_grad(net->layers[net->param_refs[k].layer], net->param_refs[k].index);
-        for (e = 0; e < g->size; e++) sq += (double)g->data[e] * g->data[e];
-    }
-    n = sqrt(sq);
-    if (n > max_norm) {
-        f = max_norm / n;
-        for (k = 0; k < net->n_params; k++) {
-            nmz_tensor *g = nmz_layer_param_grad(net->layers[net->param_refs[k].layer], net->param_refs[k].index);
-            for (e = 0; e < g->size; e++) g->data[e] = (float)(g->data[e] * f);
+    be = nmz__net_backend(net);
+    if (net->n_params > 64) {
+        gp = malloc((size_t)net->n_params * sizeof *gp);
+        gn = malloc((size_t)net->n_params * sizeof *gn);
+        if (!gp || !gn) {
+            free(gp == stack_p ? NULL : gp);
+            free(gn == stack_n ? NULL : gn);
+            return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
         }
     }
+    for (k = 0; k < net->n_params && s == NMZ_OK; k++) {
+        nmz_tensor *g = layer_param(net->layers[net->param_refs[k].layer], net->param_refs[k].index).grad;
+        gn[k] = g->size;
+        if (!(gp[k] = nmz__u(be, g)) && g->size) s = nmz__op_failed();
+    }
+    if (s == NMZ_OK && (s = be->sumsq(be, net->n_params, gp, gn, &sq)) == NMZ_OK) s = be->sync(be);
+    n = sqrt(sq);
+    if (s == NMZ_OK && n > max_norm) {
+        f = max_norm / n;
+        s = be->scale(be, net->n_params, gp, gn, f);
+    }
+    if (gp != stack_p) free(gp);
+    if (gn != stack_n) free(gn);
+    if (s != NMZ_OK) return s;
     if (net->trace) {
         nmz_ctx ctx = make_ctx(net, -1, 1);
         nmz_trace_scalar sc[3] = {{"norm", n}, {"max_norm", max_norm}, {"scale", f}};
@@ -921,7 +1123,7 @@ int nmz_net_summary(const nmz_net *net, char *buf, size_t n) {
         const nmz_layer *l = net->layers[i];
         int p, np = nmz_layer_param_count(l);
         size_t count = 0;
-        for (p = 0; p < np; p++) count += nmz_layer_param_value((nmz_layer *)l, p)->size;
+        for (p = 0; p < np; p++) count += layer_param(l, p).value->size;
         nmz_layer_describe(l, desc, sizeof desc);
         APPEND("  [%d] %-40s out=%-5d params=%zu\n", i, desc, nmz_layer_output_size(l), count);
     }

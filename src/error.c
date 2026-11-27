@@ -20,6 +20,7 @@
 #endif
 
 static NMZ_THREAD_LOCAL char g_last_error[512];
+static NMZ_THREAD_LOCAL nmz_status g_last_status;
 
 const char *nmz_status_str(nmz_status s) {
     switch (s) {
@@ -43,7 +44,24 @@ nmz_status nmz__fail(nmz_status s, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(g_last_error, sizeof g_last_error, fmt, ap);
     va_end(ap);
+    g_last_status = s;
     return s;
+}
+
+nmz_status nmz_backend_error(nmz_status s, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_last_error, sizeof g_last_error, fmt, ap);
+    va_end(ap);
+    g_last_status = s;
+    return s;
+}
+
+/* An op found NULL where it needed data: the accessor that should have
+ * provided it failed (out of device memory, say) and recorded why. */
+nmz_status nmz__op_failed(void) {
+    if (g_last_status != NMZ_OK && g_last_error[0]) return g_last_status;
+    return nmz__fail(NMZ_ERR_STATE, "internal error: a tensor has no data on the device");
 }
 
 #if defined(_WIN32)

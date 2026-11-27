@@ -201,10 +201,11 @@ static void sec_optimizer(nmz_net *net, nmz_writer *w) {
     write_u64(w, (uint64_t)net->opt_t);
     nmz_write_u32(w, (uint32_t)net->n_params);
     for (k = 0; k < net->n_params; k++) {
+        const float *m = nmz__hr(&net->opt_m[k]), *v = nmz__hr(&net->opt_v[k]);
         nmz_write_u32(w, (uint32_t)net->opt_m[k].size);
-        for (e = 0; e < net->opt_m[k].size; e++) nmz_write_f32(w, net->opt_m[k].data[e]);
+        for (e = 0; e < net->opt_m[k].size; e++) nmz_write_f32(w, m[e]);
         if (net->opt_kind == NMZ_OPT_ADAM || net->opt_kind == NMZ_OPT_ADAMW)
-            for (e = 0; e < net->opt_v[k].size; e++) nmz_write_f32(w, net->opt_v[k].data[e]);
+            for (e = 0; e < net->opt_v[k].size; e++) nmz_write_f32(w, v[e]);
     }
 }
 
@@ -305,11 +306,12 @@ static nmz_status save_body(nmz_net *net, nmz_writer *w, unsigned flags) {
         l->ops->save_config(l, w);
         nmz_write_u32(w, (uint32_t)np);
         for (j = 0; j < np; j++) {
-            const nmz_tensor *v = nmz_layer_param_value(l, j);
+            const nmz_tensor *v = nmz__param(l, j).value;
+            const float *vd = nmz__hr(v); /* from the device, if the net computed there */
             write_str(w, nmz_layer_param_name(l, j));
             nmz_write_u32(w, (uint32_t)v->rank);
             for (d = 0; d < v->rank; d++) nmz_write_u32(w, (uint32_t)v->shape[d]);
-            for (e = 0; e < v->size; e++) nmz_write_f32(w, v->data[e]);
+            for (e = 0; e < v->size; e++) nmz_write_f32(w, vd[e]);
         }
     }
     {
@@ -397,9 +399,12 @@ static nmz_status read_optimizer(nmz_reader *r, nmz_net *net) {
     for (k = 0; k < net->n_params; k++) {
         if (nmz_read_u32(r, &count) != NMZ_OK) return r->err;
         if (count != net->opt_m[k].size) return r->err = nmz__fail(NMZ_ERR_FORMAT, "optimizer state does not match the layers");
-        for (e = 0; e < count; e++) nmz_read_f32(r, &net->opt_m[k].data[e]);
-        if (kind == NMZ_OPT_ADAM || kind == NMZ_OPT_ADAMW)
-            for (e = 0; e < count; e++) nmz_read_f32(r, &net->opt_v[k].data[e]);
+        {
+            float *m = nmz__hw(&net->opt_m[k]), *v = nmz__hu(&net->opt_v[k]);
+            for (e = 0; e < count; e++) nmz_read_f32(r, &m[e]);
+            if (kind == NMZ_OPT_ADAM || kind == NMZ_OPT_ADAMW)
+                for (e = 0; e < count; e++) nmz_read_f32(r, &v[e]);
+        }
     }
     if (r->err == NMZ_OK) {
         net->opt_kind = (int)kind;
@@ -689,7 +694,7 @@ static nmz_status load_body(nmz_reader *r, nmz_net **out) {
             goto fail;
         }
         for (j = 0; j < np; j++) {
-            nmz_tensor *v = nmz_layer_param_value(layer, (int)j);
+            nmz_tensor *v = nmz__param(layer, (int)j).value;
             char *name = NULL;
             uint32_t rank = 0;
             int ok;
@@ -706,8 +711,11 @@ static nmz_status load_body(nmz_reader *r, nmz_net **out) {
                 nmz__fail(NMZ_ERR_FORMAT, "layer %u parameter %u does not match the layer's shape", i, j);
                 goto fail;
             }
-            for (e = 0; e < v->size; e++)
-                if (nmz_read_f32(r, &v->data[e]) != NMZ_OK) goto fail;
+            {
+                float *vd = nmz__hw(v);
+                for (e = 0; e < v->size; e++)
+                    if (nmz_read_f32(r, &vd[e]) != NMZ_OK) goto fail;
+            }
         }
     }
     if ((s = nmz__net_finish_build(net)) != NMZ_OK) {

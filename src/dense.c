@@ -20,7 +20,6 @@ typedef struct dense_layer {
     nmz_init init;     /* as requested (may be AUTO) */
     nmz_init resolved; /* what was actually used     */
     nmz_tensor W, b, dW, db;
-    double *acc; /* units doubles, forward accumulator */
 } dense_layer;
 
 static nmz_status dense_setup(nmz_layer *l, int in_rank, const int *in_shape, int *out_rank,
@@ -36,9 +35,6 @@ static nmz_status dense_setup(nmz_layer *l, int in_rank, const int *in_shape, in
     if ((s = nmz_tensor_init(&d->dW, 2, wshape)) != NMZ_OK) return s;
     if ((s = nmz_tensor_init(&d->b, 1, &d->units)) != NMZ_OK) return s;
     if ((s = nmz_tensor_init(&d->db, 1, &d->units)) != NMZ_OK) return s;
-    free(d->acc);
-    d->acc = malloc((size_t)d->units * sizeof *d->acc);
-    if (!d->acc) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
     *out_rank = in_rank;
     for (i = 0; i < in_rank - 1; i++) out_shape[i] = in_shape[i];
     out_shape[in_rank - 1] = d->units;
@@ -59,27 +55,80 @@ static nmz_status dense_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) 
         limit = sqrt(6.0 / d->n_in); /* Var = 2/fan_in */
     else
         limit = sqrt(6.0 / (d->n_in + d->units)); /* Var = 2/(fan_in+fan_out) */
-    for (i = 0; i < d->W.size; i++) d->W.data[i] = (float)((2.0 * nmz_rng_uniform(rng) - 1.0) * limit);
+    {
+        float *w = nmz__hw(&d->W);
+        for (i = 0; i < d->W.size; i++) w[i] = (float)((2.0 * nmz_rng_uniform(rng) - 1.0) * limit);
+    }
     nmz_tensor_zero(&d->b);
+    return NMZ_OK;
+}
+
+/* The CPU kernels: the v2.0.1 loops. The forward sums each row in double
+ * (decision 1); the weight gradient adds row by row in float. */
+nmz_status nmz__cpu_dense_forward(const nmz_backend *be, size_t rows, int n_in, int units, const float *x,
+                                  const float *W, const float *b, float *y) {
+    double stack[1024], *acc = units <= 1024 ? stack : malloc((size_t)units * sizeof *acc);
+    size_t r;
+    int i, j, n = n_in, u = units;
+    (void)be;
+    if (!acc) return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
+    for (r = 0; r < rows; r++) {
+        const float *xr = x + r * (size_t)n;
+        float *yr = y + r * (size_t)u;
+        for (j = 0; j < u; j++) acc[j] = b[j];
+        for (i = 0; i < n; i++) {
+            const float *wi = W + (size_t)i * u;
+            double xi = xr[i];
+            for (j = 0; j < u; j++) acc[j] += xi * wi[j];
+        }
+        for (j = 0; j < u; j++) yr[j] = (float)acc[j];
+    }
+    if (acc != stack) free(acc);
+    return NMZ_OK;
+}
+
+nmz_status nmz__cpu_dense_backward(const nmz_backend *be, size_t rows, int n_in, int units, const float *x,
+                                   const float *W, const float *dy, float *dW, float *db, float *dx) {
+    size_t r;
+    int i, j, n = n_in, u = units;
+    (void)be;
+    for (r = 0; r < rows; r++) {
+        const float *xr = x + r * (size_t)n;
+        const float *gr = dy + r * (size_t)u;
+        for (j = 0; j < u; j++) db[j] += gr[j];
+        for (i = 0; i < n; i++) {
+            float *dwi = dW + (size_t)i * u;
+            float xi = xr[i];
+            for (j = 0; j < u; j++) dwi[j] += xi * gr[j];
+        }
+        if (dx) {
+            float *dxr = dx + r * (size_t)n;
+            for (i = 0; i < n; i++) {
+                const float *wi = W + (size_t)i * u;
+                double s = 0.0;
+                for (j = 0; j < u; j++) s += (double)wi[j] * gr[j];
+                dxr[i] = (float)s;
+            }
+        }
+    }
     return NMZ_OK;
 }
 
 static nmz_status dense_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y,
                                 const nmz_ctx *ctx) {
     dense_layer *d = l->self;
-    size_t rows = nmz_tensor_rows(x), r;
-    int i, j, n = d->n_in, u = d->units;
-    for (r = 0; r < rows; r++) {
-        const float *xr = x->data + r * (size_t)n;
-        float *yr = y->data + r * (size_t)u;
-        for (j = 0; j < u; j++) d->acc[j] = d->b.data[j];
-        for (i = 0; i < n; i++) {
-            const float *wi = d->W.data + (size_t)i * u;
-            double xi = xr[i];
-            for (j = 0; j < u; j++) d->acc[j] += xi * wi[j];
-        }
-        for (j = 0; j < u; j++) yr[j] = (float)d->acc[j];
-    }
+    const nmz_backend *be = ctx->backend;
+    size_t rows = nmz_tensor_rows(x);
+    int n = d->n_in, u = d->units;
+    const float *px = nmz__r(be, x), *pW = nmz__r(be, &d->W), *pb = nmz__r(be, &d->b);
+    float *py = nmz__w(be, y);
+    nmz_status s;
+    if (!px || !pW || !pb || !py) return nmz__op_failed();
+    if (NMZ_FUSED(be, dense_forward))
+        s = be->dense_forward(be, rows, n, u, px, pW, pb, py);
+    else if ((s = be->gemm(be, 0, (int)rows, u, n, px, n, pW, u, py, u)) == NMZ_OK) /* z = x·W + b */
+        s = be->add_bias(be, rows, u, py, pb);
+    if (s != NMZ_OK) return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_item it[4] = {{"x", x}, {"W", &d->W}, {"b", &d->b}, {"z", y}};
         nmz_trace_emit(ctx, NMZ_TRACE_FORWARD, "dense", "", 0, NULL, 4, it);
@@ -90,28 +139,22 @@ static nmz_status dense_forward(nmz_layer *l, const nmz_tensor *x, nmz_tensor *y
 static nmz_status dense_backward(nmz_layer *l, const nmz_tensor *x, const nmz_tensor *y,
                                  const nmz_tensor *dy, nmz_tensor *dx, const nmz_ctx *ctx) {
     dense_layer *d = l->self;
-    size_t rows = nmz_tensor_rows(x), r;
-    int i, j, n = d->n_in, u = d->units;
+    const nmz_backend *be = ctx->backend;
+    size_t rows = nmz_tensor_rows(x);
+    int i, n = d->n_in, u = d->units;
+    const float *px = nmz__r(be, x), *pW = nmz__r(be, &d->W), *pdy = nmz__r(be, dy);
+    float *pdW = nmz__u(be, &d->dW), *pdb = nmz__u(be, &d->db), *pdx = dx ? nmz__w(be, dx) : NULL;
+    nmz_status s;
     (void)y;
-    for (r = 0; r < rows; r++) {
-        const float *xr = x->data + r * (size_t)n;
-        const float *gr = dy->data + r * (size_t)u;
-        for (j = 0; j < u; j++) d->db.data[j] += gr[j];
-        for (i = 0; i < n; i++) {
-            float *dwi = d->dW.data + (size_t)i * u;
-            float xi = xr[i];
-            for (j = 0; j < u; j++) dwi[j] += xi * gr[j];
-        }
-        if (dx) {
-            float *dxr = dx->data + r * (size_t)n;
-            for (i = 0; i < n; i++) {
-                const float *wi = d->W.data + (size_t)i * u;
-                double s = 0.0;
-                for (j = 0; j < u; j++) s += (double)wi[j] * gr[j];
-                dxr[i] = (float)s;
-            }
-        }
+    if (!px || !pW || !pdy || !pdW || !pdb || (dx && !pdx)) return nmz__op_failed();
+    if (NMZ_FUSED(be, dense_backward)) {
+        s = be->dense_backward(be, rows, n, u, px, pW, pdy, pdW, pdb, pdx);
+    } else { /* dW += xᵀ·δ, db += Σ δ, dx = δ·Wᵀ */
+        s = be->gemm(be, NMZ_MM_TRANS_A | NMZ_MM_ACCUMULATE, n, u, (int)rows, px, n, pdy, u, pdW, u);
+        if (s == NMZ_OK) s = be->colsum_add(be, rows, u, pdy, pdb);
+        if (s == NMZ_OK && dx) s = be->gemm(be, NMZ_MM_TRANS_B, (int)rows, n, u, pdy, u, pW, u, pdx, n);
     }
+    if (s != NMZ_OK) return s;
     if (NMZ_TRACING(ctx)) {
         nmz_trace_item it[5] = {{"dL/dz", dy}, {"x", x}, {"W", &d->W}, {"dL/dW", &d->dW},
                                 {"dL/db", &d->db}};
@@ -182,13 +225,12 @@ static void dense_destroy(nmz_layer *l) {
     nmz_tensor_free(&d->b);
     nmz_tensor_free(&d->dW);
     nmz_tensor_free(&d->db);
-    free(d->acc);
     free(d);
 }
 
 const nmz_layer_ops nmz__dense_ops = {
     "dense", dense_setup, dense_init, dense_forward, dense_backward, dense_param_count,
-    dense_param, dense_save, dense_load, dense_describe, dense_destroy, NULL, 0, NULL};
+    dense_param, dense_save, dense_load, dense_describe, dense_destroy, NULL, NMZ_LAYER_BACKEND, NULL, NULL};
 
 int nmz_layer_dense_init(const nmz_layer *l) {
     if (!l || l->ops != &nmz__dense_ops) return -1;

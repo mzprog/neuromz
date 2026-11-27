@@ -23,6 +23,9 @@ extern "C" {
 #define NMZ_VERSION_PATCH 1
 #define NMZ_VERSION_STRING "2.0.1"
 
+/* this library has nmz_backend_select & co. (2.1.0 on) */
+#define NMZ_HAVE_BACKENDS 1
+
 #define NMZ_MAX_RANK 4
 /* A per-sample dimension of 0 (first dimension only) means "any length":
  * sequence nets are created with input shape [NMZ_ANY_LENGTH] and accept
@@ -53,16 +56,25 @@ const char *nmz_last_error(void);
 /* ----------------------------------------------------------------- tensors */
 
 /* Contiguous row-major float tensor. shape[0] is the batch dimension when
- * the tensor holds a batch. */
+ * the tensor holds a batch.
+ *
+ * `data` is host memory. A tensor a device backend has computed on also
+ * has a copy in device memory (`dev`, opaque); the two are kept in sync on
+ * demand (DESIGN §11.3). Every tensor the public API hands out (outputs,
+ * parameters, gradients, trace items) has up-to-date host `data` at the
+ * time of the call; ask again after further computation. Code that writes
+ * `data` directly must do so before the next computation. */
+struct nmz_tensor_dev;
 typedef struct nmz_tensor {
     int rank;
     int shape[NMZ_MAX_RANK];
     size_t size;     /* product of shape (1 for rank 0) */
-    size_t capacity; /* allocated floats                */
+    size_t capacity; /* allocated floats in `data`      */
     float *data;
+    struct nmz_tensor_dev *dev; /* device copy (NULL: host only) */
 } nmz_tensor;
 
-#define NMZ_TENSOR_EMPTY {0, {0, 0, 0, 0}, 0, 0, NULL}
+#define NMZ_TENSOR_EMPTY {0, {0, 0, 0, 0}, 0, 0, NULL, NULL}
 
 /* Allocate a zero-filled tensor. `t` must be empty or previously freed. */
 nmz_status nmz_tensor_init(nmz_tensor *t, int rank, const int *shape);
@@ -77,6 +89,39 @@ void nmz_tensor_free(nmz_tensor *t);
 size_t nmz_tensor_rows(const nmz_tensor *t);
 /* Size of the last dimension (1 for rank 0). */
 int nmz_tensor_cols(const nmz_tensor *t);
+
+/* ----------------------------------------------------------------- devices */
+
+/* Where nets compute (DESIGN §11). The CPU is the default; a library built
+ * with -DNMZ_CUDA=ON can also compute on an NVIDIA GPU. A net computes on
+ * the backend selected when it runs (it moves when the selection changes);
+ * model files are the same whatever the device. */
+typedef struct nmz_device_info {
+    char backend[16];        /* "cpu", "cuda"                                  */
+    char device[128];        /* e.g. "NVIDIA GeForce GTX 1660 Ti", "host CPU"   */
+    int cc_major, cc_minor;  /* CUDA compute capability (0 for the CPU)        */
+    size_t mem_total;        /* device memory in bytes (0 for the CPU)         */
+    size_t mem_free;         /* of which free now                              */
+    size_t mem_used;         /* bytes this library holds on the device now     */
+    size_t mem_peak;         /* ... at most so far                              */
+    int threads;             /* CPU threads (OpenMP); 0 for a device           */
+    char note[256];          /* how it was chosen, or why it is unavailable    */
+} nmz_device_info;
+
+/* Select the backend by name: "cpu", "cuda", or "auto" (CUDA when a usable
+ * GPU is present, otherwise the CPU; the info's note says which and why).
+ * Initialises a device lazily: a CUDA build runs on machines without an
+ * NVIDIA GPU or driver, where "cuda" fails with NMZ_ERR_UNSUPPORTED and the
+ * reason, and "auto" falls back to the CPU. */
+nmz_status nmz_backend_select(const char *name);
+/* The selected backend: device name, compute capability, memory. */
+nmz_status nmz_backend_info(nmz_device_info *out);
+/* Any built-in backend by name (initialising it if needed); for one that
+ * cannot be used: NMZ_ERR_UNSUPPORTED, the reason in out->note. */
+nmz_status nmz_backend_query(const char *name, nmz_device_info *out);
+/* Backends compiled into this library ("cpu" always; "cuda" with NMZ_CUDA). */
+int nmz_backend_count(void);
+const char *nmz_backend_name(int i);
 
 /* --------------------------------------------------------------------- rng */
 

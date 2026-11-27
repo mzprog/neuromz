@@ -63,7 +63,7 @@ set(NMZ_LIB_SOURCES
     src/error.c src/tensor.c src/rng.c src/activation.c src/dense.c src/loss.c src/net.c src/train.c
     src/trace.c src/gradcheck.c src/io.c src/dataset.c src/defaults.c src/conv2d.c src/shape_layers.c
     src/normalize.c src/text.c src/recurrent.c src/lstm.c src/gru.c src/generate.c src/matmul.c
-    src/attention.c src/transformer.c)
+    src/attention.c src/transformer.c src/backend.c src/backend_cpu.c)
 add_library(neuromz STATIC ${NMZ_LIB_SOURCES})
 add_library(neuromz::neuromz ALIAS neuromz)
 set_target_properties(neuromz PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
@@ -168,7 +168,7 @@ include(CMakePackageConfigHelpers)
 install(TARGETS neuromz EXPORT neuromzTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES include/neuromz.h include/neuromz_layer.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES include/neuromz.h include/neuromz_layer.h include/neuromz_backend.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT neuromzTargets NAMESPACE neuromz:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/neuromz)
 configure_package_config_file(cmake/neuromzConfig.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/neuromzConfig.cmake
                               INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/neuromz)
