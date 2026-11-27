@@ -1352,3 +1352,13 @@ attention traces):
     bytes of the example data on Windows — the library's loader already
     reads CRLF as LF, but the CLI's text excerpts (`show gates --data`,
     `compare`) did not; they now do, and checkouts are identical anyway.
+    The PowerShell scripts must be ASCII (CI checks it): Windows
+    PowerShell 5.1 reads a script without a BOM in the ANSI code page, and
+    the Arabic words of one regex had been written as letters instead of
+    `\uXXXX` escapes; hashing uses .NET because `Get-FileHash` does not
+    load in 5.1 started from 7.
+126. **A patch release, not a moved tag.** The PowerShell problems above
+    were found by the first run of the manual `data` workflow, minutes
+    after `v2.0.0` was published. Published tags are not rewritten:
+    `v2.0.1` carries the fix, and `neuromz-cli` 2.0.1 pins it (its data
+    targets run the library's scripts from the fetched release).

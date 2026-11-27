@@ -20,8 +20,8 @@ extern "C" {
 
 #define NMZ_VERSION_MAJOR 2
 #define NMZ_VERSION_MINOR 0
-#define NMZ_VERSION_PATCH 0
-#define NMZ_VERSION_STRING "2.0.0"
+#define NMZ_VERSION_PATCH 1
+#define NMZ_VERSION_STRING "2.0.1"
 
 #define NMZ_MAX_RANK 4
 /* A per-sample dimension of 0 (first dimension only) means "any length":

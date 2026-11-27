@@ -66,7 +66,7 @@ target_link_libraries(app PRIVATE neuromz::neuromz)
 
 # or without installing:
 include(FetchContent)
-FetchContent_Declare(neuromz GIT_REPOSITORY https://github.com/mzprog/neuromz.git GIT_TAG v2.0.0)
+FetchContent_Declare(neuromz GIT_REPOSITORY https://github.com/mzprog/neuromz.git GIT_TAG v2.0.1)
 FetchContent_MakeAvailable(neuromz)
 target_link_libraries(app PRIVATE neuromz::neuromz)
 ```

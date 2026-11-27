@@ -5,6 +5,21 @@ its own changelog in [neuromz-cli](https://github.com/mzprog/neuromz-cli);
 both use the same version numbers. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.0.1] — 2026-11-27
+
+### Fixed
+- The Windows data scripts under Windows PowerShell 5.1: `get_text.ps1`
+  wrote the Arabic words of a regex as literal letters, which 5.1 reads in
+  the ANSI code page, so `kalila.txt` came out different and the script
+  stopped with a checksum error; and both scripts hashed with
+  `Get-FileHash`, which does not load when 5.1 is started from PowerShell
+  7. They now use `\uXXXX` escapes and .NET hashing, CMake prefers `pwsh`
+  when it is installed, and CI checks that the scripts stay ASCII. The
+  manual `data` workflow verified identical files on Linux, PowerShell 7
+  and Windows PowerShell 5.1.
+- `.gitattributes`: LF line endings in every checkout (Git for Windows
+  converted the example data to CRLF by default).
+
 ## [2.0.0] — 2026-11-27
 
 The first public release of v2, a rewrite of the 2017 v1 (kept in
@@ -57,4 +72,5 @@ The first public release of v2, a rewrite of the 2017 v1 (kept in
 - `bench_conv` uses C11 `timespec_get`; unsigned negations are written as
   `0u - x` (MSVC C4146); two Clang warnings in the tests.
 
+[2.0.1]: https://github.com/mzprog/neuromz/releases/tag/v2.0.1
 [2.0.0]: https://github.com/mzprog/neuromz/releases/tag/v2.0.0

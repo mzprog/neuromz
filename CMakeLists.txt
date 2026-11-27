@@ -16,7 +16,7 @@
 # CMake 3.21 is the minimum: it is the first version that passes C11/C17
 # to MSVC (/std:c11) — DESIGN decision 114.
 cmake_minimum_required(VERSION 3.21)
-project(neuromz VERSION 2.0.0 DESCRIPTION "Educational neural-network engine" LANGUAGES C)
+project(neuromz VERSION 2.0.1 DESCRIPTION "Educational neural-network engine" LANGUAGES C)
 
 set(NMZ_TOP ${PROJECT_IS_TOP_LEVEL})
 option(NMZ_OPENMP "Multi-threaded matrix products and attention heads (OpenMP)" OFF)
