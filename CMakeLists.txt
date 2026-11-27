@@ -91,7 +91,7 @@ if(NMZ_BUILD_TESTS)
   add_executable(test_neuromz
       tests/test_main.c tests/test_core.c tests/test_math.c tests/test_train.c tests/test_io.c
       tests/test_layers.c tests/test_optim.c tests/test_text.c tests/test_seq.c tests/test_gated.c
-      tests/test_transformer.c)
+      tests/test_transformer.c tests/test_backend.c)
   set_target_properties(test_neuromz PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
   target_include_directories(test_neuromz PRIVATE src)
   target_link_libraries(test_neuromz PRIVATE neuromz nmz_warnings)
