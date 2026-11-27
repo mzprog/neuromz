@@ -31,6 +31,8 @@ typedef struct nmz_ctx {
     nmz_rng *rng; /* the net's PRNG (dropout masks); never NULL in forward */
     int carry;    /* recurrent layers start from (and update) their carried
                      state instead of zeros (truncated BPTT, generation) */
+    const struct nmz_backend *backend; /* where to compute (neuromz_backend.h);
+                                          never NULL in forward/backward */
 } nmz_ctx;
 
 /* Little-endian byte writer/reader used by save_config/load_config. */
@@ -73,6 +75,11 @@ typedef struct nmz_layer_ops {
     /* Called when the net is built (and after loading), with the whole
      * stack: lets a layer use another layer's parameter (weight tying). */
     nmz_status (*bind)(nmz_layer *l, nmz_layer *const *layers, int n_layers, int self_index);
+    /* The layer's own tensors other than its parameters and gradients
+     * (caches, work space, carried state): up to max of them into out,
+     * returns how many there are. Lets the engine give their device memory
+     * back (moving to the CPU, after running out of device memory). */
+    int (*buffers)(nmz_layer *l, nmz_tensor **out, int max);
 } nmz_layer_ops;
 
 /* The layer's input is discrete (token ids): there is no input gradient,
@@ -80,6 +87,11 @@ typedef struct nmz_layer_ops {
 #define NMZ_LAYER_DISCRETE_INPUT 1u
 /* AdamW does not decay this layer's parameters (position tables). */
 #define NMZ_LAYER_NO_DECAY 2u
+/* The layer computes through ctx->backend (neuromz_backend.h), so it runs
+ * on any backend. Without this flag the layer is treated as host code: on a
+ * device the engine brings its input, output, parameters and gradients to
+ * the host before each call and marks them changed there afterwards. */
+#define NMZ_LAYER_BACKEND 4u
 
 struct nmz_layer {
     const nmz_layer_ops *ops;

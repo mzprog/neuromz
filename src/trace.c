@@ -26,7 +26,10 @@ void nmz_trace_emit(const nmz_ctx *ctx, nmz_trace_phase phase, const char *layer
     ev.n_scalars = n_scalars;
     for (i = 0; i < n_scalars; i++) ev.scalars[i] = scalars[i];
     ev.n_items = n_items;
-    for (i = 0; i < n_items; i++) ev.items[i] = items[i];
+    for (i = 0; i < n_items; i++) {
+        ev.items[i] = items[i];
+        if (items[i].t) nmz__hr(items[i].t); /* computed on a device: its numbers come to the host */
+    }
     ctx->trace(&ev, ctx->trace_user);
 }
 
@@ -44,7 +47,10 @@ void nmz_trace_emit_step(const nmz_ctx *ctx, nmz_trace_phase phase, const char *
     ev.detail = detail ? detail : "";
     if (n_items > NMZ_TRACE_MAX_ITEMS) n_items = NMZ_TRACE_MAX_ITEMS;
     ev.n_items = n_items;
-    for (i = 0; i < n_items; i++) ev.items[i] = items[i];
+    for (i = 0; i < n_items; i++) {
+        ev.items[i] = items[i];
+        if (items[i].t) nmz__hr(items[i].t);
+    }
     ctx->trace(&ev, ctx->trace_user);
 }
 

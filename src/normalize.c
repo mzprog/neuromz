@@ -116,6 +116,7 @@ void nmz__norm_free(nmz_net *net) {
     net->norm_offset = net->norm_scale = NULL;
     net->norm_groups = 0;
     net->norm_fitted = 0;
+    net->norm_ver++; /* a device copy of the values is out of date */
 }
 
 nmz_status nmz__norm_alloc(nmz_net *net, int groups) {
@@ -127,6 +128,7 @@ nmz_status nmz__norm_alloc(nmz_net *net, int groups) {
         return nmz__fail(NMZ_ERR_NOMEM, "out of memory");
     }
     net->norm_groups = groups;
+    net->norm_ver++;
     return NMZ_OK;
 }
 
@@ -135,21 +137,6 @@ static size_t sample_size(const nmz_net *net) {
     int i;
     for (i = 0; i < net->in_rank; i++) n *= (size_t)net->in_shape[i];
     return n;
-}
-
-void nmz__norm_apply(const nmz_net *net, nmz_tensor *t) {
-    size_t per = sample_size(net), e;
-    if (!net->norm_fitted || net->norm == NMZ_NORM_NONE) return;
-    for (e = 0; e < t->size; e++) {
-        int g = nmz__norm_group_of(net, e % per);
-        t->data[e] = (t->data[e] - net->norm_offset[g]) * net->norm_scale[g];
-    }
-}
-
-void nmz__norm_scale_grad(const nmz_net *net, nmz_tensor *gr) {
-    size_t per = sample_size(net), e;
-    if (!net->norm_fitted || net->norm == NMZ_NORM_NONE) return;
-    for (e = 0; e < gr->size; e++) gr->data[e] *= net->norm_scale[nmz__norm_group_of(net, e % per)];
 }
 
 nmz_status nmz_net_set_normalization(nmz_net *net, nmz_norm kind) {
@@ -209,6 +196,7 @@ nmz_status nmz_net_fit_normalization(nmz_net *net, const nmz_dataset *ds) {
         }
     }
     net->norm_fitted = 1;
+    net->norm_ver++;
     net->have_forward = net->have_grads = 0;
     s = NMZ_OK;
 out:

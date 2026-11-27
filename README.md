@@ -21,6 +21,11 @@ and every derivative is checked against numerical gradients.
   cache for generation that is bit-identical to recomputation
 * Portable model files (little-endian, versioned, CRC-32): files from every
   earlier phase still load
+* **Device backends** (2.1): the CPU by default (bit-identical to 2.0)
+  and, built with `-DNMZ_CUDA=ON`, NVIDIA GPUs — every layer type trains
+  there (cuBLAS + the library's own kernels), 10–240× faster on the models
+  below; the public API stays C, traces still work, model files are the
+  same on every device, and a CUDA build still runs without a GPU
 * Builds with GCC, Clang and MSVC (Windows natively), optional OpenMP;
   tested on Linux, Windows and macOS, under ASan + UBSan
 
@@ -49,8 +54,9 @@ cmake --build build --target bench        # slow: matrix-product and convolution
 cmake --install build --prefix /usr/local # headers, libneuromz, a CMake package
 ```
 
-Options: `-DNMZ_OPENMP=ON` (multi-threaded matrix products and attention
-heads; same results), `-DNMZ_SANITIZE=ON`, `-DNMZ_WERROR=OFF`. With MSVC,
+Options: `-DNMZ_CUDA=ON` (the GPU backend, [below](#on-an-nvidia-gpu-cuda)),
+`-DNMZ_OPENMP=ON` (multi-threaded matrix products and attention heads; same
+results), `-DNMZ_SANITIZE=ON`, `-DNMZ_WERROR=OFF`. With MSVC,
 use `--config Release` for the build and `ctest -C Release`. Requirements:
 CMake ≥ 3.21 and a C11 compiler (GCC, Clang, or MSVC from Visual Studio
 2019 16.8 on); the data targets use `sh` with `curl`/`wget` on Unix-like
@@ -61,15 +67,47 @@ runs only when the data has been downloaded.
 Using it from another CMake project:
 
 ```cmake
-find_package(neuromz 2.0 REQUIRED)          # after cmake --install
+find_package(neuromz 2.1 REQUIRED)          # after cmake --install
 target_link_libraries(app PRIVATE neuromz::neuromz)
 
 # or without installing:
 include(FetchContent)
-FetchContent_Declare(neuromz GIT_REPOSITORY https://github.com/mzprog/neuromz.git GIT_TAG v2.0.1)
+FetchContent_Declare(neuromz GIT_REPOSITORY https://github.com/mzprog/neuromz.git GIT_TAG v2.1.0)
 FetchContent_MakeAvailable(neuromz)
 target_link_libraries(app PRIVATE neuromz::neuromz)
 ```
+
+### On an NVIDIA GPU (CUDA)
+
+```bash
+cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release -DNMZ_CUDA=ON
+cmake --build build-cuda
+ctest --test-dir build-cuda -L gpu        # every op against the CPU, gradient checks, training parity
+```
+
+Building needs the CUDA Toolkit (tested with 13.5: `nvcc` and the CUDA
+runtime, which is linked statically). cuBLAS is loaded when a program first
+selects the GPU, so a CUDA build starts on any machine: without an NVIDIA
+GPU or driver, `"cuda"` fails with the reason and `"auto"` uses the CPU.
+To compute on a GPU, a machine needs the NVIDIA driver and cuBLAS
+(`cublas64_13.dll` and `cublasLt64_13.dll` on Windows, `libcublas.so.13`
+and `libcublasLt.so.13` on Linux: installed with the CUDA Toolkit, or
+placed next to the program).
+GPUs from compute capability 7.5 (Turing, the oldest CUDA 13 supports).
+`-DNMZ_CUDA_ARCHITECTURES` chooses the code compiled in: by default the GPU
+of the building machine (else 75); for a binary for others list them, e.g.
+`"75;86;89;120"` (Turing, Ampere, Ada, consumer Blackwell; add 80 and 90 for
+data-centre GPUs). Each entry also embeds PTX, so newer GPUs run it through
+the driver's JIT compiler. The kernels are compiled behind a C ABI; the
+headers stay C, and programs using the library are still compiled as C.
+
+Device memory: the library holds at most what was free on the GPU when it
+started (Windows would otherwise page GPU memory out to the host and
+training would crawl); `NMZ_CUDA_MEMORY=MiB` or `nmz_backend_memory_limit`
+change that. Running out is an error with a message ("out of GPU memory:
+… Try a smaller batch size"), never a crash, and the device stays usable.
+How a backend works and how to add another (HIP, Vulkan, OpenCL):
+[DESIGN §11](docs/DESIGN.md#11-device-backends-release-21).
 
 ## Using the library from C
 
@@ -98,6 +136,17 @@ opts.target_loss = 0;
 if (nmz_net_train(net, train, &opts, &res) != NMZ_OK)
     fprintf(stderr, "%s\n", nmz_last_error());
 nmz_net_save(net, "small_cnn.nmz");
+```
+
+Devices: nets compute on the selected backend (the CPU unless told
+otherwise); every result the API hands back is on the host.
+
+```c
+nmz_device_info di;
+nmz_backend_select("auto");               /* "cpu", "cuda", or "auto" */
+nmz_backend_info(&di);                    /* e.g. "cuda", "NVIDIA GeForce GTX 1660 Ti", 7.5, 6144 MiB */
+printf("%s: %s (%s)\n", di.backend, di.device, di.note);   /* note: why this device */
+/* ... train as above; di.mem_used / mem_peak / mem_limit: the library's GPU memory */
 ```
 
 All functions are documented in [`include/neuromz.h`](include/neuromz.h).
@@ -151,6 +200,58 @@ one thread in the same order, so results stay bit-identical (all tests
 pass in both builds). One training epoch of a 113 k-weight model: 16.2 s
 on one thread, 11.2 s on 2 threads; 4 threads (hyper-threads) 14.6 s.
 
+### On the GPU
+
+An Intel Core i5-8500 (6 cores) and an NVIDIA GeForce GTX 1660 Ti (6 GB,
+Turing, no tensor cores), Windows 11, MSVC, CUDA 13.5; `bench_device`
+([`examples/bench_device.c`](examples/bench_device.c)): the second epoch of
+each model, including the evaluation of the training and validation sets
+the CLI reports after every epoch.
+
+| model | weights | CPU, 1 thread | CPU, 6 threads (OpenMP) | GPU | GPU vs 1 / 6 threads | GPU memory, peak |
+|---|---|---|---|---|---|---|
+| MNIST CNN (the CLI's preset), 60 000 images | 27.6 k | 24.3 s | 24.4 s | **2.35 s** | 10× / 10× | 192 MiB |
+| Alice LSTM: embed 32 → lstm 64 | 32 k | 6.67 s | 6.68 s | **0.70 s** | 9.5× / 9.5× | 6 MiB |
+| Alice Transformer: 2 blocks of 32, context 128 | 32 k | 8.55 s | 4.13 s | **0.54 s** | 16× / 7.6× | 22 MiB |
+| Alice Transformer: 4 blocks of 64, context 128 | 213 k | 33.9 s | 13.7 s | **1.04 s** | 33× / 13× | 65 MiB |
+| Alice Transformer: 8 blocks of 512, context 256, batch 16 | 25.4 M | ≈ 36 min ¹ | ≈ 8.7 min ¹ | **12.2 s** (8.9 s ¹) | ≈ 240× / 58× ¹ | 3587 MiB |
+| XOR (quick mode `2 4 1`), the whole training | 17 | 0.00 s | | 0.15 s | slower | |
+| Iris (4 → 16 → 3), 100 epochs, the whole training | 131 | 0.01 s | | 0.42 s | 40× slower | |
+
+¹ updates only (no evaluation), from 3 (1 thread) and 4 (6 threads) of the
+epoch's 32 batches; on the GPU the updates are 8.9 s of the 12.2 s epoch.
+The largest model is sized to fit comfortably: 3.5 GB of the 6 GB.
+
+Where the GPU does not help: **tiny nets** train *slower* (XOR in 0.15 s
+instead of milliseconds, Iris in 0.42 s instead of 0.01 s) — starting the
+device and one kernel launch per operation cost more than all of their
+arithmetic, which is one reason the CPU stays the default.
+**Small models are launch-bound**: of the LSTM's 0.70 s epoch, 0.12 s are
+the updates and the rest is evaluating the text step by step, at 10–15 µs
+per launch under Windows' display driver. OpenMP helps only the
+Transformers (their time is in the blocked product and the attention
+heads), not the CNN or the LSTM. The GPU pays off as models grow: 10× at
+30 k weights, ≈ 240× at 25 M, where one CPU core needs over half an hour
+per epoch.
+
+Training reaches the same quality on both devices (`ctest -L gpu`; the
+same seeds; times are whole runs):
+
+| run | CPU | GPU |
+|---|---|---|
+| XOR, quick mode (172 epochs) | loss 0.0010, 100% | loss 0.0010, 100% |
+| Iris, 100 epochs | loss 0.1965, 93.33% | loss 0.1965, 93.33% |
+| MNIST CNN, 1 epoch on 20 000 images | 96.56%, 9.3 s | 96.56%, 1.2 s |
+| names RNN, 8 epochs | loss 2.1305, 10.3 s | loss 2.1305, 0.70 s |
+| Alice LSTM, 3 epochs | loss 1.8555, 19.5 s | loss 1.8555, 2.2 s |
+| Alice Transformer (32 k), 3 epochs | loss 2.4199, 24.9 s | loss 2.4199, 1.7 s |
+
+The numbers agree to 4 digits; a GPU sums in another order (cuBLAS, its
+own reductions), so they are not bit-identical. With dropout the devices
+draw different masks and train along different random paths (the 213 k
+Transformer: validation loss 2.4645 on the CPU, 2.4607 on the GPU). Two
+runs on the same GPU give identical model files.
+
 ## Results in brief
 
 Measured with the CLI's benchmark scripts ([details, samples, attention
@@ -175,7 +276,7 @@ it still receives 0.86% of the last prediction's gradient on Alice, against
 
 ## Tests
 
-`cmake --build build --target test` runs 87 unit tests (~106 000 checks) in
+`cmake --build build --target test` runs 96 unit tests (~106 000 checks) in
 about a second, the two C examples as regressions (XOR must converge; the
 MNIST CNN must reach 95% after one epoch on 20 000 images, when the data is
 present), and in CI a consumer of the installed package:
@@ -236,20 +337,39 @@ present), and in CI a consumer of the installed package:
   parameters decay); save/load of a Transformer; the attention trace
   events; and **a model written by the last phase-4 commit still loads and
   generates exactly the same names**;
+* **devices**, on every machine: `cpu-generic` (the CPU's ops without its
+  fused kernels: exactly what a GPU runs) against the CPU for every layer
+  type, and a fake device registered through the public API (its own
+  memory, poisoned with NaN, explicit copies) bit-identical to
+  cpu-generic for passes, gradient checks, training with the data on the
+  device, moving a net mid-training, generation with and without the KV
+  cache, traces and a layer written for 2.0; running out of device memory
+  and retrying with a smaller batch;
+* **the GPU** (`-DNMZ_CUDA=ON`, `ctest -L gpu`, skipped without a GPU):
+  every op of the CUDA backend against the CPU on random inputs and odd
+  shapes, within tolerances stated and explained in
+  [`tests/test_gpu.c`](tests/test_gpu.c) (0 for data movement, 1e-6 to
+  1e-5 for arithmetic, 1e-4 for whole models); every layer type and its
+  gradient check on the GPU, recurrent layers too wide for the fused
+  kernels, traces, the KV cache, a GPU-trained file on the CPU, identical
+  files from two GPU runs, running out of memory; the parity runs above
+  (21 tests, ~1 400 checks);
 * CSV and IDX parsing errors; every API entry point with `NULL`/bad input.
 * the training data a model remembers (path and item hashes) through
   save/load, and older files without it.
 
 CI (GitHub Actions) runs them with GCC and Clang on Linux (Release, OpenMP,
 and ASan + UBSan), MSVC on Windows (with and without OpenMP) and Apple Clang
-on macOS. Benchmarks and dataset downloads are not part of CI; the data
+on macOS, and compiles the CUDA backend with GCC and MSVC (CUDA 13.5); those
+builds' tests run there without a GPU (the GPU tests report "skipped"). Benchmarks and dataset downloads are not part of CI; the data
 scripts have a manual workflow (`data.yml`).
 
 ## Layout
 
 ```
 include/neuromz.h        public API            src/       the library (C11)
-include/neuromz_layer.h  layer-author API      tests/     unit tests, fixtures, package consumer
+include/neuromz_layer.h  layer-author API      src/cuda/  the CUDA backend (one .cu, C ABI)
+include/neuromz_backend.h backend-author API   tests/     unit tests, GPU tests, fixtures, package consumer
 docs/DESIGN.md           design + decisions    examples/  example data, C examples, benchmarks
 cmake/                   package config        scripts/   MNIST / text download (sh + PowerShell)
 legacy/                  v1 (2017–2020)        data/      downloaded datasets (gitignored)
@@ -267,10 +387,11 @@ RNN with truncated BPTT, clipping, validation/early stopping and generation
 (phase 3); LSTM, GRU, gate traces, gradient survival, Arabic prose (phase
 4); a decoder-only Transformer with AdamW, warm-up, a blocked matrix
 product, a KV cache and attention traces (phase 5); CMake, native Windows,
-CI, the first public release and the split into repositories (v2.0.0).
-Next, in their own repositories: `neuromz-protocol` (the trace events as a
-wire format), `neuromz-server` and `neuromz-web` (a GUI that consumes the
-trace events); in this one, CPU and CUDA backends.
+CI, the first public release and the split into repositories (v2.0.0);
+device backends with CUDA (v2.1.0). Next, in their own repositories:
+`neuromz-protocol` (the trace events as a wire format), `neuromz-server`
+and `neuromz-web` (a GUI that consumes the trace events); in this one,
+more backends (HIP, Vulkan) on the same table of ops.
 
 ## License
 

@@ -52,7 +52,7 @@ static const float *last_logits(const nmz_net *net, int r, int *V) {
     const nmz_tensor *z = nmz__net_fused_ce_possible(net) ? &net->acts[net->n_layers - 1] : &net->acts[net->n_layers];
     int T = z->shape[1];
     *V = z->shape[2];
-    return z->data + ((size_t)r * T + (size_t)(T - 1)) * (size_t)*V;
+    return nmz__hr(z) + ((size_t)r * T + (size_t)(T - 1)) * (size_t)*V; /* from the device, if there */
 }
 
 int nmz__sample_next(const float *z, int V, double temperature, int top_k, nmz_rng *rng, double *probs) {
@@ -105,10 +105,12 @@ static void compact_states(nmz_net *net, int B, const int *keep, int n) {
         nmz_tensor *st = l->ops->state ? l->ops->state(l) : NULL;
         size_t per;
         int shape[NMZ_MAX_RANK];
+        float *d;
         if (!st || st->size == 0 || st->rank < 1 || st->shape[0] != B) continue;
         per = st->size / (size_t)B;
+        d = nmz__hu(st); /* on the host (a device copy follows when next needed) */
         for (k = 0; k < n; k++)
-            if (keep[k] != k) memmove(st->data + (size_t)k * per, st->data + (size_t)keep[k] * per, per * sizeof(float));
+            if (keep[k] != k) memmove(d + (size_t)k * per, d + (size_t)keep[k] * per, per * sizeof(float));
         memcpy(shape, st->shape, sizeof shape);
         shape[0] = n;
         nmz_tensor_reshape(st, st->rank, shape); /* smaller: keeps the data */

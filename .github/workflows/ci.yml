@@ -1,6 +1,9 @@
 # CI for the library: Linux (GCC, Clang; Release and sanitizers), Windows
-# (MSVC), macOS (Apple Clang). No dataset downloads and no benchmarks here:
-# the MNIST regression is skipped when data/ is absent (see data.yml).
+# (MSVC), macOS (Apple Clang), and the CUDA backend compiled on Linux and
+# Windows. No dataset downloads and no benchmarks here: the MNIST regression
+# is skipped when data/ is absent (see data.yml). The runners have no GPU, so
+# the CUDA jobs also check that a CUDA build runs without one: the CPU tests
+# pass, "auto" falls back to the CPU, and the GPU tests report "skipped".
 name: CI
 on:
   push:
@@ -90,4 +93,72 @@ jobs:
       - name: Build
         run: cmake --build build -j 3
       - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # The CUDA backend, compiled (no GPU on the runners). Only nvcc, the CUDA
+  # runtime and its headers are needed: cuBLAS is loaded at run time. They
+  # come from NVIDIA's redistributable archives (no installer).
+  cuda-linux:
+    name: Linux CUDA ${{ matrix.cuda }} (compile; tests without a GPU)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["13.5.0"]
+    steps:
+      - uses: actions/checkout@v5
+      - name: CUDA ${{ matrix.cuda }} (nvcc, nvvm, runtime, headers)
+        run: |
+          set -euo pipefail
+          base=https://developer.download.nvidia.com/compute/cuda/redist
+          curl -fsSL "$base/redistrib_${{ matrix.cuda }}.json" -o redist.json
+          mkdir -p "$HOME/cuda"
+          for pkg in cuda_nvcc cuda_cudart cuda_crt cccl libnvvm; do
+            rel=$(python3 -c "import json; print(json.load(open('redist.json'))['$pkg']['linux-x86_64']['relative_path'])")
+            curl -fsSL "$base/$rel" -o pkg.tar.xz
+            tar -xf pkg.tar.xz --strip-components=1 -C "$HOME/cuda"
+          done
+          # the archives install into lib/; nvcc.profile links from lib64/
+          [ -e "$HOME/cuda/lib64" ] || ln -s lib "$HOME/cuda/lib64"
+          ls "$HOME/cuda/lib64/"
+          echo "CUDA=$HOME/cuda" >> "$GITHUB_ENV"
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNMZ_CUDA=ON -DCMAKE_CUDA_COMPILER="$CUDA/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA"
+      - name: Build
+        run: cmake --build build -j 4
+      - name: "Test (no GPU here: the CPU tests pass, auto falls back to the CPU, gpu tests skipped)"
+        run: ctest --test-dir build --output-on-failure
+
+  cuda-windows:
+    name: Windows MSVC CUDA ${{ matrix.cuda }} (compile; tests without a GPU)
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["13.5.0"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: CUDA ${{ matrix.cuda }} (nvcc, nvvm, runtime, headers)
+        shell: pwsh
+        run: |
+          $base = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $m = Invoke-RestMethod "$base/redistrib_${{ matrix.cuda }}.json"
+          $root = Join-Path $env:RUNNER_TEMP "cuda"
+          New-Item -ItemType Directory -Force $root | Out-Null
+          foreach ($p in "cuda_nvcc", "cuda_cudart", "cuda_crt", "cccl", "libnvvm") {
+            $rel = $m.$p.'windows-x86_64'.relative_path
+            Invoke-WebRequest "$base/$rel" -OutFile pkg.zip
+            Expand-Archive pkg.zip -DestinationPath unpacked -Force
+            $top = Get-ChildItem unpacked | Select-Object -First 1
+            Copy-Item (Join-Path $top.FullName "*") $root -Recurse -Force
+            Remove-Item unpacked, pkg.zip -Recurse -Force
+          }
+          "CUDA=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNMZ_CUDA=ON "-DCMAKE_CUDA_COMPILER=$env:CUDA/bin/nvcc.exe" "-DCUDAToolkit_ROOT=$env:CUDA"
+      - name: Build
+        run: cmake --build build -j 4
+      - name: "Test (no GPU here: the CPU tests pass, auto falls back to the CPU, gpu tests skipped)"
         run: ctest --test-dir build --output-on-failure

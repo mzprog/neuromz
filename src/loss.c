@@ -50,26 +50,24 @@ static nmz_status check_pair(const nmz_tensor *y, const nmz_tensor *t) {
     return NMZ_OK;
 }
 
-nmz_status nmz__loss_value(nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
-                           const nmz_tensor *z, double *out) {
-    size_t rows, r;
-    int k, cols;
+/* The CPU kernels: the v2.0.1 loops on raw rows × cols arrays. */
+nmz_status nmz__cpu_loss_value(const nmz_backend *be, nmz_loss kind, size_t rows, int cols, const float *y,
+                               const float *t, const float *z, double *out) {
+    size_t r, size = rows * (size_t)cols;
+    int k;
     double total = 0.0;
-    nmz_status s = check_pair(y, t);
-    if (s != NMZ_OK) return s;
-    rows = nmz_tensor_rows(y);
-    cols = nmz_tensor_cols(y);
+    (void)be;
     if (kind == NMZ_LOSS_MSE) {
-        for (r = 0; r < y->size; r++) {
-            double e = (double)y->data[r] - t->data[r];
+        for (r = 0; r < size; r++) {
+            double e = (double)y[r] - t[r];
             total += 0.5 * e * e;
         }
     } else if (kind == NMZ_LOSS_CROSS_ENTROPY) {
         for (r = 0; r < rows; r++) {
-            const float *tr = t->data + r * (size_t)cols;
+            const float *tr = t + r * (size_t)cols;
             if (z) {
                 /* log p_k = z_k − log Σ_j exp(z_j), computed stably */
-                const float *zr = z->data + r * (size_t)cols;
+                const float *zr = z + r * (size_t)cols;
                 double mx = zr[0], sum = 0.0, lse;
                 for (k = 1; k < cols; k++)
                     if (zr[k] > mx) mx = zr[k];
@@ -78,7 +76,7 @@ nmz_status nmz__loss_value(nmz_loss kind, const nmz_tensor *y, const nmz_tensor 
                 for (k = 0; k < cols; k++)
                     if (tr[k] != 0.0f) total -= tr[k] * ((double)zr[k] - lse);
             } else {
-                const float *pr = y->data + r * (size_t)cols;
+                const float *pr = y + r * (size_t)cols;
                 for (k = 0; k < cols; k++)
                     if (tr[k] != 0.0f) total -= tr[k] * log(fmax((double)pr[k], 1e-300));
             }
@@ -90,23 +88,18 @@ nmz_status nmz__loss_value(nmz_loss kind, const nmz_tensor *y, const nmz_tensor 
     return NMZ_OK;
 }
 
-nmz_status nmz__loss_grad(nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
-                          nmz_tensor *g) {
-    size_t rows, r;
-    int k, cols;
-    double inv;
-    nmz_status s = check_pair(y, t);
-    if (s != NMZ_OK) return s;
-    if ((s = nmz_tensor_reshape(g, y->rank, y->shape)) != NMZ_OK) return s;
-    rows = nmz_tensor_rows(y);
-    cols = nmz_tensor_cols(y);
-    inv = 1.0 / (double)rows;
+nmz_status nmz__cpu_loss_grad(const nmz_backend *be, nmz_loss kind, size_t rows, int cols, const float *y,
+                              const float *t, float *g) {
+    size_t r, size = rows * (size_t)cols;
+    int k;
+    double inv = 1.0 / (double)rows;
+    (void)be;
     if (kind == NMZ_LOSS_MSE) {
-        for (r = 0; r < y->size; r++) g->data[r] = (float)(((double)y->data[r] - t->data[r]) * inv);
+        for (r = 0; r < size; r++) g[r] = (float)(((double)y[r] - t[r]) * inv);
     } else if (kind == NMZ_LOSS_CROSS_ENTROPY) {
         for (r = 0; r < rows; r++) {
-            const float *pr = y->data + r * (size_t)cols, *tr = t->data + r * (size_t)cols;
-            float *gr = g->data + r * (size_t)cols;
+            const float *pr = y + r * (size_t)cols, *tr = t + r * (size_t)cols;
+            float *gr = g + r * (size_t)cols;
             double tsum = 0.0;
             for (k = 0; k < cols; k++) tsum += tr[k];
             for (k = 0; k < cols; k++) gr[k] = (float)(((double)pr[k] * tsum - tr[k]) * inv);
@@ -115,4 +108,40 @@ nmz_status nmz__loss_grad(nmz_loss kind, const nmz_tensor *y, const nmz_tensor *
         return nmz__fail(NMZ_ERR_ARG, "invalid loss kind %d", (int)kind);
     }
     return NMZ_OK;
+}
+
+/* Tensor-level entry points: the value is read back (one sync), or, for
+ * _queued, written to *out at the backend's next sync. */
+nmz_status nmz__loss_value_queued(const nmz_backend *be, nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
+                                  const nmz_tensor *z, double *out) {
+    const float *py, *pt, *pz = NULL;
+    nmz_status s = check_pair(y, t);
+    if (s != NMZ_OK) return s;
+    if ((int)kind < 0 || kind >= NMZ_LOSS_COUNT) return nmz__fail(NMZ_ERR_ARG, "invalid loss kind %d", (int)kind);
+    py = nmz__r(be, y);
+    pt = nmz__r(be, t);
+    if (z && !(pz = nmz__r(be, z))) return nmz__op_failed();
+    if (!py || !pt) return nmz__op_failed();
+    return be->loss_value(be, kind, nmz_tensor_rows(y), nmz_tensor_cols(y), py, pt, pz, out);
+}
+
+nmz_status nmz__loss_value(const nmz_backend *be, nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
+                           const nmz_tensor *z, double *out) {
+    nmz_status s = nmz__loss_value_queued(be, kind, y, t, z, out);
+    return s == NMZ_OK ? be->sync(be) : s;
+}
+
+nmz_status nmz__loss_grad(const nmz_backend *be, nmz_loss kind, const nmz_tensor *y, const nmz_tensor *t,
+                          nmz_tensor *g) {
+    const float *py, *pt;
+    float *pg;
+    nmz_status s = check_pair(y, t);
+    if (s != NMZ_OK) return s;
+    if ((int)kind < 0 || kind >= NMZ_LOSS_COUNT) return nmz__fail(NMZ_ERR_ARG, "invalid loss kind %d", (int)kind);
+    if ((s = nmz_tensor_reshape(g, y->rank, y->shape)) != NMZ_OK) return s;
+    py = nmz__r(be, y);
+    pt = nmz__r(be, t);
+    pg = nmz__w(be, g);
+    if (!py || !pt || !pg) return nmz__op_failed();
+    return be->loss_grad(be, kind, nmz_tensor_rows(y), nmz_tensor_cols(y), py, pt, pg);
 }

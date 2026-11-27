@@ -25,12 +25,14 @@ static size_t signature(const nmz_net *net, float *out) {
         const nmz_layer *l = net->layers[i];
         int k = nmz_layer_activation_kind(l);
         if (k == NMZ_ACT_RELU || k == NMZ_ACT_LEAKY_RELU) {
+            const float *z = out ? nmz__hr(&net->acts[i]) : NULL;
             for (e = 0; e < net->acts[i].size; e++, n++)
-                if (out) out[n] = net->acts[i].data[e] > 0.0f ? 1.0f : 0.0f;
+                if (out) out[n] = z[e] > 0.0f ? 1.0f : 0.0f;
         } else if (l->ops == &nmz__maxpool2d_ops) {
             const nmz_tensor *am = nmz__maxpool_argmax(l);
+            const float *a = out ? nmz__hr(am) : NULL;
             for (e = 0; e < am->size; e++, n++)
-                if (out) out[n] = am->data[e];
+                if (out) out[n] = a[e];
         }
         else {
             n += nmz__kink_signature(l, out ? out + n : NULL);
@@ -162,33 +164,34 @@ nmz_status nmz_net_gradcheck_mode(nmz_net *net, const nmz_tensor *x, const nmz_t
     net->training = 0;
     if (s != NMZ_OK) goto out;
     for (k = 0; k < net->n_params; k++)
-        total += nmz_layer_param_grad(net->layers[net->param_refs[k].layer], net->param_refs[k].index)->size;
+        total += nmz__param(net->layers[net->param_refs[k].layer], net->param_refs[k].index).grad->size;
     total += net->dacts[0].size;
     {
         int shape = (int)total;
         if ((s = nmz_tensor_init(&grads, 1, &shape)) != NMZ_OK) goto out;
     }
     for (k = 0, off = 0; k < net->n_params; k++) {
-        const nmz_tensor *g = nmz_layer_param_grad(net->layers[net->param_refs[k].layer], net->param_refs[k].index);
-        memcpy(grads.data + off, g->data, g->size * sizeof(float));
+        const nmz_tensor *g = nmz__param(net->layers[net->param_refs[k].layer], net->param_refs[k].index).grad;
+        memcpy(grads.data + off, nmz__hr(g), g->size * sizeof(float));
         off += g->size;
     }
-    memcpy(grads.data + off, net->dacts[0].data, net->dacts[0].size * sizeof(float));
+    memcpy(grads.data + off, nmz__hr(&net->dacts[0]), net->dacts[0].size * sizeof(float));
 
     /* parameters */
     for (k = 0, off = 0; k < net->n_params; k++) {
         nmz_layer *l = net->layers[net->param_refs[k].layer];
         int pi = net->param_refs[k].index;
-        nmz_tensor *w = nmz_layer_param_value(l, pi);
+        nmz_tensor *w = nmz__param(l, pi).value;
         for (e = 0; e < w->size; e++) {
-            float orig = w->data[e];
+            float orig = nmz__hr(w)[e];
             double lp = 0, lm = 0;
-            w->data[e] = (float)(orig + eps);
+            /* nmz__tensor_set changes the number in every copy (a device's too) */
+            if ((s = nmz__tensor_set(w, e, (float)(orig + eps))) != NMZ_OK) goto out;
             sb.crossed = 0;
             s = loss_at(net, x, t, training, &rng0, &sb, &lp);
-            w->data[e] = (float)(orig - eps);
+            if (s == NMZ_OK) s = nmz__tensor_set(w, e, (float)(orig - eps));
             if (s == NMZ_OK) s = loss_at(net, x, t, training, &rng0, &sb, &lm);
-            w->data[e] = orig;
+            if (s == NMZ_OK) s = nmz__tensor_set(w, e, orig);
             if (s != NMZ_OK) goto out;
             if (sb.crossed) {
                 r.kinks++;
