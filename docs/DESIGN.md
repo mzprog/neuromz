@@ -15,7 +15,8 @@ RNN, generation) added decisions 51–70; phase 4 (LSTM, GRU, orthogonal
 init, gate traces, gradient-survival comparison, Arabic prose) added
 decisions 71–90; phase 5 (a decoder-only Transformer, AdamW, warm-up,
 the blocked matrix product, the KV cache, attention traces) added
-decisions 91–110.
+decisions 91–110. Release 2.1 (device backends: the backend layer, the
+CPU and CUDA backends) added §11 and decisions 127–.
 
 ---
 
@@ -25,6 +26,7 @@ decisions 91–110.
 include/
   neuromz.h            public API (everything a library user needs)
   neuromz_layer.h      layer-author API (vtable, params, trace emit, byte I/O)
+  neuromz_backend.h    backend-author API (the table of ops, tensor pointers)
 src/                   libneuromz — platform-independent C11, libc + libm only
   error.c              status strings, thread-local last-error message
   tensor.c             contiguous float tensor
@@ -55,6 +57,10 @@ src/                   libneuromz — platform-independent C11, libc + libm only
   transformer.c        position encoding, LayerNorm, feed-forward, the
                        pre-LN block (composite layer), tied output
   defaults.c           "quick mode" defaults and the reasons for them
+  backend.c            backend registry and selection; device copies of
+                       tensors (§11)
+  backend_cpu.c        the CPU backend: the ops (v2.0.1's loops) and the
+                       "cpu-generic" table without fused kernels
   internal.h           private helpers shared by the library sources
 tests/                 test_*.c (unit, gradient checks, convergence, I/O),
                        data/*.nmz (model files of earlier phases), package/
@@ -62,7 +68,7 @@ tests/                 test_*.c (unit, gradient checks, convergence, I/O),
 examples/              xor.csv, xor_and.csv, iris.csv (+ 120/30 train/test
                        split), names_en.txt, names_ar.txt, DATASETS.md,
                        api_xor.c, api_mnist.c (CTest regressions),
-                       bench_conv.c, bench_matmul.c
+                       bench_conv.c, bench_matmul.c, bench_device.c
 scripts/get_mnist.*    downloads MNIST into data/ (gitignored), verifies
                        MD5 + SHA-256 (.sh: Unix-like systems, .ps1: Windows)
 scripts/get_text.*     downloads Alice (Gutenberg #11) and Kalila wa-Dimna
@@ -101,6 +107,7 @@ typedef struct nmz_tensor {
     size_t size;                 /* product of shape                      */
     size_t capacity;             /* allocated floats (>= size)            */
     float *data;                 /* contiguous, row-major (C order)       */
+    struct nmz_tensor_dev *dev;  /* device copy (2.1, §11.3), or NULL     */
 } nmz_tensor;
 ```
 
@@ -170,6 +177,11 @@ name to its `load_config`). Nothing in `net.c` or `train.c` changes.
 "params" and "grads" are exposed together as `nmz_param` pairs so a value can
 never be paired with the wrong gradient; the optimizer, the saver, the
 gradient checker and the trace all iterate over the same list.
+
+Release 2.1 appended three things for device backends (§11): the field
+`nmz_ctx.backend` (where to compute), the flag `NMZ_LAYER_BACKEND` (the
+layer computes through it) and the optional entry `buffers` (the layer's
+caches, so their device memory can be given back).
 
 ---
 
@@ -446,6 +458,9 @@ All names use the `nmz_` / `NMZ_` prefix. The full header is
 /* inspect */     nmz_net_activation_grad(net, i); nmz_layer_param_decays(l, i, all)
 /* matmul */      nmz_matmul / nmz_matmul_naive(M, N, K, A, B, C, TRANS_A|TRANS_B|
                   ACCUMULATE); nmz_threads()
+/* devices */     nmz_backend_select("auto"|"cpu"|"cuda"); nmz_backend_info(&info);
+                  nmz_backend_query(name, &info); nmz_backend_count/name;
+                  (neuromz_backend.h) nmz_backend_register, nmz_tensor_ptr
 /* teaching */    nmz_net_gradcheck(net, x, t, eps, atol, rtol, &result);
                   nmz_net_gradcheck_mode(..., training, &result)
 ```
@@ -1362,3 +1377,204 @@ attention traces):
     after `v2.0.0` was published. Published tags are not rewritten:
     `v2.0.1` carries the fix, and `neuromz-cli` 2.0.1 pins it (its data
     targets run the library's scripts from the fetched release).
+
+### Release 2.1: device backends (Step A: the backend layer and the CPU backend)
+
+127. **A backend is a table of ops; fused kernels are optional.** The table
+    (`nmz_backend`, `neuromz_backend.h`) has the memory functions and about
+    fifty required ops the layers are written in: GEMM with transpose
+    flags and row strides, element-wise ops, activations and their
+    derivatives, softmax and the fused cross-entropy, reductions, im2col /
+    col2im, pooling, dropout masks, embeddings and positions, LayerNorm,
+    the attention core, one time step of each recurrent cell, the
+    optimizer updates, the clipping norm, normalisation and the training
+    loop's gathers. Ten fused layer kernels (dense, conv2d, rnn, lstm and
+    gru, forward and backward) may be NULL: a layer then composes the same
+    math from the required ops. Each layer therefore has two paths, the
+    fused call and the composition; the composition is what a GPU runs,
+    written once in the layer for every device. The granularity was chosen
+    by the CPU: v2.0.1's dense, convolution and recurrent loops keep
+    intermediate sums in double that a GEMM-then-activation split would
+    round to float in between, so bit-identity needs them as one kernel;
+    every other layer's v2.0.1 code already was a sequence of GEMMs and
+    simple loops, which became ops one for one. A recurrent sequence is
+    one fused kernel, as in cuDNN: a backend can then pick its own
+    schedule (the CPU walks each row through all its steps; the
+    composition does the input product of all steps at once, one
+    recurrent product and one cell op per step, and the weight gradients
+    of all steps as single GEMMs after the loop).
+128. **The CPU backend is v2.0.1, bit for bit.** Its ops are the old loops,
+    moved into `backend_cpu.c` or left next to their layer as `nmz__cpu_*`
+    kernels; the CPU path through a layer is the old arithmetic with the
+    old operation order. Verified three ways: the 87 unit tests pass with
+    unchanged numbers; a probe program (public API only) that trains a
+    model of every layer type (XOR quick mode, Iris with Adam/patience and
+    with SGD/clipping/step schedule, a CNN with both convolution
+    algorithms, RNN/LSTM/GRU with carried states and dropout, a tied
+    Transformer with AdamW and warm-up, the Transformer parts), records a
+    traced step and a gradient check, generates text (KV cache and no
+    cache) and loads the four fixtures gives the same output as v2.0.1 and
+    11 byte-identical model files — in the single-threaded and the OpenMP
+    build; and the benchmarks are no slower (im2col 4.32 → 4.17 s, naive
+    convolution 13.2 → 10.6 s, a char-LSTM epoch 6.80 → 6.53 s, a
+    char-GPT epoch 8.64 → 8.45 s: plain pointers into the kernels let MSVC
+    optimise the inner loops better).
+129. **A tensor keeps its host data and, once a device computes on it, a
+    device copy plus a note of which is newer** (Caffe's synced memory).
+    `nmz_tensor` gained one pointer, `dev`; `data` stays host memory.
+    `nmz__r/w/u(be, t)` (public: `nmz_tensor_ptr`) return the tensor's
+    data in a backend's memory for reading, overwriting or updating, move
+    data only when that copy is out of date, and mark the other copy
+    stale after a write; for a host tensor on the CPU they are one test.
+    A device copy is allocated on first use; `nmz_tensor_reshape` drops one
+    that became too small (contents are unspecified on growth anyway),
+    `nmz_tensor_copy` and `nmz_tensor_zero` work where the newest data is.
+    Device-only tensors were the alternative, and would have broken the
+    public API: `nmz_layer_param_value(l, i)->data[k] = …` (the unit tests
+    set hand-computed weights that way), `nmz_net_forward`'s output,
+    trace events and the CLI all read `data` directly.
+130. **What the public API hands out is current on the host at the time of
+    the call.** `nmz_net_forward`/`_mode` (the output), `nmz_net_activation`,
+    `nmz_net_activation_grad`, `nmz_net_input_grad`, every trace item and
+    `nmz_layer_param_value`/`_grad` bring their tensor to the host; the
+    parameter accessors also mark the host copy as the newer one, because
+    the caller may write. A pointer kept across later computation can be
+    stale: ask again. Internally the engine uses `nmz__param` (no
+    synchronisation), so counting parameters, saving or clipping never
+    moves data that does not have to move. A caller's input and target
+    are copied into the net, never given device copies of their own (the
+    caller owns those structs and may free them with `free`).
+131. **Layers declare `NMZ_LAYER_BACKEND`.** All built-in layers compute
+    through `ctx->backend` (a field appended to `nmz_ctx`). A layer table
+    without the flag — one written for v2.0 that reads `->data` — still
+    runs on a device: the engine brings its input, output gradient and
+    parameters to the host before the call, marks its output, input
+    gradient and parameter gradients as changed there, and gives it the
+    CPU backend in its context. Tested with such a layer inside a net on a
+    device (the result equals the host run bit for bit).
+132. **The selection is process-wide, the default is the CPU.** Selecting a
+    backend is the library's one piece of global state besides the
+    thread-local error message: a device is a property of the process
+    (one CUDA context), and `nmz_backend_select` is called once at start
+    by a program (`--device`) more often than per net. A net computes on
+    the backend selected when it runs: entry points that compute look at
+    the selection, and a net that moves to the CPU brings every tensor
+    home and frees its device memory. Model files never record a device.
+    "auto" picks CUDA when it is built in and a usable GPU is found and
+    otherwise the CPU, and its note says which and why ("auto: no usable
+    CUDA device (…), using the CPU"): the library does not print, so the
+    one clear message is the note, which the CLI prints.
+133. **The generic compositions and the device data path are tested on
+    every CI runner, without a GPU.** Two backends do it: `cpu-generic`
+    (the CPU's ops with no fused kernels: the compositions a GPU runs) is
+    built in and selectable; a fake device registered by the test through
+    the public API (`nmz_backend_register`) uses the same ops on memory of
+    its own, with explicit copies, memory poisoned with NaN when
+    allocated, and an optional limit. cpu-generic agrees with the CPU to
+    2.4·10⁻⁷ relative on every layer type (outputs, all gradients); the
+    fake device must give cpu-generic's bits exactly — any missed or stale
+    copy would show — for passes, gradient checks, training with the data
+    set on the device, moving a net mid-training, generation with and
+    without the KV cache, traced values and a host-only layer.
+134. **Token ids are checked on the host before a device sees them.** The
+    CPU's embedding kernel reports "token id 7.5 is not an integer in
+    0..64"; a kernel cannot. On a device the net checks a caller's input
+    on the host before copying it, and training checks the whole data set
+    once before it goes to the device.
+135. **Running out of device memory is a clean error, and the net lets go
+    of its buffers.** An allocation that fails returns `NMZ_ERR_NOMEM`
+    with a message that says how much was needed, what is in use and what
+    to try (a smaller batch); nothing crashes and the device stays usable.
+    Training and evaluation that fail this way free the activations and
+    every layer's caches on the device, so a retry with a smaller batch in
+    the same process starts from nothing. For that the layer table gained
+    one more optional entry, `buffers(l, out, max)`: the layer's tensors
+    other than its parameters (caches, work space, carried state). The
+    same list lets a net that moves back to the CPU free all its device
+    memory.
+136. **On a device the training data stays on the device.** A run copies
+    the data set (and a separate validation set) to the device once, the
+    epoch's shuffled order once per epoch, and gathers every batch there
+    (`gather_rows`, `onehot` for text targets); evaluation counts correct
+    predictions on the device (`count_correct`). What comes back during an
+    epoch is the batch loss (and, with clipping, the gradient norm), which
+    the loop needs for its NaN check, the clipping decision and the
+    `on_batch` report; the epoch's metrics; nothing else. A data set too
+    large for the device falls back to gathering batches on the host and
+    copying them one at a time.
+137. **Traces work on any device, with the same events in the same order.**
+    `nmz_trace_emit` brings every item to the host before the callback.
+    The recurrent layers used to emit their per-step backward events from
+    inside the time loop; the loop now lives in a kernel, so the kernels
+    record those values in `[B, T, ·]` buffers (`nmz_seq_record`) and the
+    layer emits the same events, with the same numbers, after the loop.
+    The fake device's traced numbers equal cpu-generic's.
+
+---
+
+## 11. Device backends (release 2.1)
+
+### 11.1 The layer
+
+```
+ layers (dense.c, lstm.c, attention.c, …)       the engine (net.c, train.c)
+        │  ctx->backend->gemm(…), ->lstm_cell_forward(…), …       │
+        ▼                                                         ▼
+ nmz_backend  ── memory: alloc release upload download sync ──────┘
+   ├─ "cpu"          the ops = v2.0.1's loops, + fused kernels   (backend_cpu.c)
+   ├─ "cpu-generic"  the same ops, no fused kernels              (testing)
+   └─ "cuda"         cuBLAS + kernels, device memory             (src/cuda/, §11.7)
+```
+
+Every layer computes through the backend in its context; the optimizer,
+clipping, normalisation, the loss and the training loop's gathers through
+`net->be`. Pointers come from `nmz__r/w/u(be, tensor)`. The ops are listed
+in `neuromz_backend.h` with their exact contracts (row-major, strides,
+which outputs are added into, which scalars are valid only after `sync`).
+
+### 11.2 The CPU backend and cpu-generic
+
+The CPU table is v2.0.1 (decision 128). `cpu-generic` shares its ops and
+leaves the fused kernels out, so on the CPU it runs exactly what a GPU
+runs: one input GEMM for all time steps, a recurrent GEMM and a cell op
+per step, im2col over the whole batch and one GEMM per pass; it is the
+reference the device path is tested against (decision 133).
+
+### 11.3 Tensors on devices
+
+A tensor's `dev` (struct `nmz_tensor_dev`: owning backend, device pointer,
+capacity, which copy is newer) appears the first time a device backend
+asks for the tensor's data (decision 129). Host code keeps working as long
+as it goes through the accessors (`nmz__hr/hw/hu` in the library, the
+public accessors outside it, decision 130).
+
+### 11.4 Selection
+
+`nmz_backend_select("auto" | "cpu" | "cuda")`, `nmz_backend_info`,
+`nmz_backend_query`, `nmz_backend_count/name` (decision 132). A device
+backend's `init` runs once, the first time it is selected or queried, and
+its answer (usable, or why not) is remembered.
+
+### 11.5 Training on a device
+
+Decision 136: the data set is copied once, batches are gathered on the
+device, and per batch only the loss (and the clipping norm) come back.
+
+### 11.6 Adding a backend (HIP, Vulkan, OpenCL, …)
+
+1. Write `src/<name>/backend_<name>.<ext>` exporting
+   `const nmz_backend *nmz__<name>_backend(void)`: fill the table of
+   `neuromz_backend.h` — `init` (find the device lazily; return
+   `NMZ_ERR_UNSUPPORTED` and the reason when there is none, never crash),
+   `info`, the memory functions (`alloc` reports failures with
+   `nmz_backend_error(NMZ_ERR_NOMEM, …)`), `sync`, and every required op.
+   Leave the fused kernels NULL: the layers then compose them from the
+   required ops.
+2. Add one `add_slot()` line to `builtins()` in `backend.c`, under a
+   compile-time switch, and the sources and the switch to CMake (as
+   `NMZ_CUDA` does).
+3. Test it the way the CUDA backend is tested (§11.7): every op against
+   the CPU on random inputs, the gradient checks of every layer type,
+   training parity. The engine, the layers and the file format need no
+   change; `nmz_backend_register` also adds a backend from outside the
+   library (the test suite's fake device is one).
