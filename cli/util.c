@@ -95,10 +95,10 @@ void cli_print_train_config(const nmz_train_opts *o) {
     if (o->optimizer == NMZ_OPT_ADAM || o->optimizer == NMZ_OPT_ADAMW)
         printf("%s lr %g (beta1 %g, beta2 %g, eps %g)", nmz_optimizer_name(o->optimizer), (double)o->learning_rate,
                (double)o->beta1, (double)o->beta2, (double)o->epsilon);
+    else /* SGD: momentum is the only optimizer setting that applies */
+        printf("sgd lr %g, momentum %g", (double)o->learning_rate, (double)o->momentum);
     if (o->optimizer == NMZ_OPT_ADAMW)
         printf(", weight decay %g (%s)", (double)o->weight_decay, o->decay_all ? "all parameters" : "weight matrices");
-    else
-        printf("sgd lr %g, momentum %g", (double)o->learning_rate, (double)o->momentum);
     if (o->schedule == NMZ_SCHED_STEP)
         printf(", step schedule (x%g every %d epochs)", (double)o->gamma, o->step_size);
     else if (o->schedule == NMZ_SCHED_COSINE)
@@ -250,7 +250,7 @@ static int ends_with(const char *s, const char *suffix) {
 }
 
 static int file_exists(const char *p) {
-    FILE *f = fopen(p, "rb");
+    FILE *f = cli_fopen(p, "rb");
     if (f) fclose(f);
     return f != NULL;
 }

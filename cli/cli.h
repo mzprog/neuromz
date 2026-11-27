@@ -61,9 +61,16 @@ const char *cli_char_label(uint32_t cp, char *buf, size_t n);
 const char *cli_act_reason(nmz_act a);
 const char *cli_init_reason(int init);
 
-/* main.c (platform bits) */
+/* platform.c — the only file that talks to the operating system */
 double cli_now(void);       /* seconds, monotonic where available */
 int cli_stdout_is_tty(void);
+int cli_stdin_is_tty(void);
+int cli_term_width(void);   /* columns of the terminal (80 if unknown) */
+/* Windows: UTF-8 console output and UTF-8 argv; elsewhere nothing */
+void cli_console_init(int *argc, char ***argv);
+FILE *cli_fopen(const char *path, const char *mode); /* UTF-8 file names everywhere */
+int cli_file_exists(const char *path);               /* a regular file */
+char *cli_abspath(const char *path);                 /* malloc'd; the path itself if unresolvable */
 
 /* cmd_new.c */
 int cmd_new(cli_state *st, int argc, char **argv);
@@ -138,6 +145,8 @@ double seq_survival_rate(const double *v, int T, double *left);
  * layer); sv (may be NULL) = the vanishing-gradient view */
 void print_seq_trace(const nmz_trace_recorder *rec, const nmz_vocab *v, const print_opts *o, int applied, int unit,
                      int layer, const seq_survival *sv);
+/* print.c: summary line + the rows of an update table (malloc'd indices) */
+size_t *update_rows(const nmz_tensor *w, const nmz_tensor *delta, const print_opts *o, size_t *n_rows);
 void print_update_section(const nmz_trace_recorder *rec, const print_opts *o, int applied);
 /* print_attn.c: the Transformer's attention, step by step */
 typedef struct attn_pats attn_pats; /* per-head pattern statistics */

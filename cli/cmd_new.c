@@ -92,7 +92,7 @@ static const preset k_presets[] = {
      NMZ_NORM_ZSCORE, "pixels 0..255 -> mean 0, std 1 (fitted on the training set, stored in the model)",
      NMZ_OPT_ADAM, 0.001f, "Adam adapts the step per weight: conv and dense weights get very different gradients",
      "0.001 is Adam's standard step size", 32, "32 images per update: ~1900 updates per epoch", 3,
-     "3 passes: about a minute each on a laptop CPU (naive convolution), enough for > 98%", NMZ_SCHED_COSINE,
+     "3 passes: ~30 s each on one laptop core (im2col convolution), enough for > 98%", NMZ_SCHED_COSINE,
      "cosine: large steps first, a smooth decay to 0 by the last epoch for fine-tuning", 0.0,
      "0 = always run all epochs (test accuracy, not training loss, is the goal)", NULL, 0, 0, 0, 0, 0.0f, 0.0f,
      NULL},
@@ -102,7 +102,7 @@ static const preset k_presets[] = {
       {NULL, NULL}},
      NMZ_NORM_ZSCORE, "pixels 0..255 -> mean 0, std 1 per pixel position (fitted on the training set)", NMZ_OPT_ADAM,
      0.001f, "Adam converges in a few epochs without tuning", "0.001 is Adam's standard step size", 32,
-     "32 images per update", 5, "5 passes, ~25 s each", NMZ_SCHED_COSINE, "cosine decay to 0 over the 5 epochs",
+     "32 images per update", 5, "5 passes, ~20 s each on one laptop core", NMZ_SCHED_COSINE, "cosine decay to 0 over the 5 epochs",
      0.0, "0 = always run all epochs", NULL, 0, 0, 0, 0, 0.0f, 0.0f, NULL},
     {"names", "character RNN that invents names (one name per line)", "text",
      "characters (Unicode code points) of a list of names; one per line, newline = end of a name",
@@ -113,7 +113,8 @@ static const preset k_presets[] = {
      NMZ_NORM_NONE, "token ids are not scaled", NMZ_OPT_ADAM, 0.003f,
      "Adam copes well with the very different gradient sizes of embedding, recurrent and output weights",
      "0.003: a little above Adam's usual 0.001, fine for a small RNN with clipping", 32,
-     "32 sequences of 16 characters per update", 40, "at most 40 passes; early stopping usually ends sooner",
+     "32 sequences of 16 characters per update", 40,
+     "at most 40 passes (~2 s each on the English names); early stopping usually ends sooner",
      NMZ_SCHED_CONSTANT, "constant: early stopping decides when to stop", 0.0,
      "0 = no loss target; the validation loss decides (patience)", "examples/names_en.txt", 1, 16, 0, 3, 0.1f, 5.0f,
      "16 steps cover two or three names: enough context for one name, cheap to train"},
@@ -139,7 +140,8 @@ static const preset k_presets[] = {
      NMZ_NORM_NONE, "token ids are not scaled", NMZ_OPT_ADAM, 0.01f,
      "Adam copes well with the very different gradient sizes of embedding, gate and output weights",
      "0.01: best of 0.005 and 0.01 on the English names (validation 2.038 vs 2.028)", 32,
-     "32 sequences of 16 characters per update", 40, "at most 40 passes; early stopping usually ends sooner",
+     "32 sequences of 16 characters per update", 40,
+     "at most 40 passes (~2 s each on the English names); early stopping usually ends sooner",
      NMZ_SCHED_CONSTANT, "constant: early stopping decides when to stop", 0.0,
      "0 = no loss target; the validation loss decides (patience)", "examples/names_en.txt", 1, 16, 0, 3, 0.1f, 5.0f,
      "16 steps cover two or three names: enough context for one name, cheap to train"},
@@ -186,7 +188,7 @@ static const preset k_presets[] = {
      "AdamW: Adam's per-weight steps plus decoupled weight decay (0.1) on the weight matrices",
      "0.01 peak: best of 0.003-0.02 on the English names (validation 2.11 at 0.01 vs 2.17 at 0.003)", 16,
      "16 windows of 32 characters per update (better than 32: more updates)", 40,
-     "at most 40 passes; early stopping usually ends sooner",
+     "at most 40 passes (~1.5 s each on the English names); early stopping usually ends sooner",
      NMZ_SCHED_WARMUP_COSINE, "warm-up (5% of the updates), then a cosine down to a tenth of the rate, per batch", 0.0,
      "0 = no loss target; the validation loss decides (patience)", "examples/names_en.txt", 1, 32, 0, 3, 0.1f, 1.0f,
      "32 characters = the context window: every position of a window is one prediction"},
@@ -203,7 +205,7 @@ static const preset k_presets[] = {
      "AdamW: Adam's per-weight steps plus decoupled weight decay (0.1) on the weight matrices",
      "0.01 peak: on Alice 0.001/0.002/0.003/0.005/0.01 gave 2.30/2.02/1.82/1.72/1.67 (tiny models want large steps)", 8,
      "8 windows of 128 characters per update: twice the updates of 16 (1.633 vs 1.666 on Alice)", 30,
-     "at most 30 passes over the book (~11 s each); early stopping may end sooner",
+     "at most 30 passes over the book (~9 s each); early stopping may end sooner",
      NMZ_SCHED_WARMUP_COSINE, "warm-up (5% of the updates), then a cosine down to a tenth of the rate, per batch", 0.0,
      "0 = no loss target; the validation loss decides", "data/alice.txt", 0, 128, 0, 3, 0.1f, 1.0f,
      "128 characters = the context window: every position of a window is one prediction"},
@@ -221,7 +223,7 @@ static const preset k_presets[] = {
      "AdamW: Adam's per-weight steps plus decoupled weight decay (0.1) on the weight matrices",
      "0.005 peak: half of char-gpt's 0.01 for a net 5x larger (validation 1.883 on Kalila)", 8,
      "8 windows of 128 characters per update (more updates per epoch, as for char-gpt)", 20,
-     "at most 20 passes over the book (~45 s each); early stopping may end sooner", NMZ_SCHED_WARMUP_COSINE,
+     "at most 20 passes over the book (~50 s each); early stopping may end sooner", NMZ_SCHED_WARMUP_COSINE,
      "warm-up (5% of the updates), then a cosine down to a tenth of the rate, per batch", 0.0,
      "0 = no loss target; the validation loss decides", "data/kalila.txt", 0, 128, 0, 3, 0.1f, 1.0f,
      "128 characters = the context window: every position of a window is one prediction"},
@@ -860,7 +862,10 @@ int cmd_new(cli_state *st, int argc, char **argv) {
     if (mask & CLI_SET_SHUFFLE) o.shuffle = user.shuffle;
     if (mask & CLI_SET_OPTIMIZER) {
         o.optimizer = user.optimizer;
-        if (!(mask & CLI_SET_LR)) o.learning_rate = o.optimizer == NMZ_OPT_ADAM ? 0.001f : qt.train.learning_rate;
+        if (!(mask & CLI_SET_LR))
+            o.learning_rate = o.optimizer == NMZ_OPT_SGD ? qt.train.learning_rate : 0.001f;
+        /* AdamW chosen by hand: decay 0.01, the usual default (decision 112) */
+        if (o.optimizer == NMZ_OPT_ADAMW && o.weight_decay == 0.0f && !(mask & CLI_SET_DECAY)) o.weight_decay = 0.01f;
     }
     if (mask & CLI_SET_BETAS) {
         o.beta1 = user.beta1;

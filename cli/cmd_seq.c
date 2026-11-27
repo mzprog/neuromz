@@ -72,7 +72,7 @@ static int *encode(const nmz_vocab *v, const char *text, size_t len, int *n, con
 
 /* the whole file (for --data) */
 static char *read_all(const char *path, size_t *len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cli_fopen(path, "rb");
     char *buf = NULL;
     size_t cap = 0, n = 0;
     if (!f) {
@@ -124,14 +124,24 @@ static int text_src_option(int argc, char **argv, int *i, text_src *ts) {
     return 1;
 }
 
-/* resolve to UTF-8 bytes: the text, or chars [from, from+chars) of the file */
-static int text_src_load(text_src *ts, long default_chars) {
+/* resolve to UTF-8 bytes: the text, or chars [from, from+chars) of the file.
+ * Without --text and --data, a model that remembers its training data
+ * (decision 111) uses a short excerpt of it: at most `auto_chars`. */
+static int text_src_load(text_src *ts, long default_chars, const nmz_net *net, long auto_chars) {
     size_t i, start = 0, end;
     long c = 0;
     if (ts->text) {
         ts->s = ts->text;
         ts->len = strlen(ts->text);
         return 0;
+    }
+    if (!ts->data && net && nmz_net_data_path(net)) {
+        ts->data = nmz_net_data_path(net);
+        if (!cli_file_exists(ts->data))
+            return cli_fail("this model was trained on %s, which no longer exists; give --text \"...\" or --data FILE",
+                            ts->data);
+        if (!ts->chars) ts->chars = auto_chars < default_chars ? auto_chars : default_chars;
+        printf("(no --text or --data: using %ld characters of the training data, %s)\n", ts->chars, ts->data);
     }
     if (!ts->data) return cli_fail("give a text: --text \"...\" or --data FILE [--from K] [--chars N]%s", NULL);
     if (!(ts->owned = read_all(ts->data, &ts->len))) return 1;
@@ -278,7 +288,7 @@ int show_gates(cli_state *st, int argc, char **argv) {
         if (!strcmp(ty, "lstm") || !strcmp(ty, "gru")) gs.n++;
     }
     if (!gs.n) return cli_fail("this model has no gated layer (lstm or gru); a vanilla rnn has no gates%s", NULL);
-    if (text_src_load(&ts, 20000)) goto out;
+    if (text_src_load(&ts, 20000, st->net, 2000)) goto out;
     if (!(ids = encode(v, ts.s, ts.len, &n, "the model"))) goto out;
     if (n < 1) {
         cli_fail("the text is empty%s", NULL);
@@ -486,7 +496,7 @@ int cmd_compare(cli_state *st, int argc, char **argv) {
         cli_fail("usage: compare MODEL.nmz [MODEL.nmz ...] --text \"...\" | --data FILE [--from K] [--chars N]%s", NULL);
         goto out;
     }
-    if (text_src_load(&ts, 65)) goto out;
+    if (text_src_load(&ts, 65, NULL, 0)) goto out;
     for (i = 0; i < nm; i++) {
         int *ids, n, li;
         const nmz_vocab *v;
@@ -721,7 +731,7 @@ int show_attention(cli_state *st, int argc, char **argv) {
     }
     cb.want_layer = seq_attention_layer(st->net, (int)layer_n);
     if (cb.want_layer < 0) return cli_fail("--layer: the model has fewer attention layers (blocks)%s", NULL);
-    if (text_src_load(&ts, 4000)) goto out;
+    if (text_src_load(&ts, 4000, st->net, 2000)) goto out;
     if (!(ids = encode(v, ts.s, ts.len, &n, "the model"))) goto out;
     if (n < 3) {
         cli_fail("the text needs at least 3 characters%s", NULL);

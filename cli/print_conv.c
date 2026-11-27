@@ -406,22 +406,21 @@ void pr_adam_header(const nmz_trace_event *ev) {
 void pr_adam_update(const nmz_trace_event *ev, const print_opts *o) {
     const nmz_tensor *w = item(ev, "value"), *g = item(ev, "grad"), *m = item(ev, "m"), *v = item(ev, "v"),
                      *mh = item(ev, "m_hat"), *vh = item(ev, "v_hat"), *dl = item(ev, "delta");
-    size_t e, n = w->size;
+    size_t r, nr, *rows, n = w->size;
     double wd = 0;
     printf("\n[layer %d] %s %s  (%zu value%s)", ev->layer, ev->layer_type, ev->detail, n, n == 1 ? "" : "s");
     if (nmz_trace_scalar_get(ev, "weight_decay", &wd)) printf("   %s = %g", sym("λ", "lambda"), wd);
     printf("\n");
+    if (!(rows = update_rows(w, dl, o, &nr))) return;
     printf("  %10s %10s %10s %10s %10s %10s %10s %10s %10s\n", "index", "w old", "grad", "m", "v", "m_hat", "v_hat",
            "delta", "w new");
-    for (e = 0; e < n; e++) {
+    for (r = 0; r < nr; r++) {
         char idx[48];
-        if (o->max_rows > 0 && e >= (size_t)o->max_rows) {
-            printf("    %s %zu more value(s) not shown (use --full)\n", sym("…", "..."), n - (size_t)o->max_rows);
-            break;
-        }
+        size_t e = rows[r];
         fmt_index(idx, sizeof idx, w, e);
         printf("  %10s %10s %10s %10s %10s %10s %10s %10s %10s\n", idx, c7(w->data[e]), c7(g->data[e]),
                c7(m->data[e]), c7(v->data[e]), c7(mh->data[e]), c7(vh->data[e]), c7(dl->data[e]),
                c7((double)w->data[e] + dl->data[e]));
     }
+    free(rows);
 }

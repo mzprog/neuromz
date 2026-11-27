@@ -317,7 +317,7 @@ static int cmd_show(cli_state *st, int argc, char **argv) {
 
 /* does `item` occur as a whole line of the file? (small files only) */
 static int line_in_file(const char *path, const char *item) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cli_fopen(path, "rb");
     char *line;
     int found = 0;
     if (!f) return 0;
@@ -329,6 +329,89 @@ static int line_in_file(const char *path, const char *item) {
     }
     fclose(f);
     return found;
+}
+
+/* one training item as the model sees it: trailing blanks and a UTF-8 BOM
+ * removed, the model's text normalisation applied (malloc'd, or NULL) */
+static char *item_key(const char *line, unsigned normalize, int first) {
+    size_t n = strlen(line), m = 0, i;
+    uint32_t *cps = NULL;
+    char *out;
+    if (first && !strncmp(line, "\xef\xbb\xbf", 3)) line += 3, n -= 3;
+    while (n && (line[n - 1] == ' ' || line[n - 1] == '\t' || line[n - 1] == '\r')) n--;
+    if (!normalize) {
+        if (!(out = malloc(n + 1))) return NULL;
+        memcpy(out, line, n);
+        out[n] = '\0';
+        return out;
+    }
+    if (nmz_utf8_decode(line, n, &cps, &m, NULL) != NMZ_OK) return NULL;
+    m = nmz_text_normalize(cps, m, normalize);
+    if ((out = malloc(4 * m + 1)) != NULL) {
+        size_t k = 0;
+        for (i = 0; i < m; i++) {
+            char b[5];
+            int len = nmz_utf8_encode(cps[i], b);
+            memcpy(out + k, b, (size_t)len);
+            k += (size_t)len;
+        }
+        out[k] = '\0';
+    }
+    free(cps);
+    return out;
+}
+
+/* After training on a text file, the model remembers where it came from and,
+ * for line-per-item data, which items it saw (decision 111), so `generate
+ * --new-only` and `show gates` work without --data. */
+static void remember_data_source(cli_state *st, const char *spec) {
+    const nmz_vocab *v = nmz_net_vocab(st->net);
+    char *path, **items = NULL, *line;
+    int n = 0, cap = 0, ok = 1;
+    FILE *f;
+    if (!v || !nmz_net_is_sequence(st->net) || !cli_file_exists(spec)) return;
+    path = cli_abspath(spec);
+    if (v->items && (f = cli_fopen(spec, "rb")) != NULL) {
+        while (ok && (line = cli_read_line(f)) != NULL) {
+            char *key = item_key(line, v->normalize, n == 0 && cap == 0);
+            free(line);
+            if (!key) {
+                ok = 0;
+            } else if (!*key) {
+                free(key);
+            } else {
+                if (n == cap) {
+                    char **g = realloc(items, (size_t)(cap = cap ? 2 * cap : 256) * sizeof *g);
+                    if (!g) {
+                        free(key);
+                        ok = 0;
+                        break;
+                    }
+                    items = g;
+                }
+                items[n++] = key;
+            }
+        }
+        fclose(f);
+    }
+    if (!ok || nmz_net_set_data_source(st->net, path, (const char *const *)items, ok ? n : 0) != NMZ_OK)
+        printf("  (note: could not record the training data in the model)\n");
+    while (n > 0) free(items[--n]);
+    free(items);
+    free(path);
+}
+
+/* is prime + out one of the training items? */
+static int item_known(const nmz_net *net, const char *data, const char *prime, const char *out) {
+    size_t a = prime ? strlen(prime) : 0, b = strlen(out);
+    char *full = malloc(a + b + 1);
+    int known;
+    if (!full) return 0;
+    memcpy(full, prime ? prime : "", a);
+    memcpy(full + a, out, b + 1);
+    known = data ? line_in_file(data, full) : nmz_net_knows_item(net, full) > 0;
+    free(full);
+    return known;
 }
 
 static int cmd_generate(cli_state *st, int argc, char **argv) {
@@ -378,7 +461,14 @@ static int cmd_generate(cli_state *st, int argc, char **argv) {
             return fail("unknown option '%s' for generate (see `help generate`)", a);
         }
     }
-    if (new_only && !data) return fail("--new-only needs --data FILE (the training items to avoid)%s", NULL);
+    /* which items count as "known": --data FILE, else the items stored with
+     * the model, else the file it was trained on (decision 111) */
+    if (!data && nmz_net_knows_item(st->net, "") < 0 && nmz_net_data_path(st->net) &&
+        cli_file_exists(nmz_net_data_path(st->net)))
+        data = nmz_net_data_path(st->net);
+    if (new_only && !data && nmz_net_knows_item(st->net, "") < 0)
+        return fail("--new-only: this model does not record its training items (trained before v2.0.0, or not on "
+                    "a file); give --data FILE%s", NULL);
     if (!v->items) { /* running text: one passage per seed, all generated at once */
         char **outs;
         if (!count) count = 1;
@@ -433,7 +523,7 @@ static int cmd_generate(cli_state *st, int argc, char **argv) {
             len = strlen(out);
             if (len && out[len - 1] == '\n') out[--len] = '\0';
             for (k = 0; k < made && !dup; k++) dup = !strcmp(seen[k], out);
-            known = data && len ? line_in_file(data, out) : 0;
+            known = !len ? 0 : item_known(st->net, data, g.prime, out);
             if (!len || dup || (new_only && known)) {
                 free(out);
                 continue;
@@ -453,6 +543,8 @@ static int cmd_generate(cli_state *st, int argc, char **argv) {
 
 typedef struct progress {
     int every, quiet, tty, max_epochs, ce, has_val;
+    int drawn; /* characters of the live line now on screen (0 = none) */
+    int width; /* terminal columns */
     double t0, last_draw;
 } progress;
 
@@ -463,24 +555,37 @@ static void print_acc(double acc) {
         printf("accuracy %5.1f%%", 100.0 * acc);
 }
 
+/* Erase the live line: overwrite exactly what was drawn, then return to
+ * column 0. The line is never wider than the terminal (a wrapped line
+ * cannot be erased with \r), so this always leaves a clean row. */
 static void clear_line(progress *p) {
-    if (p->tty) printf("\r%79s\r", "");
+    if (p->tty && p->drawn > 0) printf("\r%*s\r", p->drawn, "");
+    p->drawn = 0;
 }
 
 static int on_batch(const nmz_batch_info *b, void *user) {
     progress *p = user;
     double now;
+    char line[256];
+    int filled, i, n, bar = 30;
     if (p->quiet || !p->tty) return 0; /* the live line is for terminals only */
     now = cli_now();
     if (now - p->last_draw < 0.1 && b->batch != b->n_batches) return 0;
     p->last_draw = now;
-    {
-        int filled = (int)(30.0 * b->batch / b->n_batches), i;
-        printf("\r  epoch %d/%d [", b->epoch, p->max_epochs);
-        for (i = 0; i < 30; i++) putchar(i < filled ? '#' : '.');
-        printf("] %3d%%  batch loss %-9.4g %6.1fs ", 100 * b->batch / b->n_batches, b->loss, now - p->t0);
-        fflush(stdout);
-    }
+    if (p->width < 70) bar = p->width > 50 ? p->width - 50 : 0;
+    filled = (int)((double)bar * b->batch / b->n_batches);
+    n = snprintf(line, sizeof line, "  epoch %d/%d [", b->epoch, p->max_epochs);
+    for (i = 0; i < bar && n < (int)sizeof line - 1; i++) line[n++] = i < filled ? '#' : '.';
+    if (n < (int)sizeof line)
+        snprintf(line + n, sizeof line - (size_t)n, "] %3d%%  batch loss %-9.4g %6.1fs", 100 * b->batch / b->n_batches,
+                 b->loss, now - p->t0);
+    n = (int)strlen(line);
+    if (n > p->width - 1) n = p->width - 1; /* ASCII only, so bytes = columns */
+    line[n] = '\0';
+    printf("\r%s", line);
+    if (p->drawn > n) printf("%*s\r%s", p->drawn - n, "", line); /* a shorter line: blank the old tail */
+    p->drawn = n;
+    fflush(stdout);
     return 0;
 }
 
@@ -496,7 +601,7 @@ static int on_epoch(const nmz_epoch_info *info, void *user) {
             if (p->ce) printf(" (ppl %6.2f)", exp(info->val_loss));
             printf(info->improved ? " *" : "  ");
         }
-        printf("  ");
+        printf("  %s ", p->has_val ? "val" : "train");
         print_acc(p->has_val ? info->val_accuracy : info->accuracy);
         if (info->clipped_batches) printf("  clipped %d", info->clipped_batches);
         printf("   lr %-8.3g %6.1fs\n", (double)info->learning_rate, cli_now() - p->t0);
@@ -553,6 +658,7 @@ static int cmd_train(cli_state *st, int argc, char **argv) {
     pr.max_epochs = o.max_epochs;
     pr.every = every ? (int)every : (o.max_epochs >= 20 ? o.max_epochs / 20 : 1);
     pr.tty = cli_stdout_is_tty();
+    pr.width = pr.tty ? cli_term_width() : 80;
     pr.t0 = cli_now();
     pr.ce = nmz_net_loss_kind(st->net) == NMZ_LOSS_CROSS_ENTROPY;
     pr.has_val = o.val_fraction > 0 || vds;
@@ -568,9 +674,14 @@ static int cmd_train(cli_state *st, int argc, char **argv) {
     cli_print_train_config(&o);
     if (o.batch_size > ds->n_samples)
         printf("  (batch %d > %d samples: using the full dataset as one batch)\n", o.batch_size, ds->n_samples);
+    if (!pr.quiet)
+        printf("  (each epoch line: the whole %s re-evaluated after the epoch's updates; the live bar shows the "
+               "last batch)\n",
+               pr.has_val ? "training set (loss) and validation set (val)" : "training set");
     s = nmz_net_train_val(st->net, ds, vds, &o, &res);
     clear_line(&pr);
     st->dirty = 1;
+    if (s == NMZ_OK) remember_data_source(st, spec);
     nmz_net_normalization(st->net, &fitted_after, NULL, NULL, NULL);
     if (!fitted_before && fitted_after)
         printf("  (input normalization was fitted on this data and is now part of the model)\n");
@@ -589,7 +700,9 @@ static int cmd_train(cli_state *st, int argc, char **argv) {
     else
         printf("Stopped at the epoch limit (%d): loss %.6g > target %g, ", res.epochs, res.loss, o.target_loss);
     print_acc(res.accuracy);
-    printf(" (on the training data), %.1fs\n", cli_now() - pr.t0);
+    printf(" on the training set%s, %.1fs\n",
+           res.best_epoch && res.best_epoch < res.epochs ? " (re-evaluated with the kept weights)" : "",
+           cli_now() - pr.t0);
     if (vds || o.val_fraction > 0) {
         if (vds)
             printf("  validation (%s): loss %.6g", val_file, res.val_loss);
@@ -834,7 +947,7 @@ out:
 /* --------------------------------------------------------- trace / step */
 
 static int write_json(const nmz_trace_recorder *rec, const char *path) {
-    FILE *f = fopen(path, "w");
+    FILE *f = cli_fopen(path, "w");
     size_t i;
     if (!f) return fail("cannot write '%s'", path);
     for (i = 0; i < nmz_trace_recorder_count(rec); i++) nmz_trace_event_write_json(nmz_trace_recorder_get(rec, i), f);

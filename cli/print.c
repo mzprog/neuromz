@@ -31,6 +31,7 @@ const char *sym(const char *utf8, const char *ascii) { return g_ascii ? ascii : 
 #define S_SQ sym("²", "^2")
 #define S_ALPHA sym("α", "alpha")
 #define S_DOTS sym("…", "...")
+#define S_UPD sym("Δ", "delta") /* a weight update (δ is a backprop error) */
 
 const char *fmt_num(char *buf, size_t n, double v) {
     double a = fabs(v);
@@ -366,11 +367,53 @@ static void dense_backward(const nmz_trace_event *ev, const print_opts *o) {
 
 /* ---------------------------------------------------------------- update */
 
+/* ------------------------------------------------- weight-update tables
+ * A matrix has hundreds of weights; by default the table shows the
+ * UPDATE_TOP that moved most (largest |Δ| first) after a one-line summary
+ * of the whole matrix; --full lists every weight in index order. */
+#define UPDATE_TOP 8
+
+static const nmz_tensor *g_abs_delta; /* qsort has no user pointer */
+static int cmp_abs_delta(const void *a, const void *b) {
+    double x = fabs(g_abs_delta->data[*(const size_t *)a]), y = fabs(g_abs_delta->data[*(const size_t *)b]);
+    if (x != y) return x < y ? 1 : -1;
+    return *(const size_t *)a < *(const size_t *)b ? -1 : 1;
+}
+
+size_t *update_rows(const nmz_tensor *w, const nmz_tensor *delta, const print_opts *o, size_t *n_rows) {
+    size_t n = delta->size, e, top = 0, *rows = malloc((n ? n : 1) * sizeof *rows);
+    double sum = 0;
+    char idx[48];
+    *n_rows = 0;
+    if (!rows) return NULL;
+    for (e = 0; e < n; e++) {
+        rows[e] = e;
+        sum += fabs(delta->data[e]);
+        if (fabs(delta->data[e]) > fabs(delta->data[top])) top = e;
+    }
+    if (n == 0) return rows;
+    fmt_index(idx, sizeof idx, w, top);
+    printf("  %zu value%s: mean |%s| = %s, max |%s| = %s at [%s]", n, n == 1 ? "" : "s", S_UPD, num(sum / (double)n),
+           S_UPD, num(fabs(delta->data[top])), idx);
+    if (o->full || n <= UPDATE_TOP) {
+        printf("\n");
+        *n_rows = n;
+        return rows;
+    }
+    printf("; the %d largest |%s| (--full: all %zu)\n", UPDATE_TOP, S_UPD, n);
+    g_abs_delta = delta;
+    qsort(rows, n, sizeof *rows, cmp_abs_delta);
+    *n_rows = UPDATE_TOP;
+    return rows;
+}
+
 void print_sgd_update(const nmz_trace_event *ev, const print_opts *o) {
     const nmz_tensor *w = nmz_trace_find(ev, "value"), *g = nmz_trace_find(ev, "grad"),
                      *v0 = nmz_trace_find(ev, "velocity_prev"), *dl = nmz_trace_find(ev, "delta");
-    int n = (int)w->size, e;
+    int n = (int)w->size;
+    size_t r, nr, *rows;
     printf("\n[layer %d] %s %s  (%d value%s)\n", ev->layer, ev->layer_type, ev->detail, n, n == 1 ? "" : "s");
+    if (!(rows = update_rows(w, dl, o, &nr))) return;
     printf("  ");
     rpad(w->rank == 2 ? "i,j" : w->rank == 4 ? "f,c,ky,kx" : "j", 10);
     rpad("w old", 13);
@@ -379,13 +422,14 @@ void print_sgd_update(const nmz_trace_event *ev, const print_opts *o) {
     rpad(g_ascii ? "v new=delta" : "v new = Δ", 13);
     rpad("w new", 13);
     printf("\n");
-    for (e = 0; e < n; e++) {
+    for (r = 0; r < nr; r++) {
         char idx[48];
-        if (over_limit(e, n, o)) break;
-        fmt_index(idx, sizeof idx, w, (size_t)e);
+        size_t e = rows[r];
+        fmt_index(idx, sizeof idx, w, e);
         printf("  %10s %12s %12s %12s %12s %12s\n", idx, num(w->data[e]), num(g->data[e]), num(v0->data[e]),
                num(dl->data[e]), num((double)w->data[e] + dl->data[e]));
     }
+    free(rows);
 }
 
 /* -------------------------------------------------------------- dispatch */

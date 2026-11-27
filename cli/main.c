@@ -3,43 +3,11 @@
  *   neuromz                          interactive shell (reads stdin; prompt only on a terminal)
  *   neuromz [-m FILE] CMD ARGS [-o FILE]   one command, optionally loading/saving a model
  *
- * Only this program may use POSIX/terminal APIs; the library stays portable. */
-#if defined(__unix__) || defined(__APPLE__)
-#define _POSIX_C_SOURCE 200809L
-#include <time.h>
-#include <unistd.h>
-#define NMZ_HAVE_ISATTY 1
-#endif
-
+ * Operating-system calls live in platform.c; the library stays plain C11. */
 #include "cli.h"
 
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-
-double cli_now(void) {
-#ifdef NMZ_HAVE_ISATTY
-    struct timespec t;
-    if (clock_gettime(CLOCK_MONOTONIC, &t) == 0) return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
-#endif
-    return (double)clock() / CLOCKS_PER_SEC;
-}
-
-int cli_stdout_is_tty(void) {
-#ifdef NMZ_HAVE_ISATTY
-    return isatty(STDOUT_FILENO);
-#else
-    return 0;
-#endif
-}
-
-static int stdin_is_terminal(void) {
-#ifdef NMZ_HAVE_ISATTY
-    return isatty(STDIN_FILENO);
-#else
-    return 0;
-#endif
-}
 
 static int repl(cli_state *st) {
     int errors = 0;
@@ -83,6 +51,7 @@ int main(int argc, char **argv) {
     char **rest;
     int n_rest = 0, i, rc;
     memset(&st, 0, sizeof st);
+    cli_console_init(&argc, &argv);
     rest = calloc((size_t)argc + 1, sizeof *rest);
     if (!rest) return 2;
     for (i = 1; i < argc; i++) {
@@ -122,7 +91,7 @@ int main(int argc, char **argv) {
     if (n_rest == 0) {
         if (st.output) fprintf(stderr, "note: -o is ignored in the interactive shell; use `save FILE`\n");
         st.output = NULL;
-        st.interactive = stdin_is_terminal();
+        st.interactive = cli_stdin_is_tty();
         rc = repl(&st);
     } else {
         rc = cli_run(&st, n_rest, rest);

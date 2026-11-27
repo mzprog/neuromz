@@ -147,6 +147,14 @@ check 0 "PASS" "$B" -m "$T/nl.nmz" gradcheck --text "Eve"
 check 0 "Weights updated" "$B" -m "$T/nl.nmz" step --text "Bob"
 check 0 "mean forget gate f per cell" "$B" -m "$T/nl.nmz" show gates --data examples/names_en.txt --chars 500
 check 0 "longest memory" "$B" -m "$T/nl.nmz" show gates --text "AnnaMaria"
+# v2.0.0: the model remembers its training data (decision 111)
+check 0 "of the training data" "$B" -m "$T/nl.nmz" show gates
+check 0 " 3\. " "$B" -m "$T/nl.nmz" generate --count 3 --new-only
+check 0 "the 8 largest" "$B" -m "$T/nl.nmz" trace --text "Anna"
+check 0 "val accuracy" "$B" -m "$T/nl.nmz" train examples/names_en.txt --limit 100 --epochs 1
+check 0 "" sh -c "\"$B\" -m \"$T/nl.nmz\" train examples/names_en.txt --limit 50 --epochs 1 | grep 'adam lr' | grep -v 'sgd lr'"
+check 1 "give --data FILE" "$B" -m tests/data/v3_phase4_names_en.nmz generate --new-only   # a phase-4 file
+check 0 " 3\. " "$B" -m tests/data/v3_phase4_names_en.nmz generate --new-only --count 3 --data examples/names_en.txt
 check 0 " 4\. " "$B" -m "$T/nl.nmz" generate --count 4 --seed 3
 check 0 "gru Tx8->Tx6" "$B" new text embed:8 gru:6 vocab --data examples/names_en.txt --epochs 2 -o "$T/ng.nmz"
 check 0 "validation" "$B" -m "$T/ng.nmz" train examples/names_en.txt --limit 100 -o "$T/ng.nmz"
