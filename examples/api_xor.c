@@ -1,6 +1,9 @@
 /* api_xor.c — using libneuromz from C: the beginner path, the advanced path,
- * and the trace callback. Build: make examples   (or see README.md) */
+ * and the trace callback. Build: cmake --build build (see README.md); run
+ * from the repository root: build/api_xor. Exit status 1 if XOR is not
+ * learned (CTest uses it as a regression test). */
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "neuromz.h"
 
@@ -37,11 +40,17 @@ int main(void) {
     TRY(nmz_net_create_quick(&net, 3, sizes, 42, NULL));
     TRY(nmz_net_train(net, ds, NULL, &res));
     printf("quick:    %s after %d epochs, loss %.6f\n", res.converged ? "converged" : "stopped", res.epochs, res.loss);
+    if (!res.converged) return 1;
     for (i = 0; i < 4; i++) {
         TRY(nmz_net_predict(net, X + 2 * i, &out));
         printf("  %g xor %g -> %.3f\n", X[2 * i], X[2 * i + 1], out);
     }
-    TRY(nmz_net_save(net, "build/api_xor.nmz"));
+    {
+        char path[1024];
+        const char *dir = getenv("NMZ_TEST_DIR");
+        snprintf(path, sizeof path, "%s/api_xor.nmz", dir && *dir ? dir : ".");
+        TRY(nmz_net_save(net, path));
+    }
     nmz_net_free(net);
 
     /* 2. Advanced: every layer, init, loss and training knob explicit */
@@ -58,6 +67,7 @@ int main(void) {
     opts.target_loss = 5e-4;
     TRY(nmz_net_train(net, ds, &opts, &res));
     printf("advanced: %s after %d epochs, loss %.6f\n", res.converged ? "converged" : "stopped", res.epochs, res.loss);
+    if (!res.converged) return 1;
 
     /* 3. Trace: watch three training steps on one sample */
     {

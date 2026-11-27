@@ -15,6 +15,8 @@
 #    revision (oldid), which never changes, so per-revision SHA-256 sums
 #    are stable. The wiki markup (header template, links, image, category)
 #    is removed by scripts/strip_wikitext.awk; one paragraph per line.
+# Both prepared files are checked against a SHA-256 as well. On Windows use
+# get_text.ps1 (the same steps and sums) or `cmake --build build --target data-text`.
 set -eu
 DIR=${1:-data}
 HERE=$(dirname "$0")
@@ -28,6 +30,16 @@ sha_of() {
 fetch() { # fetch URL OUT
     if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 2 -A "neuromz-get-text/1.0" -o "$2" "$1"
     else wget -q -U "neuromz-get-text/1.0" -O "$2" "$1"; fi
+}
+
+# the prepared file must be byte-identical everywhere (get_text.ps1 checks
+# the same sums), so every result in the README is reproducible
+check_out() { # check_out FILE SHA256
+    got=$(sha_of "$1")
+    [ "$got" = "$2" ] && return 0
+    echo "error: $1 has sha256 $got, expected $2 (different awk or text tools?)" >&2
+    rm -f "$1"
+    return 1
 }
 
 get_alice() {
@@ -57,6 +69,7 @@ get_alice() {
     echo "verify  $NAME sha256 $got"
     # keep the text between the START and END markers
     awk '/^\*\*\* START OF/ { on = 1; next } /^\*\*\* END OF/ { on = 0 } on' "$raw" >"$OUT.part"
+    check_out "$OUT.part" 2c9eddc277e75b19ce8e5e884e1ee57f2341fa798be0e30057ca82d32366e4af || { rm -f "$raw"; return 1; }
     mv "$OUT.part" "$OUT"
     rm -f "$raw"
     echo "ok      $OUT ($(wc -c <"$OUT") bytes)"
@@ -113,6 +126,7 @@ get_kalila() {
     done || { rm -rf "$tmp"; return 1; }
     echo "verify  19 revisions sha256 ok"
     cat "$tmp"/*.txt | LC_ALL=C awk -f "$HERE/strip_wikitext.awk" >"$OUT.part"
+    check_out "$OUT.part" 709e5b8fc92a2e3393d57382a046bba51713d4d511bddf9e62cfbb8def0ae90a || { rm -rf "$tmp"; return 1; }
     mv "$OUT.part" "$OUT"
     rm -rf "$tmp"
     echo "ok      $OUT ($(wc -c <"$OUT") bytes)"
