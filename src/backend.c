@@ -7,7 +7,7 @@
  * nmz_backend_select_thread, which wins over the process-wide choice in
  * that thread only (decision 158: a server's worker threads each run a job
  * on its own device). The CPU is the default, so a program that never
- * selects anything runs exactly as with v2.0.1. Device backends initialise
+ * selects anything runs the reference loops. Device backends initialise
  * lazily, once, the first time they are selected or queried; until then
  * nothing of theirs runs, which is how a CUDA build works on a machine
  * without a GPU or driver. The registry and the process-wide selection are

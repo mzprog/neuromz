@@ -1,12 +1,13 @@
 /* backend_cpu.c — the CPU backend, the reference every other backend is
  * compared with (DESIGN §11.2).
  *
- * Its ops are the loops of v2.0.1, moved here or left next to their layer
- * (the layer kernels nmz__cpu_*), so a net on the CPU computes bit for bit
- * what v2.0.1 computed. Two tables share them:
+ * Its ops are the reference loops (the library's CPU code from before the
+ * backends, decision 128), moved here or left next to their layer (the
+ * layer kernels nmz__cpu_*), so a net on the CPU computes bit for bit what
+ * that code computed. Two tables share them:
  *
  *   "cpu"          the ops plus the fused layer kernels (dense, conv2d,
- *                  rnn, lstm, gru): the v2.0.1 arithmetic, the default;
+ *                  rnn, lstm, gru): the reference arithmetic, the default;
  *   "cpu-generic"  the same ops without fused kernels, so the layers
  *                  compose their math from gemm and the cell ops exactly
  *                  as on a GPU. It runs the device code path on the CPU,
@@ -81,7 +82,7 @@ static nmz_status cpu_mul(const nmz_backend *be, size_t n, const float *a, const
 
 /* ------------------------------------------------------------ products */
 
-/* contiguous operands go to nmz_matmul (blocked, the v2.0.1 products);
+/* contiguous operands go to nmz_matmul (blocked, the reference products);
  * strided ones to the same sums as three loops — nmz_matmul is
  * bit-identical to those (decision 92), so both give the same bits */
 static nmz_status cpu_gemm(const nmz_backend *be, unsigned flags, int M, int N, int K, const float *A, int lda,
@@ -103,7 +104,7 @@ static nmz_status cpu_gemm(const nmz_backend *be, unsigned flags, int M, int N, 
     return NMZ_OK;
 }
 
-/* the v2.0.1 add_rows (attention.c) */
+/* the reference add_rows (attention.c) */
 static nmz_status cpu_add_bias(const nmz_backend *be, size_t rows, int cols, float *Y, const float *bias) {
     size_t r;
     int j;
@@ -126,7 +127,7 @@ static nmz_status cpu_add_bias3(const nmz_backend *be, int A, int B, int C, floa
     return NMZ_OK;
 }
 
-/* the v2.0.1 colsum_add (attention.c): sums in double */
+/* the reference colsum_add (attention.c): sums in double */
 static nmz_status cpu_colsum_add(const nmz_backend *be, size_t rows, int cols, const float *A, float *out) {
     double stack[256], *acc = cols <= 256 ? stack : calloc((size_t)cols, sizeof *acc);
     size_t r;
@@ -220,7 +221,7 @@ static nmz_status cpu_col2im(const nmz_backend *be, const nmz_conv_shape *s, con
 
 /* ---------------------------------------------------------------- dropout */
 
-/* the v2.0.1 masks: one draw of the net's PCG32 per element */
+/* the reference masks: one draw of the net's PCG32 per element */
 static nmz_status cpu_dropout_mask(const nmz_backend *be, size_t n, float rate, nmz_rng *rng, float *mask) {
     const float keep = 1.0f / (1.0f - rate);
     size_t i;
@@ -364,7 +365,7 @@ static nmz_status cpu_gru_cell_backward2(const nmz_backend *be, int B, int H, nm
 }
 
 /* ------------------------------------------------------------- optimizers
- * the v2.0.1 update loops of net.c */
+ * the reference update loops of net.c */
 
 static nmz_status cpu_sgd_velocity(const nmz_backend *be, size_t n, float lr, float mu, int fresh, const float *g,
                                    const float *v_prev, float *v_out) {
@@ -407,7 +408,7 @@ static nmz_status cpu_adam_preview(const nmz_backend *be, size_t n, double lr, d
     return NMZ_OK;
 }
 
-/* the v2.0.1 clipping loops: one double accumulator over every tensor */
+/* the reference clipping loops: one double accumulator over every tensor */
 static nmz_status cpu_sumsq(const nmz_backend *be, int k, float *const *x, const size_t *n, double *out) {
     double sq = 0.0;
     int i;
@@ -430,7 +431,7 @@ static nmz_status cpu_scale(const nmz_backend *be, int k, float *const *x, const
 
 /* ------------------------------------------------------- the training loop */
 
-/* the v2.0.1 nmz__norm_apply / nmz__norm_scale_grad (normalize.c) */
+/* the reference nmz__norm_apply / nmz__norm_scale_grad (normalize.c) */
 static nmz_status cpu_norm_apply(const nmz_backend *be, size_t n, size_t per, size_t div, int groups,
                                  const float *offset, const float *scale, float *x, int grad) {
     size_t e;

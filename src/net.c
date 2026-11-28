@@ -10,7 +10,7 @@
  *
  * Every computation goes through the backend the net is on (net->be, which
  * follows nmz_backend_select): layers get it in their nmz_ctx, and the
- * optimizer and clipping call its ops. On the CPU these are the v2.0.1
+ * optimizer and clipping call its ops. On the CPU these are the reference
  * loops; nothing else changes (DESIGN §11). */
 #include "internal.h"
 

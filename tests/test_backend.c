@@ -1,7 +1,7 @@
 /* test_backend.c — the backend layer (DESIGN §11), without a GPU.
  *
  *   - selection and information (auto falls back to the CPU here);
- *   - every layer type on "cpu" (the v2.0.1 kernels) against
+ *   - every layer type on "cpu" (the reference kernels) against
  *     "cpu-generic" (the compositions a GPU runs): outputs, every
  *     parameter gradient and the input gradient agree to float rounding;
  *   - a fake device registered through the public API: the CPU's ops, but

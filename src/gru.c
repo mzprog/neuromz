@@ -68,7 +68,7 @@ static nmz_status gru_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
     return nmz__recurrent_init(g->init, &g->resolved, &g->Wx, &g->Wh, g->D, g->units, 3, rng);
 }
 
-/* The CPU kernels: the v2.0.1 loops (each row through all its steps, the
+/* The CPU kernels: the reference loops (each row through all its steps, the
  * gate inputs summed in double). With rec, the trace's per-step values are
  * recorded instead of being emitted from inside the loop. */
 nmz_status nmz__cpu_gru_forward(const nmz_backend *be, int B, int T, int D, int H, const float *x, const float *h0,

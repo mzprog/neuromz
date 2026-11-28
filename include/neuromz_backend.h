@@ -4,8 +4,9 @@
  * A backend is a table of functions: memory management and the numeric
  * kernels ("ops") the layers are written in. Every layer computes through
  * the backend in its nmz_ctx, so the same layer code runs on the CPU and on
- * a GPU. The CPU backend is the reference: its ops are the loops of v2.0.1,
- * so results on the CPU are bit-identical to that release.
+ * a GPU. The CPU backend is the reference: its ops are the reference loops
+ * (the library's CPU code from before the backends, DESIGN decision 128),
+ * so results on the CPU are bit-identical to that code.
  *
  * Who needs this header:
  *   - authors of a new backend (HIP, Vulkan, OpenCL, ...): implement the

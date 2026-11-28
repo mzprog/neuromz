@@ -118,7 +118,7 @@ static nmz_status attn_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
 
 /* ------------------------------------------------- the CPU kernels
  * The core for one (row b, head h): scores, softmax, weighted sum — the
- * v2.0.1 loops, the dot products in double. */
+ * reference loops, the dot products in double. */
 typedef struct core {
     int H, T, Tk, Tp, d, E;
     const float *qkv, *kv, *P, *dcv;

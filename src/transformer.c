@@ -123,7 +123,7 @@ static nmz_status pos_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
     return NMZ_OK;
 }
 
-/* The CPU kernels (the v2.0.1 loops). */
+/* The CPU kernels (the reference loops). */
 nmz_status nmz__cpu_posenc_forward(const nmz_backend *be, int B, int T, int D, const int *off, const float *x,
                                    const float *P, float *y) {
     int b, t, k;
@@ -334,7 +334,7 @@ static nmz_status ln_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
     return NMZ_OK;
 }
 
-/* The CPU kernels: the v2.0.1 loops (statistics in double). */
+/* The CPU kernels: the reference loops (statistics in double). */
 nmz_status nmz__cpu_layernorm_forward(const nmz_backend *be, size_t rows, int D, float eps, const float *x,
                                       const float *g, const float *b, float *y, float *xhat, float *mean,
                                       float *rstd) {

@@ -106,7 +106,7 @@ static nmz_status act_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) {
     return NMZ_OK;
 }
 
-/* The CPU kernels (the v2.0.1 loops). */
+/* The CPU kernels (the reference loops). */
 nmz_status nmz__cpu_softmax_forward(const nmz_backend *be, size_t rows, int cols, const float *z, float *p) {
     size_t r;
     int k;

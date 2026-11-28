@@ -74,7 +74,7 @@ static nmz_status token_of(int V, float v, int *id) {
     return NMZ_OK;
 }
 
-/* The CPU kernels (the v2.0.1 loops). */
+/* The CPU kernels (the reference loops). */
 nmz_status nmz__cpu_embed_forward(const nmz_backend *be, size_t n, int V, int D, const float *ids, const float *W,
                                   float *y) {
     size_t i;
@@ -355,7 +355,7 @@ nmz_status nmz__slice_t(const nmz_tensor *src, int t, nmz_tensor *dst) {
     return nmz__slice_tc(src, t, 0, src->shape[2], dst);
 }
 
-/* The CPU kernels: the v2.0.1 loops (each row through all its steps; the
+/* The CPU kernels: the reference loops (each row through all its steps; the
  * sums in double). With rec, the trace's per-step values are recorded
  * instead of being emitted from inside the loop. */
 nmz_status nmz__cpu_rnn_forward(const nmz_backend *be, int B, int T, int D, int H, const float *x, const float *h0,

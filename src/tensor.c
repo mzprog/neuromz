@@ -4,7 +4,7 @@
  * device backend has computed on also has a device copy (dev, backend.c);
  * these functions keep the two consistent: reshape drops a device buffer
  * that became too small, zero and copy work where the newest data is. A
- * host-only tensor (dev == NULL) takes exactly the v2.0.1 code paths. */
+ * host-only tensor (dev == NULL) takes exactly the reference code paths. */
 #include "internal.h"
 
 #include <stdlib.h>

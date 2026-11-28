@@ -63,7 +63,7 @@ static nmz_status dense_init(nmz_layer *l, nmz_rng *rng, const nmz_layer *next) 
     return NMZ_OK;
 }
 
-/* The CPU kernels: the v2.0.1 loops. The forward sums each row in double
+/* The CPU kernels: the reference loops. The forward sums each row in double
  * (decision 1); the weight gradient adds row by row in float. */
 nmz_status nmz__cpu_dense_forward(const nmz_backend *be, size_t rows, int n_in, int units, const float *x,
                                   const float *W, const float *b, float *y) {

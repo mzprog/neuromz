@@ -50,7 +50,7 @@ static nmz_status check_pair(const nmz_tensor *y, const nmz_tensor *t) {
     return NMZ_OK;
 }
 
-/* The CPU kernels: the v2.0.1 loops on raw rows × cols arrays. */
+/* The CPU kernels: the reference loops on raw rows × cols arrays. */
 nmz_status nmz__cpu_loss_value(const nmz_backend *be, nmz_loss kind, size_t rows, int cols, const float *y,
                                const float *t, const float *z, double *out) {
     size_t r, size = rows * (size_t)cols;

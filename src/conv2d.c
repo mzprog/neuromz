@@ -115,7 +115,7 @@ static void emit(const nmz_ctx *ctx, conv_layer *c, nmz_trace_phase ph, int n, c
  * inner loop runs over contiguous memory. Backward: dW += dz·colᵀ,
  * dcol = Wᵀ·dz, then dcol is scattered back ("col2im") into dx.
  *
- * These are the CPU kernels (v2.0.1's loops, one sample at a time). A
+ * These are the CPU kernels (the reference loops, one sample at a time). A
  * backend without them gets the generic path further down: one im2col for
  * the whole batch and one matrix product per pass. */
 

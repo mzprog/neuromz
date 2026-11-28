@@ -35,7 +35,7 @@ char *nmz__strdup(const char *s);
 nmz_status nmz__last_status(void);
 
 /* ----- backends and device copies of tensors (backend.c, DESIGN §11) */
-extern const nmz_backend nmz__cpu_backend;         /* the reference: v2.0.1's loops      */
+extern const nmz_backend nmz__cpu_backend;         /* the reference loops                */
 extern const nmz_backend nmz__cpu_generic_backend; /* the same ops, no fused kernels     */
 #ifdef NMZ_HAVE_CUDA
 const nmz_backend *nmz__cuda_backend(void);        /* src/cuda/backend_cuda.cu           */

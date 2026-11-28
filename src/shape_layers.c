@@ -75,7 +75,7 @@ static void pool_emit(const nmz_ctx *ctx, const pool_layer *p, nmz_trace_phase p
     nmz_trace_emit(ctx, ph, "maxpool2d", "", 2, sc, n, it);
 }
 
-/* The CPU kernels (the v2.0.1 loops). */
+/* The CPU kernels (the reference loops). */
 nmz_status nmz__cpu_maxpool_forward(const nmz_backend *be, int planes, int H, int W, int size, int stride, int OH,
                                     int OW, const float *x, float *y, float *argmax) {
     int bc, oy, ox, ky, kx;

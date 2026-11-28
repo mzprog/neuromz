@@ -229,7 +229,7 @@ static nmz_status evaluate_range(nmz_net *net, const nmz_dataset *ds, resident *
     int start, mode = accuracy_mode(net, ds), T = steps_of(ds), c = 0;
     int chunk = carry ? 1 : ds->time_steps > 0 ? 64 : 256;
     /* on a device no larger than the training batch, whose activations fit (the
-     * CPU keeps v2.0.1's chunks: they decide the order the losses are summed in) */
+     * CPU keeps the reference chunks: they decide the order the losses are summed in) */
     if (rd && rd->x) {
         int bsz = net->train_batch > 0 ? net->train_batch : net->train.batch_size; /* this run's, or the stored one */
         if (bsz > 0 && chunk > bsz) chunk = bsz;
