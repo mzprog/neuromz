@@ -9,7 +9,8 @@ loss, every `δ`, every gradient and every weight update — as trace events,
 and every derivative is checked against numerical gradients.
 
 NeuroMZ is in active development, with no releases yet (the version is
-`2.0.0-dev`; development happens on the `2.0.0-dev` branch).
+`2.0.0-dev`; development happens on the `2.0.0-dev` branch). The `v1.0`
+release of 2017 is the old NeuroMZ 1 ([`legacy/`](legacy/)).
 
 * Dense, Conv2D (naive and im2col), MaxPool2D, Flatten, Dropout; SGD with
   momentum, Adam, AdamW; step, cosine and warm-up + cosine schedules; input
