@@ -32,14 +32,17 @@
 extern "C" {
 #endif
 
+/* "2.0.0-dev" until the first release (DESIGN decisions 169-170). Within
+ * one MAJOR, a program tests the NMZ_HAVE_* macros below for a feature,
+ * not the version numbers. */
 #define NMZ_VERSION_MAJOR 2
-#define NMZ_VERSION_MINOR 2
+#define NMZ_VERSION_MINOR 0
 #define NMZ_VERSION_PATCH 0
-#define NMZ_VERSION_STRING "2.2.0"
+#define NMZ_VERSION_STRING "2.0.0-dev"
 
-/* this library has nmz_backend_select & co. (2.1.0 on) */
+/* this library has nmz_backend_select & co. (the device backends) */
 #define NMZ_HAVE_BACKENDS 1
-/* this library has nmz_backend_select_thread and nmz_model_new & co. (2.2.0 on) */
+/* this library has nmz_backend_select_thread and nmz_model_new & co. */
 #define NMZ_HAVE_THREADS 1
 #define NMZ_HAVE_MODEL_WORDS 1
 
@@ -134,7 +137,7 @@ typedef struct nmz_device_info {
 nmz_status nmz_backend_select(const char *name);
 /* The same for the calling thread only (it wins over nmz_backend_select in
  * this thread); NULL returns the thread to the process-wide selection.
- * Other threads are not affected. (2.2.0 on.) */
+ * Other threads are not affected. */
 nmz_status nmz_backend_select_thread(const char *name);
 /* Wait until the device work this thread queued is done (no-op on the CPU).
  * Needed only before another thread uses a net whose last call queued work

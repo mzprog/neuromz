@@ -17,7 +17,18 @@
 # CMake 3.21 is the minimum: it is the first version that passes C11/C17
 # to MSVC (/std:c11) — DESIGN decision 114.
 cmake_minimum_required(VERSION 3.21)
-project(neuromz VERSION 2.2.0 DESCRIPTION "Educational neural-network engine" LANGUAGES C)
+project(neuromz VERSION 2.0.0 DESCRIPTION "Educational neural-network engine" LANGUAGES C)
+
+# The version string: CMake's VERSION holds numbers only, so the whole string
+# (2.0.0-dev until the first release, DESIGN decisions 169-170) is here and in
+# include/neuromz.h (NMZ_VERSION_STRING, NMZ_VERSION_MAJOR/MINOR/PATCH); they
+# must agree with each other and with the VERSION above.
+set(NMZ_VERSION_STRING "2.0.0-dev")
+file(STRINGS "${PROJECT_SOURCE_DIR}/include/neuromz.h" _nmz_h REGEX "^#define NMZ_VERSION_(STRING|MAJOR|MINOR|PATCH) ")
+if(NOT _nmz_h STREQUAL "#define NMZ_VERSION_MAJOR ${PROJECT_VERSION_MAJOR};#define NMZ_VERSION_MINOR ${PROJECT_VERSION_MINOR};#define NMZ_VERSION_PATCH ${PROJECT_VERSION_PATCH};#define NMZ_VERSION_STRING \"${NMZ_VERSION_STRING}\""
+   OR NOT NMZ_VERSION_STRING MATCHES "^${PROJECT_VERSION}(-|$)")
+  message(FATAL_ERROR "include/neuromz.h (${_nmz_h}) does not match the version here (${PROJECT_VERSION}, ${NMZ_VERSION_STRING})")
+endif()
 
 set(NMZ_TOP ${PROJECT_IS_TOP_LEVEL})
 option(NMZ_OPENMP "Multi-threaded matrix products and attention heads (OpenMP)" OFF)
