@@ -8,6 +8,9 @@ be *watched*: each layer reports the numbers it computes — `z`, `a`, the
 loss, every `δ`, every gradient and every weight update — as trace events,
 and every derivative is checked against numerical gradients.
 
+NeuroMZ is in active development, with no releases yet (the version is
+`2.0.0-dev`; development happens on the `2.0.0-dev` branch).
+
 * Dense, Conv2D (naive and im2col), MaxPool2D, Flatten, Dropout; SGD with
   momentum, Adam, AdamW; step, cosine and warm-up + cosine schedules; input
   normalisation stored with the model
@@ -21,12 +24,12 @@ and every derivative is checked against numerical gradients.
   cache for generation that is bit-identical to recomputation
 * Portable model files (little-endian, versioned, CRC-32): files from every
   earlier phase still load
-* **Device backends** (2.1): the CPU by default (bit-identical to 2.0)
+* **Device backends**: the CPU by default (bit-identical to the code before them)
   and, built with `-DNMZ_CUDA=ON`, NVIDIA GPUs — every layer type trains
   there (cuBLAS + the library's own kernels), 10–240× faster on the models
   below; the public API stays C, traces still work, model files are the
   same on every device, and a CUDA build still runs without a GPU
-* **Threads** (2.2): several nets train at once in several threads, each
+* **Threads**: several nets train at once in several threads, each
   on its own device (`nmz_backend_select_thread`), with the results of
   sequential runs — on the CPU and on the GPU; and models **described in
   words** (`nmz_model_new`: the layer grammar and presets of the program's
@@ -80,12 +83,13 @@ runs only when the data has been downloaded.
 Using it from another CMake project:
 
 ```cmake
-find_package(neuromz 2.2 REQUIRED)          # after cmake --install
+find_package(neuromz 2.0 REQUIRED)          # after cmake --install
 target_link_libraries(app PRIVATE neuromz::neuromz)
 
-# or without installing:
+# or without installing (no releases yet: pin a full commit SHA of the
+# 2.0.0-dev branch, as neuromz-cli and neuromz-server do):
 include(FetchContent)
-FetchContent_Declare(neuromz GIT_REPOSITORY https://github.com/mzprog/neuromz.git GIT_TAG v2.2.0)
+FetchContent_Declare(neuromz GIT_REPOSITORY https://github.com/mzprog/neuromz.git GIT_TAG <commit SHA>)
 FetchContent_MakeAvailable(neuromz)
 target_link_libraries(app PRIVATE neuromz::neuromz)
 ```
@@ -388,8 +392,8 @@ present), and in CI a consumer of the installed package:
   memory, poisoned with NaN, explicit copies) bit-identical to
   cpu-generic for passes, gradient checks, training with the data on the
   device, moving a net mid-training, generation with and without the KV
-  cache, traces and a layer written for 2.0; running out of device memory
-  and retrying with a smaller batch;
+  cache, traces and a layer written before the backends; running out of
+  device memory and retrying with a smaller batch;
 * **the GPU** (`-DNMZ_CUDA=ON`, `ctest -L gpu`, skipped without a GPU):
   every op of the CUDA backend against the CPU on random inputs and odd
   shapes, within tolerances stated and explained in
@@ -441,14 +445,14 @@ RNN with truncated BPTT, clipping, validation/early stopping and generation
 (phase 3); LSTM, GRU, gate traces, gradient survival, Arabic prose (phase
 4); a decoder-only Transformer with AdamW, warm-up, a blocked matrix
 product, a KV cache and attention traces (phase 5); CMake, native Windows,
-CI, the first public release and the split into repositories (v2.0.0);
-device backends with CUDA (v2.1.0); threads and models described in
-words (v2.2.0), with
+CI and the split into repositories; device backends with CUDA; threads and
+models described in words, with
 [`neuromz-protocol`](https://github.com/mzprog/neuromz-protocol) and
 [`neuromz-server`](https://github.com/mzprog/neuromz-server) in their own
-repositories and the program's remote mode — over HTTP at first (protocol
-1.0.0, server 0.1.0), then over a binary protocol of its own (protocol
-2.0.0, server 0.2.0, program 2.3.0). Next: `neuromz-php` (a PHP client of
+repositories and the program's remote mode — over HTTP at first, then over
+a binary protocol of its own (wire protocol 2). Nothing is released yet:
+the first release will be 2.0.0 of every repository ([DESIGN](docs/DESIGN.md)
+decisions 169–172). Next: `neuromz-php` (a PHP client of
 the protocol, for web applications and a web viewer of the trace events);
 in this repository, more backends (HIP, Vulkan) on the same table of ops.
 

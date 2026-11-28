@@ -19,7 +19,11 @@ decisions 91–110. Release 2.1 (device backends: the backend layer, the
 CPU and CUDA backends, devices in the program) added §11 and decisions
 127–157. Release 2.2 (threads, models described in words in the library,
 the program's remote mode; the server and the protocol have their own
-design documents) added §11.8 and decisions 158–165.
+design documents) added §11.8 and decisions 158–165; the program's remote
+mode over protocol 2 added decisions 166–168. The release numbers in this
+document (2.0.0 to 2.3.0) name development snapshots: their tags and
+releases were withdrawn, nothing is released until the owner says so, and
+development continues on the branch `2.0.0-dev` (decisions 169–172).
 
 ---
 
@@ -62,7 +66,7 @@ src/                   libneuromz — platform-independent C11, libc + libm only
   defaults.c           "quick mode" defaults and the reasons for them
   backend.c            backend registry and selection; device copies of
                        tensors (§11)
-  backend_cpu.c        the CPU backend: the ops (v2.0.1's loops) and the
+  backend_cpu.c        the CPU backend: the ops (the reference loops) and the
                        "cpu-generic" table without fused kernels
   internal.h           private helpers shared by the library sources
 tests/                 test_*.c (unit, gradient checks, convergence, I/O),
@@ -562,9 +566,10 @@ phase-4 commits) must load and generate the same text.
 ## 8. CLI
 
 (The program lives in [neuromz-cli](https://github.com/mzprog/neuromz-cli)
-since v2.0.0; this section stays here because the decisions below refer to
-it.) `neuromz` with no arguments starts an interactive shell (prompt only when
-stdin is a terminal, so scripts can be piped in). `neuromz CMD ARGS...` runs
+since the split into repositories (decision 121); this section stays here
+because the decisions below refer to it.) `neuromz` with no arguments starts
+an interactive shell (prompt only when stdin is a terminal, so scripts can
+be piped in). `neuromz CMD ARGS...` runs
 one command; `-m FILE` loads a model first and `-o FILE` saves it after, so
 one-shot use composes in shell scripts.
 
@@ -605,13 +610,13 @@ real numbers; `show attention` a heatmap and the head patterns over any
 text; `show params` the parameters per component; `generate --context N
 --no-cache`; `compare` accepts Transformers.
 
-Remote mode (2.2, decisions 161–165; protocol 2 since program 2.3,
-decisions 166–168): profiles in `client.conf` (`--profile NAME`, `--host`,
-`--token`); the same commands against a
+Remote mode (decisions 161–165; over protocol 2, decisions 166–168):
+profiles in `client.conf` (`--profile NAME`, `--host`, `--token`); the same
+commands against a
 [neuromz-server](https://github.com/mzprog/neuromz-server) over the
 [NeuroMZ protocol](https://github.com/mzprog/neuromz-protocol).
 
-Devices (2.1, decisions 154–157): `--device auto|cpu|cuda` for one command
+Devices (decisions 154–157): `--device auto|cpu|cuda` for one command
 or the shell, `set --device D` in the shell, `train … --device D` for one
 run, `show device`; `new` and `train` print the device with the other
 settings, tagged `[auto]` (with the reason) or `[yours]`.
@@ -1355,7 +1360,9 @@ attention traces):
     before a release. Library and CLI share version numbers. When the
     library is a subproject, its tests and examples are off and its
     warnings are not errors (a newer compiler must not break a user's
-    build); its own CI keeps `-Werror`.
+    build); its own CI keeps `-Werror`. *(Superseded by decisions 170 and
+    172: versions move in lockstep by MAJOR only, and the program pins the
+    library by commit SHA.)*
 123. **The library's regressions run without the CLI.** CTest runs the unit
     tests, `examples/api_xor.c` (fails if quick-mode or hand-built XOR does
     not converge) and `examples/api_mnist.c` (the mnist-cnn architecture,
@@ -1372,7 +1379,7 @@ attention traces):
     both repositories were checked for tracked datasets, models (only the
     small `tests/data/*.nmz` fixtures are tracked), build outputs and
     secrets. The contact address in `legacy/` is the v1 code's own and was
-    already public.
+    already public. *(The tags and releases were withdrawn: decision 169.)*
 125. **The GitHub repository is `mzprog/neuromz`** (renamed from
     `NeuroMZ` with `gh repo rename` at the release; GitHub redirects the
     old URL, and the names of the planned repositories are lower case too).
@@ -1390,7 +1397,8 @@ attention traces):
     were found by the first run of the manual `data` workflow, minutes
     after `v2.0.0` was published. Published tags are not rewritten:
     `v2.0.1` carries the fix, and `neuromz-cli` 2.0.1 pins it (its data
-    targets run the library's scripts from the fetched release).
+    targets run the library's scripts from the fetched release). *(Withdrawn
+    with the other tags: decision 169.)*
 
 ### Release 2.1: device backends (Step A: the backend layer and the CPU backend)
 
@@ -1726,6 +1734,7 @@ attention traces):
     by a pointer each, so code built against 2.0 must be recompiled (the
     library is a static library by default, which a program rebuilds with
     it anyway). The CLI 2.1.0 pins `v2.1.0` and adds `--device`.
+    *(Withdrawn with the other tags: decision 169.)*
 
 ### Release 2.1, Step D: devices in the program
 
@@ -1879,10 +1888,74 @@ speaks only that. The program follows; the library does not change.
     2.3.0 against library 2.2.0; `neuromz --version` names the program,
     the library and the protocol (`neuromz 2.3.0 (library 2.2.0, remote
     protocol 2.0)`), and `NMZ_LIBRARY_TAG` still pins the library.
+    *(Superseded by decisions 169–172: every repository is `2.0.0-dev`
+    until the release, `--version` reads `neuromz-cli 2.0.0-dev (library
+    2.0.0-dev, wire protocol 2)`, and `NMZ_LIBRARY_REF` pins a commit.)*
 
 168. **Local mode stays byte for byte.** The commands that run locally are
     untouched; their output and the model files they write are compared
     with 2.2.0's in the release checks (the same text, the same bytes).
+
+### Versions, branches and pins
+
+The owner's decision of 2026-11-28, in the same words in the DESIGN.md of
+every NeuroMZ repository (neuromz, neuromz-cli, neuromz-protocol,
+neuromz-server).
+
+169. **No releases and no version tags until the owner says the project is
+    ready.** NeuroMZ is in active development. The version tags and GitHub
+    releases published before 2026-11-28 (library 2.0.0 to 2.2.0, program
+    2.0.0 to 2.3.0, protocol 1.0.0 and 2.0.0, server 0.1.0 and 0.2.0) were
+    development snapshots and are withdrawn; where older decisions and
+    changelog entries name those numbers, they name the snapshots. The
+    NeuroMZ 1 code keeps its tags (`v1-legacy`, and `v1.0` in the library).
+    No tag and no release is made in any repository until the owner says the
+    project is ready.
+
+170. **Versions move in lockstep by MAJOR; the wire protocol has its own
+    number.** All repositories share the same MAJOR version: the first
+    release will be 2.0.0 for every repository, including repositories
+    created later that never had a 1.x. MINOR and PATCH are each
+    repository's own: several repositories may move together while others
+    stay on older numbers. Any 2.x repository works with any other 2.x
+    repository: newer features are negotiated through the capabilities of
+    the protocol's handshake, and a missing feature gives a clear error,
+    never a crash. A breaking change means 3.0.0 for all repositories. The
+    wire protocol's version (the number in the handshake, now 2) is separate
+    from the repositories' versions and changes only when the bytes on the
+    wire change incompatibly. Until the release the version string of every
+    repository is `2.0.0-dev`: CMake's `project(VERSION)` holds numbers
+    only, so it says 2.0.0, and the full string is carried in a variable
+    next to it and in a macro in the code. `neuromz --version` names the
+    program, the library and the wire protocol (`neuromz-cli 2.0.0-dev
+    (library 2.0.0-dev, wire protocol 2)`), and `neuromz-server --version`
+    the same way.
+
+171. **Development happens on `2.0.0-dev`; `master` waits for the release.**
+    Every repository has the branch `2.0.0-dev`, created from `master` on
+    2026-11-28 and its default branch on GitHub; all development continues
+    there. `master` stays where it was and is updated only at release time
+    (until then the program's and the server's `master` pin the withdrawn
+    tags, so they no longer build from a fresh clone). CI runs in full on
+    pushes to `2.0.0-dev` and to `master` and on pull requests.
+
+172. **The repositories pin each other by full commit SHA.** Every
+    FetchContent declaration between the repositories (the program and the
+    server fetch the library and the protocol) and every ref that CI checks
+    out by default (the program's and the protocol's CI build the server)
+    names the full 40-digit SHA of a commit on the dependency's `2.0.0-dev`,
+    never a tag or a branch, so a build is reproducible. The local-path
+    options (`-DNMZ_LOCAL_PATH`, `-DNMZP_LOCAL_PATH`) and the manual CI
+    inputs (`protocol_ref`, `server_ref`) stay, for working on several
+    repositories at once or trying another commit; one job of the program's
+    CI also builds against the library's `2.0.0-dev` as it is, to show
+    breakage before a pin moves. **When a dependency changes, the pinned
+    SHAs in the dependent repositories are updated in the same piece of
+    work**, and the dependents' CI passes with the new pins before the work
+    is done. A pin is a commit on `2.0.0-dev`, not necessarily the newest: a
+    commit that changes only a dependency's CI or documentation needs no new
+    pins, which also ends the one cycle (the protocol's CI builds the
+    server, which pins the protocol).
 
 ---
 
@@ -1895,7 +1968,7 @@ speaks only that. The program follows; the library does not change.
         │  ctx->backend->gemm(…), ->lstm_cell_forward(…), …       │
         ▼                                                         ▼
  nmz_backend  ── memory: alloc release upload download sync ──────┘
-   ├─ "cpu"          the ops = v2.0.1's loops, + fused kernels   (backend_cpu.c)
+   ├─ "cpu"          the reference loops + fused kernels         (backend_cpu.c)
    ├─ "cpu-generic"  the same ops, no fused kernels              (testing)
    └─ "cuda"         cuBLAS + kernels, device memory             (src/cuda/, §11.7)
 ```
@@ -1908,7 +1981,7 @@ which outputs are added into, which scalars are valid only after `sync`).
 
 ### 11.2 The CPU backend and cpu-generic
 
-The CPU table is v2.0.1 (decision 128). `cpu-generic` shares its ops and
+The CPU table is the reference loops (decision 128). `cpu-generic` shares its ops and
 leaves the fused kernels out, so on the CPU it runs exactly what a GPU
 runs: one input GEMM for all time steps, a recurrent GEMM and a cell op
 per step, im2col over the whole batch and one GEMM per pass; it is the

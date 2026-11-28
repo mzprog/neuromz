@@ -1,11 +1,34 @@
 # Changelog
 
 All notable changes to the NeuroMZ library. The command-line program has
-its own changelog in [neuromz-cli](https://github.com/mzprog/neuromz-cli);
-both use the same version numbers. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+its own changelog in [neuromz-cli](https://github.com/mzprog/neuromz-cli).
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [2.2.0] — 2026-11-27
+## Unreleased (2.0.0-dev)
+
+Nothing is released yet. The version numbers below (2.0.0, 2.0.1, 2.1.0,
+2.2.0) were development snapshots: their tags and GitHub releases were
+withdrawn on 2026-11-28, and the first release will be 2.0.0 of every
+NeuroMZ repository ([`docs/DESIGN.md`](docs/DESIGN.md) decisions 169–172).
+
+### Versions and branches — 2026-11-28
+
+- **Version `2.0.0-dev`** (`NMZ_VERSION_STRING`; `NMZ_VERSION_MAJOR/MINOR/PATCH`
+  2, 0, 0; CMake's `project(VERSION)` 2.0.0 with the full string in
+  `NMZ_VERSION_STRING` next to it, checked against the header when
+  configuring). `find_package(neuromz 2.0)` finds it; within a MAJOR,
+  programs test the `NMZ_HAVE_*` macros for features.
+- **Development on the branch `2.0.0-dev`**, the default branch; `master`
+  stays as it was until a release. CI runs on pushes to both and on pull
+  requests (no longer on the old `v2` branch).
+- **No releases and no version tags** until the owner says the project is
+  ready; versions move in lockstep by MAJOR across the repositories, and
+  the wire protocol has its own number (decisions 169–172).
+- Comments and documents name the CPU backend's ops "the reference loops"
+  (the code from before the backends) instead of a withdrawn version.
+  Results are unchanged, bit for bit.
+
+### 2.2.0 — development snapshot, 2026-11-27 (withdrawn)
 
 Threads, and models described in words, for
 [neuromz-server](https://github.com/mzprog/neuromz-server) (which runs
@@ -13,7 +36,7 @@ several jobs at once) and the program's remote mode. Design:
 [`docs/DESIGN.md`](docs/DESIGN.md) §11.8 and decisions 158–165. On the CPU,
 everything computes exactly as in 2.1.0, bit for bit.
 
-### Added
+#### Added
 - **Several nets at once in several threads.** The backend registry and the
   process-wide selection are behind a lock; `nmz_backend_select_thread`
   picks a device for the calling thread only (it wins over
@@ -40,20 +63,20 @@ everything computes exactly as in 2.1.0, bit for bit.
   (three GPU nets and a CPU net at once, files identical to sequential
   runs).
 
-### Unchanged
+#### Unchanged
 - The public API of 2.1 (everything added is new), the file format, and
   every CPU result: the probe of decision 128 gives the same 75 lines and
   11 model files as 2.0.1 and 2.1.0. Progress and stopping already had
   their hooks (`on_batch` / `on_epoch` returning non-zero); they are now
   tested mid-epoch.
 
-## [2.1.0] — 2026-11-27
+### 2.1.0 — development snapshot, 2026-11-27 (withdrawn)
 
 Device backends, and a CUDA backend that trains every model type on an
 NVIDIA GPU. Design: [`docs/DESIGN.md`](docs/DESIGN.md) §11 and decisions
 127–157. On the CPU, everything computes exactly as in 2.0.1, bit for bit.
 
-### Added
+#### Added
 - **The backend layer** (`include/neuromz_backend.h`): a table of memory
   functions and about fifty ops (GEMM with transpose flags, element-wise
   ops, activations, softmax and the fused cross-entropy, reductions,
@@ -94,7 +117,7 @@ NVIDIA GPU. Design: [`docs/DESIGN.md`](docs/DESIGN.md) §11 and decisions
 - CI: the CUDA backend compiled on Linux (GCC) and Windows (MSVC) with
   CUDA 13.5, and those builds' tests run without a GPU.
 
-### Changed
+#### Changed
 - `nmz_tensor` has one more field (`dev`), `nmz_ctx` one more
   (`backend`), `nmz_layer_ops` one more optional entry (`buffers`):
   source-compatible (`NMZ_TENSOR_EMPTY` and designated initialisers keep
@@ -105,9 +128,9 @@ NVIDIA GPU. Design: [`docs/DESIGN.md`](docs/DESIGN.md) §11 and decisions
   13.2 → 10.6 s, a char-LSTM epoch 6.80 → 6.53 s, a char-GPT epoch 8.64 →
   8.45 s (MSVC; plain pointers into the kernels optimise better).
 
-## [2.0.1] — 2026-11-27
+### 2.0.1 — development snapshot, 2026-11-27 (withdrawn)
 
-### Fixed
+#### Fixed
 - The Windows data scripts under Windows PowerShell 5.1: `get_text.ps1`
   wrote the Arabic words of a regex as literal letters, which 5.1 reads in
   the ANSI code page, so `kalila.txt` came out different and the script
@@ -120,13 +143,13 @@ NVIDIA GPU. Design: [`docs/DESIGN.md`](docs/DESIGN.md) §11 and decisions
 - `.gitattributes`: LF line endings in every checkout (Git for Windows
   converted the example data to CRLF by default).
 
-## [2.0.0] — 2026-11-27
+### 2.0.0 — development snapshot, 2026-11-27 (withdrawn)
 
 The first public release of v2, a rewrite of the 2017 v1 (kept in
 `legacy/`, tag `v1-legacy`). The design and every decision are in
 [`docs/DESIGN.md`](docs/DESIGN.md); decisions 111–124 are this release's.
 
-### The library (phases 1–5)
+#### The library (phases 1–5)
 - Dense layers and activations, MSE and fused softmax + cross-entropy,
   SGD with momentum; trace events for every number of a pass; numerical
   gradient checks; portable model files (phase 1).
@@ -142,7 +165,7 @@ The first public release of v2, a rewrite of the 2017 v1 (kept in
   a cache-blocked matrix product, AdamW, warm-up + cosine, KV-cache
   generation, optional OpenMP (phase 5).
 
-### Added in 2.0.0
+#### Added in 2.0.0
 - CMake build (≥ 3.21) for GCC, Clang and MSVC, replacing the Makefile;
   targets `test`, `sanitize`, `bench`, `data`, `data-text`; options
   `NMZ_OPENMP`, `NMZ_SANITIZE`, `NMZ_WERROR`.
@@ -162,7 +185,7 @@ The first public release of v2, a rewrite of the 2017 v1 (kept in
   check that the installed package works.
 - MIT licence.
 
-### Changed in 2.0.0
+#### Changed in 2.0.0
 - The `neuromz` program moved to its own repository,
   [neuromz-cli](https://github.com/mzprog/neuromz-cli), with its history,
   its smoke test, its walkthroughs and the CLI-driven benchmarks.
@@ -171,8 +194,3 @@ The first public release of v2, a rewrite of the 2017 v1 (kept in
   with FMA (Apple Clang on arm64 contracted by default).
 - `bench_conv` uses C11 `timespec_get`; unsigned negations are written as
   `0u - x` (MSVC C4146); two Clang warnings in the tests.
-
-[2.2.0]: https://github.com/mzprog/neuromz/releases/tag/v2.2.0
-[2.1.0]: https://github.com/mzprog/neuromz/releases/tag/v2.1.0
-[2.0.1]: https://github.com/mzprog/neuromz/releases/tag/v2.0.1
-[2.0.0]: https://github.com/mzprog/neuromz/releases/tag/v2.0.0
